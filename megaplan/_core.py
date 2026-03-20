@@ -15,7 +15,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
@@ -420,7 +419,6 @@ def collect_git_diff_summary(project_dir: Path) -> str:
     if not (project_dir / ".git").exists():
         return "Project directory is not a git repository."
     try:
-        started = time.monotonic()
         process = subprocess.run(
             ["git", "status", "--short"],
             cwd=str(project_dir),

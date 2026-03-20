@@ -16,8 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from megaplan.schemas import SCHEMAS  # noqa: F401
+from megaplan.schemas import SCHEMAS
 from megaplan._core import (
+    PlanState,
     CliError,
     MOCK_ENV_VAR,
     read_json,
@@ -177,7 +178,7 @@ def validate_payload(step: str, payload: dict[str, Any]) -> None:
         raise CliError("parse_error", f"{step} output missing required keys: {', '.join(missing)}")
 
 
-def mock_worker_output(step: str, state: dict[str, Any], plan_dir: Path) -> WorkerResult:
+def mock_worker_output(step: str, state: PlanState, plan_dir: Path) -> WorkerResult:
     iteration = state["iteration"] or 1
     if step == "clarify":
         payload = {
@@ -313,7 +314,7 @@ def session_key_for(step: str, agent: str) -> str:
     return f"{agent}_{step}"
 
 
-def update_session_state(state: dict[str, Any], step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool) -> None:
+def update_session_state(state: PlanState, step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool) -> None:
     if not session_id:
         return
     key = session_key_for(step, agent)
@@ -330,8 +331,11 @@ def update_session_state(state: dict[str, Any], step: str, agent: str, session_i
 persist_session = update_session_state
 
 
-def run_claude_step(step: str, state: dict[str, Any], plan_dir: Path, *, root: Path, fresh: bool) -> WorkerResult:
-    import megaplan.cli as _cli  # deferred: tests monkeypatch _cli.mock_worker_output
+def run_claude_step(step: str, state: PlanState, plan_dir: Path, *, root: Path, fresh: bool) -> WorkerResult:
+    # Deferred import: cli.py imports workers.py at module level, so importing
+    # cli here at call time avoids a circular import.  Tests monkeypatch
+    # _cli.mock_worker_output which is why we import the module, not the function.
+    import megaplan.cli as _cli
 
     if os.getenv(MOCK_ENV_VAR) == "1":
         return _cli.mock_worker_output(step, state, plan_dir)
@@ -366,7 +370,7 @@ def run_claude_step(step: str, state: dict[str, Any], plan_dir: Path, *, root: P
 
 def run_codex_step(
     step: str,
-    state: dict[str, Any],
+    state: PlanState,
     plan_dir: Path,
     *,
     root: Path,
@@ -374,7 +378,8 @@ def run_codex_step(
     fresh: bool = False,
     json_trace: bool = False,
 ) -> WorkerResult:
-    import megaplan.cli as _cli  # deferred: tests monkeypatch _cli.mock_worker_output
+    # Deferred import: same circular-dependency reason as run_claude_step.
+    import megaplan.cli as _cli
 
     if os.getenv(MOCK_ENV_VAR) == "1":
         return _cli.mock_worker_output(step, state, plan_dir)
@@ -487,7 +492,7 @@ def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None
     return agent, "persistent", refreshed
 
 
-def run_step_with_worker(step: str, state: dict[str, Any], plan_dir: Path, args: argparse.Namespace, *, root: Path) -> tuple[WorkerResult, str, str, bool]:
+def run_step_with_worker(step: str, state: PlanState, plan_dir: Path, args: argparse.Namespace, *, root: Path) -> tuple[WorkerResult, str, str, bool]:
     agent, mode, refreshed = resolve_agent_mode(step, args)
     if agent == "claude":
         worker = run_claude_step(step, state, plan_dir, root=root, fresh=refreshed)

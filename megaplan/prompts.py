@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from megaplan._core import (
+    PlanState,
     CliError,
     latest_plan_path,
     read_json,
@@ -22,7 +23,7 @@ from megaplan._core import (
 )
 
 
-def _clarify_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+def _clarify_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     notes = state.get("meta", {}).get("notes", [])
     notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
@@ -50,7 +51,7 @@ def _clarify_prompt(state: dict[str, Any], plan_dir: Path) -> str:
     ).strip()
 
 
-def _plan_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     notes = state.get("meta", {}).get("notes", [])
     notes_block = "\n".join(f"- {note['note']}" for note in notes) if notes else "- None"
@@ -99,7 +100,7 @@ def _plan_prompt(state: dict[str, Any], plan_dir: Path) -> str:
     ).strip()
 
 
-def _integrate_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+def _integrate_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
@@ -150,7 +151,7 @@ def _integrate_prompt(state: dict[str, Any], plan_dir: Path) -> str:
     ).strip()
 
 
-def _critique_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
@@ -201,7 +202,7 @@ def _critique_prompt(state: dict[str, Any], plan_dir: Path) -> str:
     ).strip()
 
 
-def _execute_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
@@ -243,7 +244,7 @@ def _execute_prompt(state: dict[str, Any], plan_dir: Path) -> str:
     ).strip()
 
 
-def _review_claude_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
@@ -282,7 +283,7 @@ def _review_claude_prompt(state: dict[str, Any], plan_dir: Path) -> str:
     ).strip()
 
 
-def _review_codex_prompt(state: dict[str, Any], plan_dir: Path) -> str:
+def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
@@ -338,14 +339,14 @@ _CODEX_PROMPT_BUILDERS: dict[str, Any] = {
 }
 
 
-def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
+def create_claude_prompt(step: str, state: PlanState, plan_dir: Path) -> str:
     builder = _CLAUDE_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
     return builder(state, plan_dir)
 
 
-def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
+def create_codex_prompt(step: str, state: PlanState, plan_dir: Path) -> str:
     builder = _CODEX_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")

@@ -6,7 +6,6 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from megaplan.schemas import SCHEMAS  # noqa: F401 — re-export not needed, just for type safety
 from megaplan._core import (
     PlanState,
     FlagRecord,
