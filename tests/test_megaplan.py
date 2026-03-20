@@ -8,6 +8,8 @@ import pytest
 
 import megaplan
 import megaplan.cli
+import megaplan.workers
+import megaplan.prompts
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -1411,3 +1413,240 @@ def test_run_command_missing_binary_raises_cli_error(tmp_path: Path) -> None:
             cwd=tmp_path,
         )
     assert exc_info.value.code == "agent_not_found"
+
+
+# ── Parsing pipeline tests ──────────────────────────────────────────
+
+
+class TestParseClaudeEnvelope:
+    def test_valid_json_with_result_block(self) -> None:
+        raw = json.dumps({"result": json.dumps({"plan": "do stuff"}), "session_id": "abc", "total_cost_usd": 0.5})
+        envelope, payload = megaplan.workers.parse_claude_envelope(raw)
+        assert payload == {"plan": "do stuff"}
+        assert envelope["session_id"] == "abc"
+
+    def test_valid_json_with_structured_output(self) -> None:
+        raw = json.dumps({"structured_output": {"plan": "do stuff"}, "session_id": "abc"})
+        envelope, payload = megaplan.workers.parse_claude_envelope(raw)
+        assert payload == {"plan": "do stuff"}
+
+    def test_valid_json_direct_dict(self) -> None:
+        raw = json.dumps({"plan": "do stuff"})
+        envelope, payload = megaplan.workers.parse_claude_envelope(raw)
+        assert payload == {"plan": "do stuff"}
+
+    def test_malformed_json_raises_cli_error(self) -> None:
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.workers.parse_claude_envelope("not valid json at all")
+        assert exc_info.value.code == "parse_error"
+
+    def test_is_error_raises_cli_error(self) -> None:
+        raw = json.dumps({"is_error": True, "result": "something broke"})
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.workers.parse_claude_envelope(raw)
+        assert exc_info.value.code == "worker_error"
+
+    def test_empty_result_raises_cli_error(self) -> None:
+        raw = json.dumps({"result": "   "})
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.workers.parse_claude_envelope(raw)
+        assert exc_info.value.code == "parse_error"
+
+    def test_non_object_result_raises_cli_error(self) -> None:
+        raw = json.dumps({"result": json.dumps([1, 2, 3])})
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.workers.parse_claude_envelope(raw)
+        assert exc_info.value.code == "parse_error"
+
+
+class TestParseJsonFile:
+    def test_valid_json_file(self, tmp_path: Path) -> None:
+        p = tmp_path / "output.json"
+        p.write_text(json.dumps({"key": "value"}), encoding="utf-8")
+        result = megaplan.workers.parse_json_file(p)
+        assert result == {"key": "value"}
+
+    def test_missing_file_raises_cli_error(self, tmp_path: Path) -> None:
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.workers.parse_json_file(tmp_path / "no_such_file.json")
+        assert exc_info.value.code == "parse_error"
+
+    def test_non_object_raises_cli_error(self, tmp_path: Path) -> None:
+        p = tmp_path / "array.json"
+        p.write_text("[1,2,3]", encoding="utf-8")
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.workers.parse_json_file(p)
+        assert exc_info.value.code == "parse_error"
+
+
+class TestValidatePayload:
+    @pytest.mark.parametrize(
+        "step, payload",
+        [
+            ("clarify", {"questions": [], "refined_idea": "x", "intent_summary": "y"}),
+            ("plan", {"plan": "p", "questions": [], "success_criteria": [], "assumptions": []}),
+            ("integrate", {"plan": "p", "changes_summary": "c", "flags_addressed": []}),
+            ("critique", {"flags": []}),
+            ("execute", {"output": "o", "files_changed": [], "commands_run": [], "deviations": []}),
+            ("review", {"criteria": [], "issues": []}),
+        ],
+    )
+    def test_valid_payloads_pass(self, step: str, payload: dict) -> None:
+        megaplan.workers.validate_payload(step, payload)  # should not raise
+
+    @pytest.mark.parametrize(
+        "step, payload, missing_key",
+        [
+            ("clarify", {"questions": []}, "refined_idea"),
+            ("plan", {"plan": "p"}, "questions"),
+            ("integrate", {"plan": "p"}, "changes_summary"),
+            ("critique", {}, "flags"),
+            ("execute", {"output": "o"}, "files_changed"),
+            ("review", {"criteria": []}, "issues"),
+        ],
+    )
+    def test_missing_keys_raise_cli_error(self, step: str, payload: dict, missing_key: str) -> None:
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.workers.validate_payload(step, payload)
+        assert exc_info.value.code == "parse_error"
+        assert missing_key in str(exc_info.value)
+
+    def test_unknown_step_is_noop(self) -> None:
+        # Steps not in the switch statement should pass silently
+        megaplan.workers.validate_payload("unknown_step", {})
+
+
+class TestExtractSessionId:
+    def test_jsonl_thread_id(self) -> None:
+        raw = '{"type":"thread.started","thread_id":"abc-123-def"}\n{"type":"done"}\n'
+        assert megaplan.workers.extract_session_id(raw) == "abc-123-def"
+
+    def test_unstructured_session_id(self) -> None:
+        raw = "some output\nsession_id: 12345678-abcd-ef01-2345\nmore output\n"
+        assert megaplan.workers.extract_session_id(raw) == "12345678-abcd-ef01-2345"
+
+    def test_session_id_pattern(self) -> None:
+        raw = "session id: AABBCCDD-1234\n"
+        assert megaplan.workers.extract_session_id(raw) == "AABBCCDD-1234"
+
+    def test_no_session_id_returns_none(self) -> None:
+        assert megaplan.workers.extract_session_id("just some plain output\n") is None
+
+    def test_empty_string_returns_none(self) -> None:
+        assert megaplan.workers.extract_session_id("") is None
+
+
+# ── Prompt generation tests ─────────────────────────────────────────
+
+
+def _minimal_state(project_dir: Path) -> dict:
+    return {
+        "idea": "add a widget",
+        "config": {
+            "project_dir": str(project_dir),
+            "robustness": "standard",
+        },
+        "clarification": {
+            "intent_summary": "The user wants to add a widget.",
+            "refined_idea": "Add a configurable widget component.",
+        },
+        "meta": {
+            "notes": [{"note": "keep it simple"}],
+        },
+        "iteration": 1,
+    }
+
+
+class TestPromptGeneration:
+    """Tests for create_claude_prompt and create_codex_prompt."""
+
+    def test_clarify_prompt_nonempty(self, tmp_path: Path) -> None:
+        state = _minimal_state(tmp_path)
+        prompt = megaplan.prompts.create_claude_prompt("clarify", state, tmp_path)
+        assert isinstance(prompt, str)
+        assert len(prompt) > 0
+        assert "add a widget" in prompt
+
+    def test_plan_prompt_nonempty(self, tmp_path: Path) -> None:
+        state = _minimal_state(tmp_path)
+        prompt = megaplan.prompts.create_claude_prompt("plan", state, tmp_path)
+        assert len(prompt) > 0
+        assert "add a widget" in prompt
+
+    def test_critique_prompt_contains_intent_and_robustness(self, tmp_path: Path) -> None:
+        plan_dir = tmp_path / "plan_data"
+        plan_dir.mkdir()
+        state = _minimal_state(tmp_path)
+        # Critique needs plan files and flag registry on disk
+        (plan_dir / "plan_v1.md").write_text("# Plan\nDo the thing.\n", encoding="utf-8")
+        write_json(plan_dir / "plan_v1.meta.json", {
+            "version": 1, "timestamp": "2026-03-20T00:00:00Z",
+            "hash": "sha256:test", "success_criteria": ["it works"],
+            "questions": [], "assumptions": [],
+        })
+        write_json(plan_dir / "faults.json", {"flags": []})
+        state["plan_versions"] = [{"version": 1, "file": "plan_v1.md", "hash": "sha256:test", "timestamp": "2026-03-20T00:00:00Z"}]
+
+        prompt = megaplan.prompts.create_claude_prompt("critique", state, plan_dir)
+        # intent_and_notes_block content should appear
+        assert "The user wants to add a widget" in prompt
+        assert "add a widget" in prompt
+        # robustness instruction should appear
+        assert "balanced judgment" in prompt
+
+    def test_critique_prompt_light_robustness(self, tmp_path: Path) -> None:
+        plan_dir = tmp_path / "plan_data"
+        plan_dir.mkdir()
+        state = _minimal_state(tmp_path)
+        state["config"]["robustness"] = "light"
+        (plan_dir / "plan_v1.md").write_text("# Plan\nDo the thing.\n", encoding="utf-8")
+        write_json(plan_dir / "plan_v1.meta.json", {
+            "version": 1, "timestamp": "2026-03-20T00:00:00Z",
+            "hash": "sha256:test", "success_criteria": [],
+            "questions": [], "assumptions": [],
+        })
+        write_json(plan_dir / "faults.json", {"flags": []})
+        state["plan_versions"] = [{"version": 1, "file": "plan_v1.md", "hash": "sha256:test", "timestamp": "2026-03-20T00:00:00Z"}]
+
+        prompt = megaplan.prompts.create_claude_prompt("critique", state, plan_dir)
+        assert "Be pragmatic" in prompt
+
+    def test_integrate_prompt_contains_intent(self, tmp_path: Path) -> None:
+        plan_dir = tmp_path / "plan_data"
+        plan_dir.mkdir()
+        state = _minimal_state(tmp_path)
+        (plan_dir / "plan_v1.md").write_text("# Plan\nDo the thing.\n", encoding="utf-8")
+        write_json(plan_dir / "plan_v1.meta.json", {
+            "version": 1, "timestamp": "2026-03-20T00:00:00Z",
+            "hash": "sha256:test", "success_criteria": [],
+            "questions": [], "assumptions": [],
+        })
+        write_json(plan_dir / "faults.json", {"flags": []})
+        write_json(plan_dir / "evaluation_v1.json", {
+            "decision": "iterate",
+            "reason": "test",
+            "significant_count": 0,
+            "weighted_score": 0.0,
+        })
+        state["plan_versions"] = [{"version": 1, "file": "plan_v1.md", "hash": "sha256:test", "timestamp": "2026-03-20T00:00:00Z"}]
+
+        prompt = megaplan.prompts.create_claude_prompt("integrate", state, plan_dir)
+        assert "The user wants to add a widget" in prompt
+        assert "add a widget" in prompt
+
+    def test_codex_prompt_matches_claude_for_shared_steps(self, tmp_path: Path) -> None:
+        state = _minimal_state(tmp_path)
+        for step in ("clarify", "plan"):
+            claude_prompt = megaplan.prompts.create_claude_prompt(step, state, tmp_path)
+            codex_prompt = megaplan.prompts.create_codex_prompt(step, state, tmp_path)
+            assert claude_prompt == codex_prompt
+
+    def test_unsupported_step_raises_cli_error(self, tmp_path: Path) -> None:
+        state = _minimal_state(tmp_path)
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.prompts.create_claude_prompt("nonexistent", state, tmp_path)
+        assert exc_info.value.code == "unsupported_step"
+
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.prompts.create_codex_prompt("nonexistent", state, tmp_path)
+        assert exc_info.value.code == "unsupported_step"
