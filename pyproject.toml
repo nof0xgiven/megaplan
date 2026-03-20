@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "megaplan"
 version = "0.1.0"
-description = "Stateful orchestration CLI for high-rigor AI planning loops"
+description = "AI agent harness for coordinating Claude and GPT to make and execute extremely robust plans"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [
