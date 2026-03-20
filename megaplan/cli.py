@@ -19,10 +19,12 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from enum import Enum
+from typing import Any, NotRequired, TypedDict
 
 __all__ = [
-    "STATE_INITIALIZED", "STATE_PLANNED", "STATE_CRITIQUED", "STATE_EVALUATED",
+    "PlanStage", "PlanState", "PlanConfig", "PlanMeta", "FlagRecord",
+    "STATE_INITIALIZED", "STATE_CLARIFIED", "STATE_PLANNED", "STATE_CRITIQUED", "STATE_EVALUATED",
     "STATE_GATED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
     "TERMINAL_STATES", "FLAG_BLOCKING_STATUSES", "MOCK_ENV_VAR",
     "CliError", "CommandResult", "WorkerResult",
@@ -31,29 +33,165 @@ __all__ = [
     "update_flags_after_critique", "update_flags_after_integrate",
     "compute_recurring_critiques", "build_evaluation",
     "infer_next_steps", "require_state",
-    "handle_init", "handle_plan", "handle_critique", "handle_evaluate",
+    "handle_init", "handle_clarify", "handle_plan", "handle_critique", "handle_evaluate",
     "handle_integrate", "handle_gate", "handle_execute", "handle_review",
     "handle_status", "handle_audit", "handle_list", "handle_override",
-    "handle_setup",
+    "handle_setup", "handle_setup_global", "handle_config",
     "load_flag_registry", "save_flag_registry",
+    "load_config", "save_config", "config_dir", "detect_available_agents",
+    "DEFAULT_AGENT_ROUTING",
     "plans_root", "main", "cli_entry",
 ]
 
 
-STATE_INITIALIZED = "initialized"
-STATE_PLANNED = "planned"
-STATE_CRITIQUED = "critiqued"
-STATE_EVALUATED = "evaluated"
-STATE_GATED = "gated"
-STATE_EXECUTED = "executed"
-STATE_DONE = "done"
-STATE_ABORTED = "aborted"
+class PlanStage(str, Enum):
+    INITIALIZED = "initialized"
+    CLARIFIED = "clarified"
+    PLANNED = "planned"
+    CRITIQUED = "critiqued"
+    EVALUATED = "evaluated"
+    GATED = "gated"
+    EXECUTED = "executed"
+    DONE = "done"
+    ABORTED = "aborted"
+
+
+# Backward-compatible aliases
+STATE_INITIALIZED = PlanStage.INITIALIZED
+STATE_CLARIFIED = PlanStage.CLARIFIED
+STATE_PLANNED = PlanStage.PLANNED
+STATE_CRITIQUED = PlanStage.CRITIQUED
+STATE_EVALUATED = PlanStage.EVALUATED
+STATE_GATED = PlanStage.GATED
+STATE_EXECUTED = PlanStage.EXECUTED
+STATE_DONE = PlanStage.DONE
+STATE_ABORTED = PlanStage.ABORTED
 TERMINAL_STATES = {STATE_DONE, STATE_ABORTED}
+
+
+class PlanConfig(TypedDict):
+    max_iterations: int
+    budget_usd: float
+    project_dir: str
+    auto_approve: bool
+    robustness: str
+
+
+class PlanMeta(TypedDict, total=False):
+    significant_counts: list[int]
+    weighted_scores: list[float]
+    plan_deltas: list[float | None]
+    recurring_critiques: list[str]
+    total_cost_usd: float
+    overrides: list[dict[str, Any]]
+    notes: list[dict[str, Any]]
+    user_approved_gate: bool
+
+
+class PlanState(TypedDict, total=False):
+    name: str
+    idea: str
+    current_state: str
+    iteration: int
+    created_at: str
+    config: PlanConfig
+    sessions: dict[str, Any]
+    plan_versions: list[dict[str, Any]]
+    history: list[dict[str, Any]]
+    meta: PlanMeta
+    last_evaluation: dict[str, Any]
+    clarification: NotRequired[dict[str, Any]]
+
+
+class FlagRecord(TypedDict, total=False):
+    id: str
+    concern: str
+    category: str
+    severity_hint: str
+    evidence: str
+    raised_in: str
+    status: str
+    severity: str
+    verified: bool
+    verified_in: str
 FLAG_BLOCKING_STATUSES = {"open", "disputed"}
 MOCK_ENV_VAR = "MEGAPLAN_MOCK_WORKERS"
-WORKER_TIMEOUT_SECONDS = 600
+WORKER_TIMEOUT_SECONDS = 3600
+
+DEFAULT_AGENT_ROUTING: dict[str, str] = {
+    "clarify": "claude",
+    "plan": "claude",
+    "critique": "codex",
+    "integrate": "claude",
+    "execute": "codex",
+    "review": "codex",
+}
+KNOWN_AGENTS = ["claude", "codex"]
+ROBUSTNESS_LEVELS = ("light", "standard", "thorough")
+ROBUSTNESS_SKIP_THRESHOLDS = {"light": 4.0, "standard": 2.0, "thorough": 1.0}
+ROBUSTNESS_STAGNATION_FACTORS = {"light": 0.8, "standard": 0.9, "thorough": 0.95}
+SCOPE_CREEP_TERMS = (
+    "scope creep",
+    "out of scope",
+    "beyond the original idea",
+    "beyond original idea",
+    "beyond user intent",
+    "expanded scope",
+)
+
+
+def config_dir(home: Path | None = None) -> Path:
+    if home is None:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        if xdg:
+            return Path(xdg) / "megaplan"
+        home = Path.home()
+    return home / ".config" / "megaplan"
+
+
+def load_config(home: Path | None = None) -> dict[str, Any]:
+    path = config_dir(home) / "config.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def save_config(config: dict[str, Any], home: Path | None = None) -> Path:
+    path = config_dir(home) / "config.json"
+    atomic_write_json(path, config)
+    return path
+
+
+def detect_available_agents() -> list[str]:
+    return [a for a in KNOWN_AGENTS if shutil.which(a)]
+
 
 SCHEMAS: dict[str, dict[str, Any]] = {
+    "clarify.json": {
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "context": {"type": "string"},
+                    },
+                    "required": ["question", "context"],
+                },
+            },
+            "refined_idea": {"type": "string"},
+            "intent_summary": {"type": "string"},
+        },
+        "required": ["questions", "refined_idea", "intent_summary"],
+    },
     "plan.json": {
         "type": "object",
         "properties": {
@@ -405,7 +543,9 @@ def current_iteration_raw_artifact(plan_dir: Path, prefix: str, iteration: int) 
 def infer_next_steps(state: dict[str, Any]) -> list[str]:
     current = state.get("current_state")
     if current == STATE_INITIALIZED:
-        return ["plan"]
+        return ["clarify"]
+    if current == STATE_CLARIFIED:
+        return ["clarify", "plan"]
     if current == STATE_PLANNED:
         return ["critique"]
     if current == STATE_CRITIQUED:
@@ -460,12 +600,17 @@ def run_command(
             capture_output=True,
             timeout=timeout,
         )
+    except FileNotFoundError as exc:
+        raise CliError(
+            "agent_not_found",
+            f"Command not found: {command[0]}",
+        ) from exc
     except subprocess.TimeoutExpired as exc:
         duration_ms = int((time.monotonic() - started) * 1000)
         raise CliError(
             "worker_timeout",
             f"Command timed out after {timeout}s: {' '.join(command[:3])}...",
-            extra={"raw_output": (exc.stdout or "") + (exc.stderr or "")},
+            extra={"raw_output": str(exc.stdout or "") + str(exc.stderr or "")},
         ) from exc
     return CommandResult(
         command=command,
@@ -540,7 +685,9 @@ def validate_payload(step: str, payload: dict[str, Any]) -> None:
         if missing:
             raise CliError("parse_error", f"{step} output missing required keys: {', '.join(missing)}")
 
-    if step == "plan":
+    if step == "clarify":
+        require_keys(["questions", "refined_idea", "intent_summary"])
+    elif step == "plan":
         require_keys(["plan", "questions", "success_criteria", "assumptions"])
     elif step == "integrate":
         require_keys(["plan", "changes_summary", "flags_addressed"])
@@ -550,6 +697,55 @@ def validate_payload(step: str, payload: dict[str, Any]) -> None:
         require_keys(["output", "files_changed", "commands_run", "deviations"])
     elif step == "review":
         require_keys(["criteria", "issues"])
+
+
+def intent_and_notes_block(state: dict[str, Any]) -> str:
+    sections = []
+    clarification = state.get("clarification", {})
+    if clarification.get("intent_summary"):
+        sections.append(f"User intent summary:\n{clarification['intent_summary']}")
+        sections.append(f"Original idea:\n{state['idea']}")
+    else:
+        sections.append(f"Idea:\n{state['idea']}")
+    notes = state.get("meta", {}).get("notes", [])
+    if notes:
+        notes_text = "\n".join(f"- {note['note']}" for note in notes)
+        sections.append(f"User notes and answers:\n{notes_text}")
+    return "\n\n".join(sections)
+
+
+def configured_robustness(state: dict[str, Any]) -> str:
+    robustness = state.get("config", {}).get("robustness", "standard")
+    if robustness not in ROBUSTNESS_LEVELS:
+        return "standard"
+    return robustness
+
+
+def robustness_critique_instruction(robustness: str) -> str:
+    if robustness == "light":
+        return "Be pragmatic. Only flag issues that would cause real failures. Ignore style, minor edge cases, and issues the executor will naturally resolve."
+    if robustness == "thorough":
+        return "Be exhaustive. Flag edge cases, missing error handling, performance concerns, and anything that could cause problems in production even if unlikely."
+    return "Use balanced judgment. Flag significant risks, but do not spend flags on minor polish or executor-obvious boilerplate."
+
+
+def is_scope_creep_flag(flag: dict[str, Any]) -> bool:
+    text = f"{flag.get('concern', '')} {flag.get('evidence', '')}".lower()
+    return any(term in text for term in SCOPE_CREEP_TERMS)
+
+
+def scope_creep_flags(
+    flag_registry: dict[str, Any],
+    *,
+    statuses: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    matches = []
+    for flag in flag_registry.get("flags", []):
+        if statuses is not None and flag.get("status") not in statuses:
+            continue
+        if is_scope_creep_flag(flag):
+            matches.append(flag)
+    return matches
 
 
 def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
@@ -563,13 +759,60 @@ def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> st
         latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     flag_registry = load_flag_registry(plan_dir)
 
+    if step == "clarify":
+        return textwrap.dedent(
+            f"""
+            You are a planning assistant. The user has proposed the following idea:
+
+            Idea:
+            {state['idea']}
+
+            Project directory:
+            {project_dir}
+
+            User notes:
+            {notes_block}
+
+            Requirements:
+            - Read the project directory to understand the codebase.
+            - Restate the idea in your own words as a precise intent summary.
+            - Identify ambiguities, underspecified aspects, or implicit assumptions.
+            - For each ambiguity, produce a question that, if answered, would materially change the implementation plan.
+            - Propose a refined version of the idea that resolves obvious ambiguities.
+            - Do NOT plan the implementation - only clarify the intent.
+            """
+        ).strip()
+
     if step == "plan":
+        clarification = state.get("clarification", {})
+        refined = clarification.get("refined_idea", "")
+        intent = clarification.get("intent_summary", "")
+        clarify_block = ""
+        if refined:
+            clarify_block = textwrap.dedent(
+                f"""
+                Refined idea (from clarification):
+                {refined}
+
+                Intent summary:
+                {intent}
+
+                Original idea (for reference):
+                {state['idea']}
+                """
+            ).strip()
+        else:
+            clarify_block = textwrap.dedent(
+                f"""
+                Idea:
+                {state['idea']}
+                """
+            ).strip()
         return textwrap.dedent(
             f"""
             You are creating an implementation plan for the following idea.
 
-            Idea:
-            {state['idea']}
+            {clarify_block}
 
             Project directory:
             {project_dir}
@@ -607,6 +850,8 @@ def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> st
             Project directory:
             {project_dir}
 
+            {intent_and_notes_block(state)}
+
             Current plan (markdown):
             {latest_plan}
 
@@ -624,6 +869,9 @@ def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> st
             - Keep the plan readable and executable.
             - Return flags_addressed with the exact flag IDs you addressed.
             - Preserve or improve success criteria quality.
+            - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
+            - Remove unjustified scope growth. If the critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
+            - If a broader change is truly necessary, explain that dependency explicitly in changes_summary instead of silently expanding the plan.
             """
         ).strip()
 
@@ -637,6 +885,8 @@ def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> st
 
             Project directory:
             {project_dir}
+
+            {intent_and_notes_block(state)}
 
             Approved plan:
             {latest_plan}
@@ -667,12 +917,13 @@ def create_claude_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> st
 
 
 def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str:
-    if step in {"plan", "integrate"}:
+    if step in {"clarify", "plan", "integrate"}:
         return create_claude_prompt(step, state, plan_dir)
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     flag_registry = load_flag_registry(plan_dir)
+    robustness = configured_robustness(state)
 
     if step == "critique":
         unresolved = [
@@ -692,6 +943,8 @@ def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str
             Project directory:
             {project_dir}
 
+            {intent_and_notes_block(state)}
+
             Plan:
             {latest_plan}
 
@@ -705,21 +958,34 @@ def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str
             - Reuse existing flag IDs when the same concern is still open.
             - verified_flag_ids should list previously addressed flags that now appear resolved.
             - Focus on concrete issues that would cause real problems.
+            - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
+            - Verify that the plan remains aligned with the user's original intent (above), not just internal plan quality.
+            - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern so the orchestrator can surface it.
             - Do not rubber-stamp the plan.
             - Assign severity_hint carefully: "likely-significant" for issues that would
               cause real product or implementation problems. "likely-minor" for cosmetic,
-              nice-to-have, or issues already covered elsewhere.
+              nice-to-have, issues already covered elsewhere, or implementation details
+              the executor will naturally resolve by reading the actual code (e.g. exact
+              line numbers, missing boilerplate, export lists).
             """
         ).strip()
 
     if step == "execute":
         gate = read_json(plan_dir / "link.json")
+        if state.get("config", {}).get("auto_approve"):
+            approval_note = "Note: User chose auto-approve mode. This execution was not manually reviewed at the gate. Exercise extra caution on destructive operations."
+        elif state.get("meta", {}).get("user_approved_gate"):
+            approval_note = "Note: User explicitly approved this plan at the gate checkpoint."
+        else:
+            approval_note = "Note: Review mode is enabled. Execute should only be running after explicit gate approval."
         return textwrap.dedent(
             f"""
             Execute the approved plan in the repository.
 
             Project directory:
             {project_dir}
+
+            {intent_and_notes_block(state)}
 
             Approved plan:
             {latest_plan}
@@ -729,6 +995,9 @@ def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str
 
             Gate summary:
             {json_dump(gate).strip()}
+
+            {approval_note}
+            Robustness level: {robustness}.
 
             Requirements:
             - Implement the intent, not just the text.
@@ -747,6 +1016,8 @@ def create_codex_prompt(step: str, state: dict[str, Any], plan_dir: Path) -> str
 
             Project directory:
             {project_dir}
+
+            {intent_and_notes_block(state)}
 
             Approved plan:
             {latest_plan}
@@ -781,6 +1052,19 @@ def collect_git_diff_summary(project_dir: Path) -> str:
 
 def mock_worker_output(step: str, state: dict[str, Any], plan_dir: Path) -> WorkerResult:
     iteration = state["iteration"] or 1
+    if step == "clarify":
+        payload = {
+            "questions": [
+                {
+                    "question": "Should the feature be behind a flag?",
+                    "context": "No feature flags exist in the repo currently.",
+                },
+            ],
+            "refined_idea": f"Refined: {state['idea']}",
+            "intent_summary": f"The user wants to {state['idea']}.",
+        }
+        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+
     if step == "plan":
         payload = {
             "plan": textwrap.dedent(
@@ -895,6 +1179,7 @@ def run_claude_step(step: str, state: dict[str, Any], plan_dir: Path, *, root: P
         return mock_worker_output(step, state, plan_dir)
     project_dir = Path(state["config"]["project_dir"])
     schema_name = {
+        "clarify": "clarify.json",
         "plan": "plan.json",
         "integrate": "integrate.json",
         "critique": "critique.json",
@@ -942,6 +1227,7 @@ def run_codex_step(
         return mock_worker_output(step, state, plan_dir)
     project_dir = Path(state["config"]["project_dir"])
     schema_file = schemas_root(root) / {
+        "clarify": "clarify.json",
         "plan": "plan.json",
         "integrate": "integrate.json",
         "critique": "critique.json",
@@ -1009,7 +1295,7 @@ def run_codex_step(
 
 
 def session_key_for(step: str, agent: str) -> str:
-    if step in {"plan", "integrate"}:
+    if step in {"clarify", "plan", "integrate"}:
         return f"{agent}_planner"
     if step == "critique":
         return f"{agent}_critic"
@@ -1147,15 +1433,35 @@ def record_step_failure(
     save_state(plan_dir, state)
 
 
-def resolve_agent_mode(step: str, args: argparse.Namespace) -> tuple[str, str, bool]:
+def resolve_agent_mode(step: str, args: argparse.Namespace, *, home: Path | None = None) -> tuple[str, str, bool]:
     """Returns (agent, mode, refreshed).
 
     Both agents default to persistent sessions.  Use --fresh to start a new
     persistent session (break continuity) or --ephemeral for a truly one-off
     call with no session saved.
     """
-    default_agent = "claude" if step in {"plan", "integrate"} else "codex"
-    agent = args.agent or default_agent
+    explicit = args.agent
+    if explicit:
+        if not shutil.which(explicit):
+            raise CliError("agent_not_found", f"Agent '{explicit}' not found on PATH")
+        agent = explicit
+    else:
+        config = load_config(home)
+        agent = config.get("agents", {}).get(step) or DEFAULT_AGENT_ROUTING[step]
+        if not shutil.which(agent):
+            available = detect_available_agents()
+            if not available:
+                raise CliError(
+                    "agent_not_found",
+                    "No supported agents found on PATH. Install claude or codex.",
+                )
+            fallback = available[0]
+            args._agent_fallback = {
+                "requested": agent,
+                "resolved": fallback,
+                "reason": f"{agent} not found on PATH",
+            }
+            agent = fallback
     ephemeral = getattr(args, "ephemeral", False)
     fresh = getattr(args, "fresh", False)
     persist = getattr(args, "persist", False)
@@ -1188,6 +1494,10 @@ def handle_init(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     project_dir = Path(args.project_dir).expanduser().resolve()
     if not project_dir.exists() or not project_dir.is_dir():
         raise CliError("invalid_project_dir", f"Project directory does not exist: {project_dir}")
+    robustness = getattr(args, "robustness", "standard")
+    if robustness not in ROBUSTNESS_LEVELS:
+        robustness = "standard"
+    auto_approve = bool(getattr(args, "auto_approve", False))
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
     plan_name = args.name or f"{slugify(args.idea)}-{timestamp}"
     plan_dir = plans_root(root) / plan_name
@@ -1205,6 +1515,8 @@ def handle_init(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             "max_iterations": args.max_iterations,
             "budget_usd": args.budget_usd,
             "project_dir": str(project_dir),
+            "auto_approve": auto_approve,
+            "robustness": robustness,
         },
         "sessions": {},
         "plan_versions": [],
@@ -1242,13 +1554,63 @@ def handle_init(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "state": STATE_INITIALIZED,
         "summary": f"Initialized plan '{plan_name}' for project {project_dir}",
         "artifacts": ["state.json"],
-        "next_step": "plan",
+        "next_step": "clarify",
+        "auto_approve": auto_approve,
+        "robustness": robustness,
     }
+
+
+def handle_clarify(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    plan_dir, state = load_plan(root, args.plan)
+    require_state(state, "clarify", {STATE_INITIALIZED, STATE_CLARIFIED})
+    try:
+        worker, agent, mode, refreshed = run_step_with_worker("clarify", state, plan_dir, args, root=root)
+    except CliError as error:
+        record_step_failure(plan_dir, state, step="clarify", iteration=state["iteration"], error=error)
+        raise
+    payload = worker.payload
+    clarify_filename = "clarify.json"
+    atomic_write_json(plan_dir / clarify_filename, payload)
+    state["clarification"] = {
+        "refined_idea": payload["refined_idea"],
+        "intent_summary": payload["intent_summary"],
+        "questions": payload["questions"],
+    }
+    state["current_state"] = STATE_CLARIFIED
+    persist_session(state, "clarify", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    append_history(
+        state,
+        {
+            "step": "clarify",
+            "timestamp": now_utc(),
+            "duration_ms": worker.duration_ms,
+            "cost_usd": worker.cost_usd,
+            "result": "success",
+            "output_file": clarify_filename,
+            "artifact_hash": sha256_file(plan_dir / clarify_filename),
+            "session_mode": mode,
+            "session_id": worker.session_id,
+            "agent": agent,
+        },
+    )
+    save_state(plan_dir, state)
+    response = {
+        "success": True,
+        "step": "clarify",
+        "summary": f"Captured clarification with {len(payload['questions'])} questions.",
+        "artifacts": [clarify_filename],
+        "next_step": "plan",
+        "state": STATE_CLARIFIED,
+        "questions": payload["questions"],
+    }
+    if hasattr(args, "_agent_fallback"):
+        response["agent_fallback"] = args._agent_fallback
+    return response
 
 
 def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "plan", {STATE_INITIALIZED})
+    require_state(state, "plan", {STATE_INITIALIZED, STATE_CLARIFIED})
     try:
         worker, agent, mode, refreshed = run_step_with_worker("plan", state, plan_dir, args, root=root)
     except CliError as error:
@@ -1271,6 +1633,7 @@ def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     atomic_write_json(plan_dir / meta_filename, meta)
     state["iteration"] = version
     state["current_state"] = STATE_PLANNED
+    state.setdefault("meta", {}).pop("user_approved_gate", None)
     state.setdefault("plan_versions", []).append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
     persist_session(state, "plan", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
@@ -1289,7 +1652,7 @@ def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         },
     )
     save_state(plan_dir, state)
-    return {
+    response = {
         "success": True,
         "step": "plan",
         "iteration": version,
@@ -1298,6 +1661,9 @@ def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "next_step": "critique",
         "state": STATE_PLANNED,
     }
+    if hasattr(args, "_agent_fallback"):
+        response["agent_fallback"] = args._agent_fallback
+    return response
 
 
 def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -1335,7 +1701,8 @@ def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         },
     )
     save_state(plan_dir, state)
-    return {
+    scope_flags = scope_creep_flags(registry, statuses=FLAG_BLOCKING_STATUSES)
+    response = {
         "success": True,
         "step": "critique",
         "iteration": iteration,
@@ -1345,7 +1712,15 @@ def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "state": STATE_CRITIQUED,
         "verified_flags": worker.payload.get("verified_flag_ids", []),
         "open_flags": [flag["id"] for flag in registry.get("flags", []) if flag.get("status") == "open"],
+        "scope_creep_flags": [flag["id"] for flag in scope_flags],
     }
+    if scope_flags:
+        response["warnings"] = [
+            "Scope creep detected in the plan. Surface this drift to the user while continuing the loop."
+        ]
+    if hasattr(args, "_agent_fallback"):
+        response["agent_fallback"] = args._agent_fallback
+    return response
 
 
 def flag_weight(flag: dict[str, Any]) -> float:
@@ -1377,6 +1752,10 @@ def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
     iteration = state["iteration"]
     flag_registry = load_flag_registry(plan_dir)
     unresolved = unresolved_significant_flags(flag_registry)
+    robustness = configured_robustness(state)
+    skip_threshold = ROBUSTNESS_SKIP_THRESHOLDS.get(robustness, 2.0)
+    stagnation_factor = ROBUSTNESS_STAGNATION_FACTORS.get(robustness, 0.9)
+    open_scope_creep = scope_creep_flags(flag_registry, statuses=FLAG_BLOCKING_STATUSES)
     significant_count = len([flag for flag in flag_registry.get("flags", []) if flag.get("severity") == "significant" and flag.get("status") != "verified"])
     weighted_score = round(sum(flag_weight(f) for f in unresolved), 2)
     weighted_history = state.get("meta", {}).get("weighted_scores", [])
@@ -1400,6 +1779,10 @@ def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
         recommendation = "SKIP"
         confidence = "high"
         rationale = "No unresolved significant flags remain."
+    elif iteration > 1 and weighted_score < skip_threshold and len(weighted_history) >= 1 and weighted_score < weighted_history[-1]:
+        recommendation = "SKIP"
+        confidence = "medium"
+        rationale = f"Remaining flags are low-weight ({weighted_score}) and trending down. Executor can resolve."
     elif plan_delta is not None and plan_delta < 5.0:
         if unresolved:
             recommendation = "ESCALATE"
@@ -1417,11 +1800,11 @@ def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
         recommendation = "ESCALATE"
         confidence = "high"
         rationale = "The same critique concerns repeated across iterations."
-    elif len(weighted_history) >= 1 and weighted_score >= weighted_history[-1] * 0.9:
+    elif len(weighted_history) >= 1 and weighted_score >= weighted_history[-1] * stagnation_factor:
         recommendation = "ESCALATE"
         confidence = "medium"
         rationale = "Weighted flag score is not improving."
-    elif len(weighted_history) >= 1 and weighted_score < weighted_history[-1] * 0.9:
+    elif len(weighted_history) >= 1 and weighted_score < weighted_history[-1] * stagnation_factor:
         recommendation = "CONTINUE"
         confidence = "medium"
         rationale = "Weighted flag score is trending down."
@@ -1435,6 +1818,7 @@ def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "recommendation": recommendation,
         "confidence": confidence,
+        "robustness": robustness,
         "signals": {
             "iteration": iteration,
             "max_iterations": state["config"].get("max_iterations"),
@@ -1444,10 +1828,15 @@ def build_evaluation(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
             "plan_delta_from_previous": plan_delta,
             "recurring_critiques": recurring,
             "cost_so_far_usd": total_cost,
+            "scope_creep_flags": [flag["id"] for flag in open_scope_creep],
         },
         "rationale": rationale,
         "valid_next_steps": valid_next,
     }
+    if open_scope_creep:
+        result["warnings"] = [
+            "Scope creep detected: the plan appears to be expanding beyond the original idea or recorded user notes."
+        ]
 
     if recommendation in ("ESCALATE", "ABORT"):
         if recommendation == "ABORT":
@@ -1546,6 +1935,7 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     atomic_write_json(plan_dir / meta_filename, meta)
     state["iteration"] = version
     state["current_state"] = STATE_PLANNED
+    state.setdefault("meta", {}).pop("user_approved_gate", None)
     state.setdefault("plan_versions", []).append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
     state.setdefault("meta", {}).setdefault("plan_deltas", []).append(delta)
     update_flags_after_integrate(plan_dir, payload["flags_addressed"], plan_file=plan_filename, summary=payload["changes_summary"])
@@ -1567,7 +1957,7 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         },
     )
     save_state(plan_dir, state)
-    return {
+    response = {
         "success": True,
         "step": "integrate",
         "iteration": version,
@@ -1576,6 +1966,9 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "next_step": "critique",
         "state": STATE_PLANNED,
     }
+    if hasattr(args, "_agent_fallback"):
+        response["agent_fallback"] = args._agent_fallback
+    return response
 
 
 def run_gate_checks(plan_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
@@ -1632,11 +2025,14 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             "artifacts": ["link.json"],
             "next_step": "integrate" if recommendation == "CONTINUE" else "override force-proceed",
             "state": state["current_state"],
+            "auto_approve": bool(state.get("config", {}).get("auto_approve", False)),
+            "robustness": configured_robustness(state),
             **gate,
         }
     final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     atomic_write_text(plan_dir / "final.md", final_plan)
     state["current_state"] = STATE_GATED
+    state.setdefault("meta", {}).pop("user_approved_gate", None)
     append_history(
         state,
         {
@@ -1657,6 +2053,8 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "artifacts": ["link.json", "final.md"],
         "next_step": "execute",
         "state": STATE_GATED,
+        "auto_approve": bool(state.get("config", {}).get("auto_approve", False)),
+        "robustness": configured_robustness(state),
         **gate,
     }
 
@@ -1666,6 +2064,15 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     require_state(state, "execute", {STATE_GATED})
     if not args.confirm_destructive:
         raise CliError("missing_confirmation", "Execute requires --confirm-destructive")
+    auto_approve = bool(state.get("config", {}).get("auto_approve", False))
+    if getattr(args, "user_approved", False):
+        state.setdefault("meta", {})["user_approved_gate"] = True
+        save_state(plan_dir, state)
+    if not auto_approve and not state.get("meta", {}).get("user_approved_gate", False):
+        raise CliError(
+            "missing_approval",
+            "Execute requires explicit user approval (--user-approved) when auto-approve is not set. The orchestrator must confirm with the user at the gate checkpoint before proceeding.",
+        )
     try:
         worker, agent, mode, refreshed = run_step_with_worker("execute", state, plan_dir, args, root=root)
     except CliError as error:
@@ -1695,7 +2102,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     artifacts = ["execution.json"]
     if worker.trace_output is not None:
         artifacts.append("execution_trace.jsonl")
-    return {
+    response = {
         "success": True,
         "step": "execute",
         "summary": worker.payload["output"],
@@ -1704,7 +2111,12 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "state": STATE_EXECUTED,
         "files_changed": worker.payload.get("files_changed", []),
         "deviations": worker.payload.get("deviations", []),
+        "auto_approve": auto_approve,
+        "user_approved_gate": bool(state.get("meta", {}).get("user_approved_gate", False)),
     }
+    if hasattr(args, "_agent_fallback"):
+        response["agent_fallback"] = args._agent_fallback
+    return response
 
 
 def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -1738,7 +2150,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         },
     )
     save_state(plan_dir, state)
-    return {
+    response = {
         "success": True,
         "step": "review",
         "summary": f"Review complete: {passed}/{total} success criteria passed.",
@@ -1747,6 +2159,9 @@ def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "state": STATE_DONE,
         "issues": worker.payload.get("issues", []),
     }
+    if hasattr(args, "_agent_fallback"):
+        response["agent_fallback"] = args._agent_fallback
+    return response
 
 
 def handle_status(root: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -1835,6 +2250,7 @@ def handle_override(root: Path, args: argparse.Namespace) -> dict[str, Any]:
             final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
             atomic_write_text(plan_dir / "final.md", final_plan)
             state["current_state"] = STATE_GATED
+            state.setdefault("meta", {}).pop("user_approved_gate", None)
             state.setdefault("meta", {}).setdefault("overrides", []).append({"action": action, "timestamp": now_utc(), "reason": args.reason})
             save_state(plan_dir, state)
             return {
@@ -1872,7 +2288,110 @@ def bundled_agents_md() -> str:
     return resources.files("megaplan").joinpath("data", "AGENTS.md").read_text(encoding="utf-8")
 
 
+def bundled_global_file(name: str) -> str:
+    """Return the contents of a bundled global config file."""
+    return resources.files("megaplan").joinpath("data", "global", name).read_text(encoding="utf-8")
+
+
+GLOBAL_TARGETS = [
+    {"agent": "claude", "detect": ".claude", "path": ".claude/skills/megaplan/SKILL.md", "data": "skill.md"},
+    {"agent": "codex",  "detect": ".codex",  "path": ".codex/skills/megaplan/SKILL.md",  "data": "skill.md"},
+    {"agent": "cursor", "detect": ".cursor", "path": ".cursor/rules/megaplan.mdc",       "data": "cursor_rule.mdc"},
+]
+
+
+def _install_owned_file(
+    path: Path, content: str, *, force: bool = False
+) -> dict[str, Any]:
+    """Write a file we own, skipping if content already matches."""
+    existed = path.exists()
+    if existed and not force:
+        existing = path.read_text(encoding="utf-8")
+        if existing == content:
+            return {"path": str(path), "skipped": True, "existed": True}
+    atomic_write_text(path, content)
+    return {"path": str(path), "skipped": False, "existed": existed}
+
+
+def handle_setup_global(force: bool = False, home: Path | None = None) -> dict[str, Any]:
+    """Install megaplan config into all detected agent global dirs."""
+    if home is None:
+        home = Path.home()
+
+    installed: list[dict[str, Any]] = []
+    detected_count = 0
+
+    for target in GLOBAL_TARGETS:
+        agent_dir = home / target["detect"]
+        if not agent_dir.is_dir():
+            installed.append({
+                "agent": target["agent"],
+                "path": str(home / target["path"]),
+                "skipped": True,
+                "reason": "not installed",
+            })
+            continue
+
+        detected_count += 1
+        content = bundled_global_file(target["data"])
+        dest = home / target["path"]
+        result = _install_owned_file(dest, content, force=force)
+        result["agent"] = target["agent"]
+        installed.append(result)
+
+    if detected_count == 0:
+        return {
+            "success": False,
+            "step": "setup",
+            "mode": "global",
+            "summary": (
+                "No supported agents detected. "
+                "Create one of ~/.claude/, ~/.codex/, or ~/.cursor/ and re-run, "
+                "or use 'megaplan setup' to install AGENTS.md into a specific project."
+            ),
+            "installed": installed,
+        }
+
+    # Write agent routing config based on what's available
+    available = detect_available_agents()
+    config_path = None
+    routing = None
+    if available:
+        agents_config: dict[str, str] = {}
+        for step, default in DEFAULT_AGENT_ROUTING.items():
+            agents_config[step] = default if default in available else available[0]
+        config = load_config(home)
+        config["agents"] = agents_config
+        config_path = save_config(config, home)
+        routing = agents_config
+
+    lines = []
+    for entry in installed:
+        if entry.get("reason") == "not installed":
+            lines.append(f"  {entry['agent']}: skipped (not installed)")
+        elif entry["skipped"]:
+            lines.append(f"  {entry['agent']}: up to date")
+        else:
+            verb = "overwrote" if entry["existed"] else "created"
+            lines.append(f"  {entry['agent']}: {verb} {entry['path']}")
+
+    result: dict[str, Any] = {
+        "success": True,
+        "step": "setup",
+        "mode": "global",
+        "summary": "Global setup complete:\n" + "\n".join(lines),
+        "installed": installed,
+    }
+    if config_path is not None:
+        result["config_path"] = str(config_path)
+        result["routing"] = routing
+    return result
+
+
 def handle_setup(args: argparse.Namespace) -> dict[str, Any]:
+    local = args.local or args.target_dir
+    if not local:
+        return handle_setup_global(force=args.force)
     target_dir = Path(args.target_dir).resolve() if args.target_dir else Path.cwd()
     target = target_dir / "AGENTS.md"
     content = bundled_agents_md()
@@ -1903,19 +2422,77 @@ def handle_setup(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def handle_config(args: argparse.Namespace) -> dict[str, Any]:
+    """Handle the config subcommand: show, set, reset."""
+    action = args.config_action
+
+    if action == "show":
+        config = load_config()
+        effective: dict[str, str] = {}
+        file_agents = config.get("agents", {})
+        for step, default in DEFAULT_AGENT_ROUTING.items():
+            effective[step] = file_agents.get(step, default)
+        return {
+            "success": True,
+            "step": "config",
+            "action": "show",
+            "config_path": str(config_dir() / "config.json"),
+            "routing": effective,
+            "raw_config": config,
+        }
+
+    if action == "set":
+        key = args.key
+        value = args.value
+        parts = key.split(".", 1)
+        if len(parts) != 2 or parts[0] != "agents":
+            raise CliError("invalid_args", f"Key must be 'agents.<step>', got '{key}'")
+        step = parts[1]
+        if step not in DEFAULT_AGENT_ROUTING:
+            raise CliError("invalid_args", f"Unknown step '{step}'. Valid steps: {', '.join(DEFAULT_AGENT_ROUTING)}")
+        if value not in KNOWN_AGENTS:
+            raise CliError("invalid_args", f"Unknown agent '{value}'. Valid agents: {', '.join(KNOWN_AGENTS)}")
+        config = load_config()
+        config.setdefault("agents", {})[step] = value
+        save_config(config)
+        return {
+            "success": True,
+            "step": "config",
+            "action": "set",
+            "key": key,
+            "value": value,
+        }
+
+    if action == "reset":
+        path = config_dir() / "config.json"
+        if path.exists():
+            path.unlink()
+        return {
+            "success": True,
+            "step": "config",
+            "action": "reset",
+            "summary": "Config file removed. Using defaults.",
+        }
+
+    raise CliError("invalid_args", f"Unknown config action: {action}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Megaplan orchestration CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    setup_parser = subparsers.add_parser("setup", help="Install AGENTS.md into a project")
-    setup_parser.add_argument("--target-dir", help="Directory to install into (default: cwd)")
-    setup_parser.add_argument("--force", action="store_true", help="Overwrite existing AGENTS.md")
+    setup_parser = subparsers.add_parser("setup", help="Install megaplan into agent configs (global by default)")
+    setup_parser.add_argument("--local", action="store_true", help="Install AGENTS.md into a project instead of global agent configs")
+    setup_parser.add_argument("--target-dir", help="Directory to install into (default: cwd, implies --local)")
+    setup_parser.add_argument("--force", action="store_true", help="Overwrite existing files")
 
     init_parser = subparsers.add_parser("init")
     init_parser.add_argument("--project-dir", required=True)
     init_parser.add_argument("--name")
     init_parser.add_argument("--max-iterations", type=int, default=3)
     init_parser.add_argument("--budget-usd", type=float, default=25.0)
+    init_parser.add_argument("--auto-approve", action="store_true")
+    init_parser.add_argument("--robustness", choices=list(ROBUSTNESS_LEVELS), default="standard")
     init_parser.add_argument("idea")
 
     subparsers.add_parser("list")
@@ -1924,7 +2501,7 @@ def build_parser() -> argparse.ArgumentParser:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
 
-    for name in ["plan", "critique", "integrate", "execute", "review"]:
+    for name in ["clarify", "plan", "critique", "integrate", "execute", "review"]:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
         step_parser.add_argument("--agent", choices=["claude", "codex"])
@@ -1933,8 +2510,17 @@ def build_parser() -> argparse.ArgumentParser:
         step_parser.add_argument("--ephemeral", action="store_true")
         if name == "execute":
             step_parser.add_argument("--confirm-destructive", action="store_true")
+            step_parser.add_argument("--user-approved", action="store_true")
         if name == "review":
             step_parser.add_argument("--confirm-self-review", action="store_true")
+
+    config_parser = subparsers.add_parser("config", help="View or edit megaplan configuration")
+    config_sub = config_parser.add_subparsers(dest="config_action", required=True)
+    config_sub.add_parser("show")
+    set_parser = config_sub.add_parser("set")
+    set_parser.add_argument("key")
+    set_parser.add_argument("value")
+    config_sub.add_parser("reset")
 
     override_parser = subparsers.add_parser("override")
     override_parser.add_argument("override_action", choices=["skip", "abort", "force-proceed", "add-note"])
@@ -1957,6 +2543,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "setup":
             response = handle_setup(args)
             return render_response(response)
+        if args.command == "config":
+            response = handle_config(args)
+            return render_response(response)
     except CliError as error:
         return error_response(error)
     root = Path.cwd()
@@ -1964,6 +2553,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "init":
             response = handle_init(root, args)
+        elif args.command == "clarify":
+            response = handle_clarify(root, args)
         elif args.command == "plan":
             response = handle_plan(root, args)
         elif args.command == "critique":
