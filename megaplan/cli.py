@@ -57,9 +57,11 @@ from megaplan.workers import (  # noqa: F401
     validate_payload,
     mock_worker_output,
     session_key_for,
-    persist_session,
+    update_session_state,
+    persist_session,  # backward-compatible alias
     resolve_agent_mode,
     WORKER_TIMEOUT_SECONDS,
+    STEP_SCHEMA_FILENAMES,
 )
 from megaplan.prompts import (  # noqa: F401
     create_claude_prompt,
@@ -412,7 +414,7 @@ def handle_clarify(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "questions": payload["questions"],
     }
     state["current_state"] = STATE_CLARIFIED
-    persist_session(state, "clarify", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    update_session_state(state, "clarify", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -468,7 +470,7 @@ def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     state["current_state"] = STATE_PLANNED
     state.setdefault("meta", {}).pop("user_approved_gate", None)
     state.setdefault("plan_versions", []).append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
-    persist_session(state, "plan", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    update_session_state(state, "plan", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -514,7 +516,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     recurring = compute_recurring_critiques(plan_dir, iteration)
     state.setdefault("meta", {}).setdefault("recurring_critiques", []).append(recurring)
     state["current_state"] = STATE_CRITIQUED
-    persist_session(state, "critique", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    update_session_state(state, "critique", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -628,7 +630,7 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     state.setdefault("plan_versions", []).append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
     state.setdefault("meta", {}).setdefault("plan_deltas", []).append(delta)
     update_flags_after_integrate(plan_dir, payload["flags_addressed"], plan_file=plan_filename, summary=payload["changes_summary"])
-    persist_session(state, "integrate", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    update_session_state(state, "integrate", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -767,7 +769,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     if worker.trace_output is not None:
         atomic_write_text(plan_dir / "execution_trace.jsonl", worker.trace_output)
     state["current_state"] = STATE_EXECUTED
-    persist_session(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    update_session_state(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
     if auto_approve:
         approval_mode = "auto_approve"
     elif state.get("meta", {}).get("user_approved_gate", False):
@@ -823,7 +825,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     passed = sum(1 for criterion in worker.payload.get("criteria", []) if criterion.get("pass"))
     total = len(worker.payload.get("criteria", []))
     state["current_state"] = STATE_DONE
-    persist_session(state, "review", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    update_session_state(state, "review", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -902,75 +904,95 @@ def handle_list(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def handle_override(root: Path, args: argparse.Namespace) -> dict[str, Any]:
-    plan_dir, state = load_plan(root, args.plan)
-    action = args.override_action
+def _override_add_note(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> dict[str, Any]:
+    action = "add-note"
     note = args.note
-    if action == "add-note":
-        override_entry = {"action": action, "timestamp": now_utc(), "note": note}
-        entry = {"timestamp": now_utc(), "note": note}
-        state.setdefault("meta", {}).setdefault("notes", []).append(entry)
-        state.setdefault("meta", {}).setdefault("overrides", []).append(override_entry)
-        save_state(plan_dir, state)
-        return {
-            "success": True,
-            "step": "override",
-            "summary": "Attached note to the plan.",
-            "next_step": infer_next_steps(state)[0] if infer_next_steps(state) else None,
-            "state": state["current_state"],
-        }
-    if action == "abort":
-        override_entry = {"action": action, "timestamp": now_utc(), "reason": args.reason}
-        state["current_state"] = STATE_ABORTED
-        state.setdefault("meta", {}).setdefault("overrides", []).append(override_entry)
-        save_state(plan_dir, state)
-        return {
-            "success": True,
-            "step": "override",
-            "summary": "Plan aborted.",
-            "next_step": None,
-            "state": STATE_ABORTED,
-        }
-    if action == "force-proceed":
-        if state["current_state"] == STATE_EVALUATED:
-            gate = run_gate_checks(plan_dir, state)
-            if not gate["preflight_results"]["project_dir_exists"] or not gate["preflight_results"]["success_criteria_present"]:
-                raise CliError("unsafe_override", "force-proceed cannot bypass missing project directory or success criteria")
-            atomic_write_json(plan_dir / "gate.json", gate)
-            final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-            atomic_write_text(plan_dir / "final.md", final_plan)
-            state["current_state"] = STATE_GATED
-            state.setdefault("meta", {}).pop("user_approved_gate", None)
-            state.setdefault("meta", {}).setdefault("overrides", []).append({"action": action, "timestamp": now_utc(), "reason": args.reason})
-            save_state(plan_dir, state)
-            return {
-                "success": True,
-                "step": "override",
-                "summary": "Force-proceeded past evaluation into gated state.",
-                "next_step": "execute",
-                "state": STATE_GATED,
-            }
+    override_entry = {"action": action, "timestamp": now_utc(), "note": note}
+    entry = {"timestamp": now_utc(), "note": note}
+    state.setdefault("meta", {}).setdefault("notes", []).append(entry)
+    state.setdefault("meta", {}).setdefault("overrides", []).append(override_entry)
+    save_state(plan_dir, state)
+    return {
+        "success": True,
+        "step": "override",
+        "summary": "Attached note to the plan.",
+        "next_step": infer_next_steps(state)[0] if infer_next_steps(state) else None,
+        "state": state["current_state"],
+    }
+
+
+def _override_abort(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> dict[str, Any]:
+    override_entry = {"action": "abort", "timestamp": now_utc(), "reason": args.reason}
+    state["current_state"] = STATE_ABORTED
+    state.setdefault("meta", {}).setdefault("overrides", []).append(override_entry)
+    save_state(plan_dir, state)
+    return {
+        "success": True,
+        "step": "override",
+        "summary": "Plan aborted.",
+        "next_step": None,
+        "state": STATE_ABORTED,
+    }
+
+
+def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> dict[str, Any]:
+    if state["current_state"] != STATE_EVALUATED:
         raise CliError(
             "invalid_transition",
             "force-proceed is only supported from evaluated state",
             valid_next=infer_next_steps(state),
         )
-    if action == "skip":
-        if state["current_state"] == STATE_EVALUATED:
-            evaluation = copy.deepcopy(state.get("last_evaluation", {}))
-            evaluation["recommendation"] = "SKIP"
-            state["last_evaluation"] = evaluation
-            state.setdefault("meta", {}).setdefault("overrides", []).append({"action": action, "timestamp": now_utc(), "reason": args.reason})
-            save_state(plan_dir, state)
-            return {
-                "success": True,
-                "step": "override",
-                "summary": "Marked evaluation as SKIP. Run gate next.",
-                "next_step": "gate",
-                "state": state["current_state"],
-            }
+    gate = run_gate_checks(plan_dir, state)
+    if not gate["preflight_results"]["project_dir_exists"] or not gate["preflight_results"]["success_criteria_present"]:
+        raise CliError("unsafe_override", "force-proceed cannot bypass missing project directory or success criteria")
+    atomic_write_json(plan_dir / "gate.json", gate)
+    final_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    atomic_write_text(plan_dir / "final.md", final_plan)
+    state["current_state"] = STATE_GATED
+    state.setdefault("meta", {}).pop("user_approved_gate", None)
+    state.setdefault("meta", {}).setdefault("overrides", []).append({"action": "force-proceed", "timestamp": now_utc(), "reason": args.reason})
+    save_state(plan_dir, state)
+    return {
+        "success": True,
+        "step": "override",
+        "summary": "Force-proceeded past evaluation into gated state.",
+        "next_step": "execute",
+        "state": STATE_GATED,
+    }
+
+
+def _override_skip(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> dict[str, Any]:
+    if state["current_state"] != STATE_EVALUATED:
         raise CliError("invalid_transition", "skip is currently only supported from evaluated state", valid_next=infer_next_steps(state))
-    raise CliError("invalid_override", f"Unknown override action: {action}")
+    evaluation = copy.deepcopy(state.get("last_evaluation", {}))
+    evaluation["recommendation"] = "SKIP"
+    state["last_evaluation"] = evaluation
+    state.setdefault("meta", {}).setdefault("overrides", []).append({"action": "skip", "timestamp": now_utc(), "reason": args.reason})
+    save_state(plan_dir, state)
+    return {
+        "success": True,
+        "step": "override",
+        "summary": "Marked evaluation as SKIP. Run gate next.",
+        "next_step": "gate",
+        "state": state["current_state"],
+    }
+
+
+_OVERRIDE_ACTIONS: dict[str, Any] = {
+    "add-note": _override_add_note,
+    "abort": _override_abort,
+    "force-proceed": _override_force_proceed,
+    "skip": _override_skip,
+}
+
+
+def handle_override(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    plan_dir, state = load_plan(root, args.plan)
+    action = args.override_action
+    handler = _OVERRIDE_ACTIONS.get(action)
+    if handler is None:
+        raise CliError("invalid_override", f"Unknown override action: {action}")
+    return handler(plan_dir, state, args)
 
 
 def bundled_agents_md() -> str:
@@ -1221,6 +1243,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# ---------------------------------------------------------------------------
+# Command dispatch
+# ---------------------------------------------------------------------------
+
+# Commands that take (root, args) and return a response dict.
+COMMAND_HANDLERS: dict[str, Any] = {
+    "init": handle_init,
+    "clarify": handle_clarify,
+    "plan": handle_plan,
+    "critique": handle_critique,
+    "evaluate": handle_evaluate,
+    "integrate": handle_integrate,
+    "gate": handle_gate,
+    "execute": handle_execute,
+    "review": handle_review,
+    "status": handle_status,
+    "audit": handle_audit,
+    "list": handle_list,
+    "override": handle_override,
+}
+
+
 def cli_entry() -> None:
     """Entry point for the `megaplan` console script."""
     sys.exit(main())
@@ -1241,36 +1285,12 @@ def main(argv: list[str] | None = None) -> int:
     root = Path.cwd()
     ensure_runtime_layout(root)
     try:
-        if args.command == "init":
-            response = handle_init(root, args)
-        elif args.command == "clarify":
-            response = handle_clarify(root, args)
-        elif args.command == "plan":
-            response = handle_plan(root, args)
-        elif args.command == "critique":
-            response = handle_critique(root, args)
-        elif args.command == "evaluate":
-            response = handle_evaluate(root, args)
-        elif args.command == "integrate":
-            response = handle_integrate(root, args)
-        elif args.command == "gate":
-            response = handle_gate(root, args)
-        elif args.command == "execute":
-            response = handle_execute(root, args)
-        elif args.command == "review":
-            response = handle_review(root, args)
-        elif args.command == "status":
-            response = handle_status(root, args)
-        elif args.command == "audit":
-            response = handle_audit(root, args)
-        elif args.command == "list":
-            response = handle_list(root, args)
-        elif args.command == "override":
-            if args.override_action == "add-note" and not args.note:
-                raise CliError("invalid_args", "override add-note requires a note")
-            response = handle_override(root, args)
-        else:
+        handler = COMMAND_HANDLERS.get(args.command)
+        if handler is None:
             raise CliError("invalid_command", f"Unknown command {args.command!r}")
+        if args.command == "override" and args.override_action == "add-note" and not args.note:
+            raise CliError("invalid_args", "override add-note requires a note")
+        response = handler(root, args)
         return render_response(response)
     except CliError as error:
         return error_response(error)

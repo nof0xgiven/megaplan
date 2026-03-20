@@ -35,6 +35,23 @@ from megaplan.prompts import create_claude_prompt, create_codex_prompt
 
 WORKER_TIMEOUT_SECONDS = 3600
 
+# Shared mapping from step name to schema filename, used by both
+# run_claude_step and run_codex_step.
+STEP_SCHEMA_FILENAMES: dict[str, str] = {
+    "clarify": "clarify.json",
+    "plan": "plan.json",
+    "integrate": "integrate.json",
+    "critique": "critique.json",
+    "execute": "execution.json",
+    "review": "review.json",
+}
+
+# Derive required keys per step from SCHEMAS so they aren't duplicated.
+_STEP_REQUIRED_KEYS: dict[str, list[str]] = {
+    step: SCHEMAS[filename].get("required", [])
+    for step, filename in STEP_SCHEMA_FILENAMES.items()
+}
+
 
 @dataclass
 class CommandResult:
@@ -152,23 +169,12 @@ def parse_json_file(path: Path) -> dict[str, Any]:
 
 
 def validate_payload(step: str, payload: dict[str, Any]) -> None:
-    def require_keys(keys: list[str]) -> None:
-        missing = [key for key in keys if key not in payload]
-        if missing:
-            raise CliError("parse_error", f"{step} output missing required keys: {', '.join(missing)}")
-
-    if step == "clarify":
-        require_keys(["questions", "refined_idea", "intent_summary"])
-    elif step == "plan":
-        require_keys(["plan", "questions", "success_criteria", "assumptions"])
-    elif step == "integrate":
-        require_keys(["plan", "changes_summary", "flags_addressed"])
-    elif step == "critique":
-        require_keys(["flags"])
-    elif step == "execute":
-        require_keys(["output", "files_changed", "commands_run", "deviations"])
-    elif step == "review":
-        require_keys(["criteria", "issues"])
+    required = _STEP_REQUIRED_KEYS.get(step)
+    if required is None:
+        return
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise CliError("parse_error", f"{step} output missing required keys: {', '.join(missing)}")
 
 
 def mock_worker_output(step: str, state: dict[str, Any], plan_dir: Path) -> WorkerResult:
@@ -307,7 +313,7 @@ def session_key_for(step: str, agent: str) -> str:
     return f"{agent}_{step}"
 
 
-def persist_session(state: dict[str, Any], step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool) -> None:
+def update_session_state(state: dict[str, Any], step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool) -> None:
     if not session_id:
         return
     key = session_key_for(step, agent)
@@ -320,20 +326,17 @@ def persist_session(state: dict[str, Any], step: str, agent: str, session_id: st
     }
 
 
+# Backward-compatible alias for the renamed function.
+persist_session = update_session_state
+
+
 def run_claude_step(step: str, state: dict[str, Any], plan_dir: Path, *, root: Path, fresh: bool) -> WorkerResult:
     import megaplan.cli as _cli  # deferred: tests monkeypatch _cli.mock_worker_output
 
     if os.getenv(MOCK_ENV_VAR) == "1":
         return _cli.mock_worker_output(step, state, plan_dir)
     project_dir = Path(state["config"]["project_dir"])
-    schema_name = {
-        "clarify": "clarify.json",
-        "plan": "plan.json",
-        "integrate": "integrate.json",
-        "critique": "critique.json",
-        "execute": "execution.json",
-        "review": "review.json",
-    }[step]
+    schema_name = STEP_SCHEMA_FILENAMES[step]
     schema_text = json.dumps(read_json(schemas_root(root) / schema_name))
     session_key = session_key_for(step, "claude")
     session = state.setdefault("sessions", {}).get(session_key, {})
@@ -376,14 +379,7 @@ def run_codex_step(
     if os.getenv(MOCK_ENV_VAR) == "1":
         return _cli.mock_worker_output(step, state, plan_dir)
     project_dir = Path(state["config"]["project_dir"])
-    schema_file = schemas_root(root) / {
-        "clarify": "clarify.json",
-        "plan": "plan.json",
-        "integrate": "integrate.json",
-        "critique": "critique.json",
-        "execute": "execution.json",
-        "review": "review.json",
-    }[step]
+    schema_file = schemas_root(root) / STEP_SCHEMA_FILENAMES[step]
     session_key = session_key_for(step, "codex")
     session = state.setdefault("sessions", {}).get(session_key, {})
     out_handle = tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False)

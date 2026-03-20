@@ -1,8 +1,10 @@
 import json
+import subprocess
 from argparse import Namespace
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from unittest.mock import patch
 
 import pytest
 
@@ -10,6 +12,7 @@ import megaplan
 import megaplan.cli
 import megaplan.workers
 import megaplan.prompts
+from megaplan.schemas import strict_schema
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -1650,3 +1653,191 @@ class TestPromptGeneration:
         with pytest.raises(megaplan.CliError) as exc_info:
             megaplan.prompts.create_codex_prompt("nonexistent", state, tmp_path)
         assert exc_info.value.code == "unsupported_step"
+
+
+# ── strict_schema tests ──────────────────────────────────────────────
+
+
+class TestStrictSchema:
+    def test_adds_additional_properties_false(self) -> None:
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+        result = strict_schema(schema)
+        assert result["additionalProperties"] is False
+
+    def test_preserves_existing_additional_properties(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "additionalProperties": True,
+        }
+        result = strict_schema(schema)
+        assert result["additionalProperties"] is True
+
+    def test_required_set_to_all_property_keys(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
+        }
+        result = strict_schema(schema)
+        assert sorted(result["required"]) == ["x", "y"]
+
+    def test_nested_objects_get_strict(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "child": {
+                    "type": "object",
+                    "properties": {"val": {"type": "number"}},
+                },
+            },
+        }
+        result = strict_schema(schema)
+        assert result["additionalProperties"] is False
+        child = result["properties"]["child"]
+        assert child["additionalProperties"] is False
+        assert child["required"] == ["val"]
+
+    def test_array_items_objects_get_strict(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "things": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                    },
+                },
+            },
+        }
+        result = strict_schema(schema)
+        item_schema = result["properties"]["things"]["items"]
+        assert item_schema["additionalProperties"] is False
+
+    def test_deeply_nested_three_levels(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "l1": {
+                    "type": "object",
+                    "properties": {
+                        "l2": {
+                            "type": "object",
+                            "properties": {"l3": {"type": "string"}},
+                        },
+                    },
+                },
+            },
+        }
+        result = strict_schema(schema)
+        l2 = result["properties"]["l1"]["properties"]["l2"]
+        assert l2["additionalProperties"] is False
+        assert l2["required"] == ["l3"]
+
+    def test_non_object_types_untouched(self) -> None:
+        assert strict_schema({"type": "string"}) == {"type": "string"}
+        assert strict_schema(42) == 42
+        assert strict_schema("hello") == "hello"
+
+
+# ── Error recovery tests ─────────────────────────────────────────────
+
+
+class TestRecordStepFailure:
+    def test_records_error_in_history_and_saves_state(self, plan_fixture: PlanFixture) -> None:
+        pf = plan_fixture
+        state = read_json(pf.plan_dir / "state.json")
+        initial_history_len = len(state.get("history", []))
+
+        error = megaplan.CliError(
+            "worker_error", "Something went wrong",
+            extra={"raw_output": "raw stderr output"},
+        )
+        megaplan.cli.record_step_failure(
+            pf.plan_dir, state, step="clarify", iteration=1, error=error,
+        )
+
+        # State was saved
+        saved = read_json(pf.plan_dir / "state.json")
+        assert len(saved["history"]) == initial_history_len + 1
+        last_entry = saved["history"][-1]
+        assert last_entry["step"] == "clarify"
+        assert last_entry["result"] == "error"
+        assert last_entry["message"] == "Something went wrong"
+
+    def test_stores_raw_output_file(self, plan_fixture: PlanFixture) -> None:
+        pf = plan_fixture
+        state = read_json(pf.plan_dir / "state.json")
+        error = megaplan.CliError(
+            "parse_error", "Bad JSON",
+            extra={"raw_output": "this is the raw output"},
+        )
+        megaplan.cli.record_step_failure(
+            pf.plan_dir, state, step="plan", iteration=1, error=error,
+        )
+        # The raw output file should exist
+        raw_files = list(pf.plan_dir.glob("plan_v1_raw.*"))
+        assert len(raw_files) == 1
+        assert "this is the raw output" in raw_files[0].read_text(encoding="utf-8")
+
+    def test_uses_message_when_no_raw_output(self, plan_fixture: PlanFixture) -> None:
+        pf = plan_fixture
+        state = read_json(pf.plan_dir / "state.json")
+        error = megaplan.CliError("worker_timeout", "Timed out")
+        megaplan.cli.record_step_failure(
+            pf.plan_dir, state, step="critique", iteration=1, error=error,
+        )
+        saved = read_json(pf.plan_dir / "state.json")
+        last_entry = saved["history"][-1]
+        assert last_entry["message"] == "Timed out"
+
+
+class TestWorkerTimeoutHandling:
+    def test_run_command_raises_on_timeout(self, tmp_path: Path) -> None:
+        """run_command wraps subprocess.TimeoutExpired into CliError."""
+        with patch("megaplan.workers.subprocess.run") as mock_run:
+            exc = subprocess.TimeoutExpired(cmd=["sleep", "999"], timeout=5)
+            exc.stdout = "partial"
+            exc.stderr = ""
+            mock_run.side_effect = exc
+            with pytest.raises(megaplan.CliError) as exc_info:
+                megaplan.workers.run_command(
+                    ["sleep", "999"], cwd=tmp_path, timeout=5,
+                )
+            assert exc_info.value.code == "worker_timeout"
+            assert "timed out" in exc_info.value.message.lower()
+            assert "raw_output" in exc_info.value.extra
+
+    def test_run_command_raises_on_file_not_found(self, tmp_path: Path) -> None:
+        """run_command wraps FileNotFoundError into CliError(agent_not_found)."""
+        with patch("megaplan.workers.subprocess.run") as mock_run:
+            mock_run.side_effect = FileNotFoundError("No such file")
+            with pytest.raises(megaplan.CliError) as exc_info:
+                megaplan.workers.run_command(
+                    ["nonexistent_binary"], cwd=tmp_path,
+                )
+            assert exc_info.value.code == "agent_not_found"
+
+
+class TestAgentNotFoundDuringStep:
+    def test_clarify_records_failure_and_reraises(
+        self, plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the worker raises agent_not_found, record_step_failure is called and the error re-raises."""
+        pf = plan_fixture
+        monkeypatch.delenv(megaplan.MOCK_ENV_VAR, raising=False)
+
+        def fake_run_command(*args, **kwargs):
+            raise megaplan.CliError("agent_not_found", "Command not found: claude")
+
+        monkeypatch.setattr(megaplan.workers, "run_command", fake_run_command)
+
+        args = pf.make_args()
+        with pytest.raises(megaplan.CliError) as exc_info:
+            megaplan.handle_clarify(pf.root, args)
+        assert exc_info.value.code == "agent_not_found"
+
+        # Verify failure was recorded in state
+        saved = read_json(pf.plan_dir / "state.json")
+        error_entries = [e for e in saved["history"] if e.get("result") == "error"]
+        assert len(error_entries) >= 1
