@@ -517,6 +517,48 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
+def resolve_severity(hint: str) -> str:
+    """Map a severity_hint to a resolved severity value."""
+    if hint == "likely-significant":
+        return "significant"
+    if hint == "likely-minor":
+        return "minor"
+    return "significant"
+
+
+def make_history_entry(
+    step: str,
+    *,
+    duration_ms: int,
+    cost_usd: float,
+    result: str,
+    worker: "WorkerResult | None" = None,
+    agent: str | None = None,
+    mode: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build a history entry dict with common fields plus step-specific extras."""
+    entry: dict[str, Any] = {
+        "step": step,
+        "timestamp": now_utc(),
+        "duration_ms": duration_ms,
+        "cost_usd": cost_usd,
+        "result": result,
+    }
+    if worker is not None and agent is not None and mode is not None:
+        entry["session_mode"] = mode
+        entry["session_id"] = worker.session_id
+        entry["agent"] = agent
+    entry.update(extra)
+    return entry
+
+
+def attach_agent_fallback(response: dict[str, Any], args: argparse.Namespace) -> None:
+    """Copy agent fallback info onto a response dict if present."""
+    if hasattr(args, "_agent_fallback"):
+        response["agent_fallback"] = args._agent_fallback
+
+
 def compute_plan_delta_percent(previous_text: str | None, current_text: str) -> float | None:
     if previous_text is None:
         return None
@@ -1362,10 +1404,10 @@ def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, ite
             existing = by_id[normalized["id"]]
             existing.update(normalized)
             existing["status"] = "open"
-            existing["severity"] = "significant" if normalized["severity_hint"] == "likely-significant" else "minor" if normalized["severity_hint"] == "likely-minor" else "significant"
+            existing["severity"] = resolve_severity(normalized["severity_hint"])
             existing["raised_in"] = f"critique_v{iteration}.json"
         else:
-            severity = "significant" if normalized["severity_hint"] == "likely-significant" else "minor" if normalized["severity_hint"] == "likely-minor" else "significant"
+            severity = resolve_severity(normalized["severity_hint"])
             created = {
                 **normalized,
                 "raised_in": f"critique_v{iteration}.json",
@@ -1420,15 +1462,14 @@ def record_step_failure(
     raw_name = store_raw_worker_output(plan_dir, step, iteration, raw_output)
     append_history(
         state,
-        {
-            "step": step,
-            "timestamp": now_utc(),
-            "duration_ms": duration_ms,
-            "cost_usd": 0.0,
-            "result": "error",
-            "raw_output_file": raw_name,
-            "message": error.message,
-        },
+        make_history_entry(
+            step,
+            duration_ms=duration_ms,
+            cost_usd=0.0,
+            result="error",
+            raw_output_file=raw_name,
+            message=error.message,
+        ),
     )
     save_state(plan_dir, state)
 
@@ -1534,17 +1575,16 @@ def handle_init(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     }
     append_history(
         state,
-        {
-            "step": "init",
-            "timestamp": now_utc(),
-            "duration_ms": 0,
-            "cost_usd": 0.0,
-            "result": "success",
-            "environment": {
+        make_history_entry(
+            "init",
+            duration_ms=0,
+            cost_usd=0.0,
+            result="success",
+            environment={
                 "claude": bool(ensure_command("claude")),
                 "codex": bool(ensure_command("codex")),
             },
-        },
+        ),
     )
     save_state(plan_dir, state)
     return {
@@ -1580,18 +1620,17 @@ def handle_clarify(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     persist_session(state, "clarify", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
-        {
-            "step": "clarify",
-            "timestamp": now_utc(),
-            "duration_ms": worker.duration_ms,
-            "cost_usd": worker.cost_usd,
-            "result": "success",
-            "output_file": clarify_filename,
-            "artifact_hash": sha256_file(plan_dir / clarify_filename),
-            "session_mode": mode,
-            "session_id": worker.session_id,
-            "agent": agent,
-        },
+        make_history_entry(
+            "clarify",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file=clarify_filename,
+            artifact_hash=sha256_file(plan_dir / clarify_filename),
+        ),
     )
     save_state(plan_dir, state)
     response = {
@@ -1603,8 +1642,7 @@ def handle_clarify(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "state": STATE_CLARIFIED,
         "questions": payload["questions"],
     }
-    if hasattr(args, "_agent_fallback"):
-        response["agent_fallback"] = args._agent_fallback
+    attach_agent_fallback(response, args)
     return response
 
 
@@ -1638,18 +1676,17 @@ def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     persist_session(state, "plan", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
-        {
-            "step": "plan",
-            "timestamp": now_utc(),
-            "duration_ms": worker.duration_ms,
-            "cost_usd": worker.cost_usd,
-            "result": "success",
-            "output_file": plan_filename,
-            "artifact_hash": meta["hash"],
-            "session_mode": mode,
-            "session_id": worker.session_id,
-            "agent": agent,
-        },
+        make_history_entry(
+            "plan",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file=plan_filename,
+            artifact_hash=meta["hash"],
+        ),
     )
     save_state(plan_dir, state)
     response = {
@@ -1661,8 +1698,7 @@ def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "next_step": "critique",
         "state": STATE_PLANNED,
     }
-    if hasattr(args, "_agent_fallback"):
-        response["agent_fallback"] = args._agent_fallback
+    attach_agent_fallback(response, args)
     return response
 
 
@@ -1686,19 +1722,18 @@ def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     persist_session(state, "critique", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
-        {
-            "step": "critique",
-            "timestamp": now_utc(),
-            "duration_ms": worker.duration_ms,
-            "cost_usd": worker.cost_usd,
-            "result": "success",
-            "output_file": critique_filename,
-            "artifact_hash": sha256_file(plan_dir / critique_filename),
-            "flags_count": len(worker.payload.get("flags", [])),
-            "session_mode": mode,
-            "session_id": worker.session_id,
-            "agent": agent,
-        },
+        make_history_entry(
+            "critique",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file=critique_filename,
+            artifact_hash=sha256_file(plan_dir / critique_filename),
+            flags_count=len(worker.payload.get("flags", [])),
+        ),
     )
     save_state(plan_dir, state)
     scope_flags = scope_creep_flags(registry, statuses=FLAG_BLOCKING_STATUSES)
@@ -1718,8 +1753,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         response["warnings"] = [
             "Scope creep detected in the plan. Surface this drift to the user while continuing the loop."
         ]
-    if hasattr(args, "_agent_fallback"):
-        response["agent_fallback"] = args._agent_fallback
+    attach_agent_fallback(response, args)
     return response
 
 
@@ -1874,16 +1908,15 @@ def handle_evaluate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     state["last_evaluation"] = evaluation
     append_history(
         state,
-        {
-            "step": "evaluate",
-            "timestamp": now_utc(),
-            "duration_ms": 0,
-            "cost_usd": 0.0,
-            "result": "success",
-            "output_file": filename,
-            "artifact_hash": sha256_file(plan_dir / filename),
-            "recommendation": evaluation["recommendation"],
-        },
+        make_history_entry(
+            "evaluate",
+            duration_ms=0,
+            cost_usd=0.0,
+            result="success",
+            output_file=filename,
+            artifact_hash=sha256_file(plan_dir / filename),
+            recommendation=evaluation["recommendation"],
+        ),
     )
     save_state(plan_dir, state)
     return {
@@ -1942,19 +1975,18 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     persist_session(state, "integrate", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
-        {
-            "step": "integrate",
-            "timestamp": now_utc(),
-            "duration_ms": worker.duration_ms,
-            "cost_usd": worker.cost_usd,
-            "result": "success",
-            "output_file": plan_filename,
-            "artifact_hash": meta["hash"],
-            "session_mode": mode,
-            "session_id": worker.session_id,
-            "agent": agent,
-            "flags_addressed": payload["flags_addressed"],
-        },
+        make_history_entry(
+            "integrate",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file=plan_filename,
+            artifact_hash=meta["hash"],
+            flags_addressed=payload["flags_addressed"],
+        ),
     )
     save_state(plan_dir, state)
     response = {
@@ -1966,8 +1998,7 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "next_step": "critique",
         "state": STATE_PLANNED,
     }
-    if hasattr(args, "_agent_fallback"):
-        response["agent_fallback"] = args._agent_fallback
+    attach_agent_fallback(response, args)
     return response
 
 
@@ -2007,15 +2038,14 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     if not gate["passed"]:
         append_history(
             state,
-            {
-                "step": "gate",
-                "timestamp": now_utc(),
-                "duration_ms": 0,
-                "cost_usd": 0.0,
-                "result": "blocked",
-                "output_file": "link.json",
-                "artifact_hash": sha256_file(plan_dir / "link.json"),
-            },
+            make_history_entry(
+                "gate",
+                duration_ms=0,
+                cost_usd=0.0,
+                result="blocked",
+                output_file="link.json",
+                artifact_hash=sha256_file(plan_dir / "link.json"),
+            ),
         )
         save_state(plan_dir, state)
         return {
@@ -2035,15 +2065,14 @@ def handle_gate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     state.setdefault("meta", {}).pop("user_approved_gate", None)
     append_history(
         state,
-        {
-            "step": "gate",
-            "timestamp": now_utc(),
-            "duration_ms": 0,
-            "cost_usd": 0.0,
-            "result": "success",
-            "output_file": "link.json",
-            "artifact_hash": sha256_file(plan_dir / "link.json"),
-        },
+        make_history_entry(
+            "gate",
+            duration_ms=0,
+            cost_usd=0.0,
+            result="success",
+            output_file="link.json",
+            artifact_hash=sha256_file(plan_dir / "link.json"),
+        ),
     )
     save_state(plan_dir, state)
     return {
@@ -2085,18 +2114,17 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     persist_session(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
-        {
-            "step": "execute",
-            "timestamp": now_utc(),
-            "duration_ms": worker.duration_ms,
-            "cost_usd": worker.cost_usd,
-            "result": "success",
-            "output_file": "execution.json",
-            "artifact_hash": sha256_file(plan_dir / "execution.json"),
-            "session_mode": mode,
-            "session_id": worker.session_id,
-            "agent": agent,
-        },
+        make_history_entry(
+            "execute",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file="execution.json",
+            artifact_hash=sha256_file(plan_dir / "execution.json"),
+        ),
     )
     save_state(plan_dir, state)
     artifacts = ["execution.json"]
@@ -2114,8 +2142,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "auto_approve": auto_approve,
         "user_approved_gate": bool(state.get("meta", {}).get("user_approved_gate", False)),
     }
-    if hasattr(args, "_agent_fallback"):
-        response["agent_fallback"] = args._agent_fallback
+    attach_agent_fallback(response, args)
     return response
 
 
@@ -2136,18 +2163,17 @@ def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     persist_session(state, "review", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
-        {
-            "step": "review",
-            "timestamp": now_utc(),
-            "duration_ms": worker.duration_ms,
-            "cost_usd": worker.cost_usd,
-            "result": "success",
-            "output_file": "review.json",
-            "artifact_hash": sha256_file(plan_dir / "review.json"),
-            "session_mode": mode,
-            "session_id": worker.session_id,
-            "agent": agent,
-        },
+        make_history_entry(
+            "review",
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result="success",
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file="review.json",
+            artifact_hash=sha256_file(plan_dir / "review.json"),
+        ),
     )
     save_state(plan_dir, state)
     response = {
@@ -2159,13 +2185,13 @@ def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "state": STATE_DONE,
         "issues": worker.payload.get("issues", []),
     }
-    if hasattr(args, "_agent_fallback"):
-        response["agent_fallback"] = args._agent_fallback
+    attach_agent_fallback(response, args)
     return response
 
 
 def handle_status(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     plan_dir, state = load_plan(root, args.plan)
+    next_steps = infer_next_steps(state)
     return {
         "success": True,
         "step": "status",
@@ -2173,8 +2199,8 @@ def handle_status(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "state": state["current_state"],
         "iteration": state["iteration"],
         "summary": f"Plan '{state['name']}' is currently in state '{state['current_state']}'.",
-        "next_step": infer_next_steps(state)[0] if infer_next_steps(state) else None,
-        "valid_next": infer_next_steps(state),
+        "next_step": next_steps[0] if next_steps else None,
+        "valid_next": next_steps,
         "artifacts": sorted(path.name for path in plan_dir.iterdir() if path.is_file()),
     }
 
@@ -2195,13 +2221,14 @@ def handle_list(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     items = []
     for plan_dir in active_plan_dirs(root):
         state = read_json(plan_dir / "state.json")
+        next_steps = infer_next_steps(state)
         items.append(
             {
                 "name": state["name"],
                 "idea": state["idea"],
                 "state": state["current_state"],
                 "iteration": state["iteration"],
-                "next_step": infer_next_steps(state)[0] if infer_next_steps(state) else None,
+                "next_step": next_steps[0] if next_steps else None,
             }
         )
     return {
