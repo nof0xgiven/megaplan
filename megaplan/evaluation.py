@@ -60,8 +60,8 @@ def compute_recurring_critiques(plan_dir: Path, iteration: int) -> list[str]:
         return []
     previous = read_json(current_iteration_artifact(plan_dir, "critique", iteration - 1))
     current = read_json(current_iteration_artifact(plan_dir, "critique", iteration))
-    previous_concerns = {normalize_text(item["concern"]) for item in previous.get("flags", [])}
-    current_concerns = {normalize_text(item["concern"]) for item in current.get("flags", [])}
+    previous_concerns = {normalize_text(flag["concern"]) for flag in previous.get("flags", [])}
+    current_concerns = {normalize_text(flag["concern"]) for flag in current.get("flags", [])}
     return sorted(previous_concerns.intersection(current_concerns))
 
 

@@ -2,11 +2,22 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from argparse import Namespace
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from megaplan._core import CliError
-from megaplan.workers import parse_claude_envelope, validate_payload
+from megaplan.workers import (
+    parse_claude_envelope,
+    validate_payload,
+    resolve_agent_mode,
+    run_command,
+    update_session_state,
+    session_key_for,
+)
 
 
 class TestParsClaudeEnvelope:
@@ -90,3 +101,143 @@ class TestValidatePayload:
     def test_unknown_step_does_not_raise(self) -> None:
         """Unknown steps are silently accepted (no schema to check)."""
         validate_payload("unknown_step", {"anything": "goes"})
+
+
+# ---------------------------------------------------------------------------
+# resolve_agent_mode tests
+# ---------------------------------------------------------------------------
+
+def _make_args(**overrides) -> Namespace:
+    defaults = {
+        "agent": None,
+        "ephemeral": False,
+        "fresh": False,
+        "persist": False,
+        "confirm_self_review": False,
+    }
+    defaults.update(overrides)
+    return Namespace(**defaults)
+
+
+class TestResolveAgentMode:
+    def test_explicit_agent(self) -> None:
+        with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
+            agent, mode, refreshed = resolve_agent_mode("plan", _make_args(agent="claude"))
+        assert agent == "claude"
+        assert mode == "persistent"
+        assert refreshed is False
+
+    def test_explicit_agent_not_found(self) -> None:
+        with patch("megaplan.workers.shutil.which", return_value=None):
+            with pytest.raises(CliError) as exc_info:
+                resolve_agent_mode("plan", _make_args(agent="claude"))
+            assert exc_info.value.code == "agent_not_found"
+
+    def test_ephemeral_mode(self) -> None:
+        with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
+            agent, mode, refreshed = resolve_agent_mode("plan", _make_args(agent="claude", ephemeral=True))
+        assert mode == "ephemeral"
+        assert refreshed is True
+
+    def test_fresh_mode(self) -> None:
+        with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
+            agent, mode, refreshed = resolve_agent_mode("plan", _make_args(agent="claude", fresh=True))
+        assert mode == "persistent"
+        assert refreshed is True
+
+    def test_conflicting_flags_raises(self) -> None:
+        with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
+            with pytest.raises(CliError) as exc_info:
+                resolve_agent_mode("plan", _make_args(agent="claude", fresh=True, ephemeral=True))
+            assert exc_info.value.code == "invalid_args"
+
+    def test_fallback_when_default_missing(self) -> None:
+        def mock_which(name: str) -> str | None:
+            return "/usr/bin/codex" if name == "codex" else None
+
+        with patch("megaplan.workers.shutil.which", side_effect=mock_which):
+            with patch("megaplan.workers.detect_available_agents", return_value=["codex"]):
+                with patch("megaplan.workers.load_config", return_value={}):
+                    args = _make_args()
+                    agent, mode, refreshed = resolve_agent_mode("plan", args)
+        assert agent == "codex"
+        assert hasattr(args, "_agent_fallback")
+
+    def test_no_agents_available_raises(self) -> None:
+        with patch("megaplan.workers.shutil.which", return_value=None):
+            with patch("megaplan.workers.detect_available_agents", return_value=[]):
+                with patch("megaplan.workers.load_config", return_value={}):
+                    with pytest.raises(CliError) as exc_info:
+                        resolve_agent_mode("plan", _make_args())
+                    assert exc_info.value.code == "agent_not_found"
+
+    def test_review_claude_defaults_to_fresh(self) -> None:
+        with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
+            agent, mode, refreshed = resolve_agent_mode("review", _make_args(agent="claude"))
+        assert refreshed is True
+
+    def test_review_claude_persist_needs_confirmation(self) -> None:
+        with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
+            with pytest.raises(CliError) as exc_info:
+                resolve_agent_mode("review", _make_args(agent="claude", persist=True))
+            assert exc_info.value.code == "invalid_args"
+
+
+# ---------------------------------------------------------------------------
+# run_command tests
+# ---------------------------------------------------------------------------
+
+class TestRunCommand:
+    def test_successful_command(self, tmp_path: Path) -> None:
+        result = run_command(["echo", "hello"], cwd=tmp_path)
+        assert result.returncode == 0
+        assert "hello" in result.stdout
+        assert result.duration_ms >= 0
+
+    def test_command_not_found(self, tmp_path: Path) -> None:
+        with pytest.raises(CliError) as exc_info:
+            run_command(["nonexistent_binary_xyz_123"], cwd=tmp_path)
+        assert exc_info.value.code == "agent_not_found"
+
+    def test_timeout_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(CliError) as exc_info:
+            run_command(["sleep", "10"], cwd=tmp_path, timeout=1)
+        assert exc_info.value.code == "worker_timeout"
+
+
+# ---------------------------------------------------------------------------
+# update_session_state tests
+# ---------------------------------------------------------------------------
+
+class TestUpdateSessionState:
+    def test_returns_none_for_no_session(self) -> None:
+        result = update_session_state("plan", "claude", None, mode="persistent", refreshed=False)
+        assert result is None
+
+    def test_returns_key_and_entry(self) -> None:
+        result = update_session_state("plan", "claude", "sess-123", mode="persistent", refreshed=False)
+        assert result is not None
+        key, entry = result
+        assert key == "claude_planner"
+        assert entry["id"] == "sess-123"
+        assert entry["mode"] == "persistent"
+        assert entry["refreshed"] is False
+
+    def test_preserves_existing_created_at(self) -> None:
+        existing = {"claude_planner": {"created_at": "2026-01-01T00:00:00Z"}}
+        result = update_session_state(
+            "plan", "claude", "sess-456",
+            mode="persistent", refreshed=True,
+            existing_sessions=existing,
+        )
+        assert result is not None
+        _key, entry = result
+        assert entry["created_at"] == "2026-01-01T00:00:00Z"
+
+    def test_session_key_mapping(self) -> None:
+        assert session_key_for("clarify", "claude") == "claude_planner"
+        assert session_key_for("plan", "codex") == "codex_planner"
+        assert session_key_for("integrate", "claude") == "claude_planner"
+        assert session_key_for("critique", "codex") == "codex_critic"
+        assert session_key_for("execute", "claude") == "claude_executor"
+        assert session_key_for("review", "codex") == "codex_reviewer"

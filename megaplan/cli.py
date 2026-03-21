@@ -14,7 +14,8 @@ from typing import Any
 
 # Import shared utilities from _core — these were previously defined here.
 from megaplan._core import (  # noqa: F401
-    PlanState, PlanConfig, PlanMeta, FlagRecord,
+    PlanState, PlanConfig, PlanMeta, FlagRecord, FlagRegistry,
+    SessionInfo, PlanVersionRecord, HistoryEntry,
     STATE_INITIALIZED, STATE_CLARIFIED, STATE_PLANNED, STATE_CRITIQUED, STATE_EVALUATED,
     STATE_GATED, STATE_EXECUTED, STATE_DONE, STATE_ABORTED,
     TERMINAL_STATES, FLAG_BLOCKING_STATUSES, MOCK_ENV_VAR,
@@ -48,20 +49,11 @@ from megaplan.workers import (  # noqa: F401
     CommandResult,
     WorkerResult,
     run_command,
-    run_claude_step,
-    run_codex_step,
     run_step_with_worker,
-    extract_session_id,
-    parse_claude_envelope,
-    parse_json_file,
     validate_payload,
     mock_worker_output,
-    session_key_for,
     update_session_state,
-    persist_session,  # backward-compatible alias
     resolve_agent_mode,
-    WORKER_TIMEOUT_SECONDS,
-    STEP_SCHEMA_FILENAMES,
 )
 from megaplan.prompts import (  # noqa: F401
     create_claude_prompt,
@@ -69,24 +61,22 @@ from megaplan.prompts import (  # noqa: F401
 )
 
 __all__ = [
+    # Types
     "PlanState", "PlanConfig", "PlanMeta", "FlagRecord",
-    "STATE_INITIALIZED", "STATE_CLARIFIED", "STATE_PLANNED", "STATE_CRITIQUED", "STATE_EVALUATED",
-    "STATE_GATED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
-    "TERMINAL_STATES", "FLAG_BLOCKING_STATUSES", "MOCK_ENV_VAR",
+    # State constants
+    "STATE_INITIALIZED", "STATE_CLARIFIED", "STATE_PLANNED", "STATE_CRITIQUED",
+    "STATE_EVALUATED", "STATE_GATED", "STATE_EXECUTED", "STATE_DONE", "STATE_ABORTED",
+    "TERMINAL_STATES",
+    # Error and result types
     "CliError", "CommandResult", "WorkerResult",
-    "slugify", "compute_plan_delta_percent", "normalize_flag_record",
-    "unresolved_significant_flags", "flag_weight",
-    "update_flags_after_critique", "update_flags_after_integrate",
-    "compute_recurring_critiques", "build_evaluation",
-    "infer_next_steps", "require_state",
-    "handle_init", "handle_clarify", "handle_plan", "handle_critique", "handle_evaluate",
-    "handle_integrate", "handle_gate", "handle_execute", "handle_review",
-    "handle_status", "handle_audit", "handle_list", "handle_override",
-    "handle_setup", "handle_setup_global", "handle_config",
-    "load_flag_registry", "save_flag_registry",
-    "load_config", "save_config", "config_dir", "detect_available_agents",
-    "DEFAULT_AGENT_ROUTING",
-    "plans_root", "main", "cli_entry",
+    # Handlers
+    "handle_init", "handle_clarify", "handle_plan", "handle_critique",
+    "handle_evaluate", "handle_integrate", "handle_gate", "handle_execute",
+    "handle_review", "handle_status", "handle_audit", "handle_list",
+    "handle_override", "handle_setup", "handle_setup_global", "handle_config",
+    # Key utilities
+    "slugify", "build_evaluation", "mock_worker_output",
+    "main", "cli_entry",
 ]
 
 
@@ -94,8 +84,13 @@ __all__ = [
 # Helpers that remain in cli.py (not needed by submodules)
 # ---------------------------------------------------------------------------
 
-def render_response(data: dict[str, Any], *, exit_code: int = 0) -> int:
-    print(json_dump(data), end="")
+def _append_to_meta(state: PlanState, field: str, value: Any) -> None:
+    """Append *value* to ``state["meta"][field]``, creating intermediates as needed."""
+    state.setdefault("meta", {}).setdefault(field, []).append(value)
+
+
+def render_response(response: dict[str, Any], *, exit_code: int = 0) -> int:
+    print(json_dump(response), end="")
     return exit_code
 
 
@@ -112,6 +107,14 @@ def error_response(error: CliError) -> int:
     return render_response(payload, exit_code=error.exit_code)
 
 
+def apply_session_update(state: PlanState, step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool) -> None:
+    """Call update_session_state and store the result on state."""
+    result = update_session_state(step, agent, session_id, mode=mode, refreshed=refreshed, existing_sessions=state.get("sessions"))
+    if result is not None:
+        key, entry = result
+        state.setdefault("sessions", {})[key] = entry
+
+
 def append_history(state: PlanState, entry: dict[str, Any]) -> None:
     state.setdefault("history", []).append(entry)
     state.setdefault("meta", {}).setdefault("total_cost_usd", 0.0)
@@ -121,7 +124,7 @@ def append_history(state: PlanState, entry: dict[str, Any]) -> None:
     )
 
 
-def next_flag_number(flags: list[dict[str, Any]]) -> int:
+def next_flag_number(flags: list[FlagRecord]) -> int:
     highest = 0
     for flag in flags:
         match = re.fullmatch(r"FLAG-(\d+)", str(flag.get("id", "")))
@@ -135,11 +138,18 @@ def make_flag_id(number: int) -> str:
 
 
 def resolve_severity(hint: str) -> str:
-    """Map a severity_hint to a resolved severity value."""
+    """Map a severity_hint to a resolved severity value.
+
+    The fallback for 'uncertain' (and any unrecognised hint) is
+    'significant' -- this is a deliberate conservative default so that
+    ambiguous flags surface for human review rather than being silently
+    downgraded.
+    """
     if hint == "likely-significant":
         return "significant"
     if hint == "likely-minor":
         return "minor"
+    # Deliberate: 'uncertain' resolves to 'significant' as a conservative default.
     return "significant"
 
 
@@ -153,9 +163,9 @@ def make_history_entry(
     agent: str | None = None,
     mode: str | None = None,
     **extra: Any,
-) -> dict[str, Any]:
+) -> HistoryEntry:
     """Build a history entry dict with common fields plus step-specific extras."""
-    entry: dict[str, Any] = {
+    entry: HistoryEntry = {
         "step": step,
         "timestamp": now_utc(),
         "duration_ms": duration_ms,
@@ -216,28 +226,27 @@ def require_state(state: PlanState, step: str, allowed: set[str]) -> None:
 
 
 def find_command(name: str) -> str | None:
-    import shutil
     return shutil.which(name)
 
 
-def normalize_flag_record(item: dict[str, Any], fallback_id: str) -> dict[str, Any]:
-    category = item.get("category", "other")
+def normalize_flag_record(raw_flag: dict[str, Any], fallback_id: str) -> FlagRecord:
+    category = raw_flag.get("category", "other")
     if category not in {"correctness", "security", "completeness", "performance", "maintainability", "other"}:
         category = "other"
-    severity_hint = item.get("severity_hint") or "uncertain"
+    severity_hint = raw_flag.get("severity_hint") or "uncertain"
     if severity_hint not in {"likely-significant", "likely-minor", "uncertain"}:
         severity_hint = "uncertain"
-    raw_id = item.get("id")
+    raw_id = raw_flag.get("id")
     return {
         "id": fallback_id if raw_id in {None, "", "FLAG-000"} else raw_id,
-        "concern": item.get("concern", "").strip(),
+        "concern": raw_flag.get("concern", "").strip(),
         "category": category,
         "severity_hint": severity_hint,
-        "evidence": item.get("evidence", "").strip(),
+        "evidence": raw_flag.get("evidence", "").strip(),
     }
 
 
-def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, iteration: int) -> dict[str, Any]:
+def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, iteration: int) -> FlagRegistry:
     registry = load_flag_registry(plan_dir)
     flags = registry.setdefault("flags", [])
     by_id = {flag["id"]: flag for flag in flags}
@@ -281,7 +290,7 @@ def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, ite
     return registry
 
 
-def update_flags_after_integrate(plan_dir: Path, flags_addressed: list[str], *, plan_file: str, summary: str) -> dict[str, Any]:
+def update_flags_after_integrate(plan_dir: Path, flags_addressed: list[str], *, plan_file: str, summary: str) -> FlagRegistry:
     registry = load_flag_registry(plan_dir)
     for flag in registry.get("flags", []):
         if flag["id"] in flags_addressed:
@@ -414,7 +423,7 @@ def handle_clarify(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         "questions": payload["questions"],
     }
     state["current_state"] = STATE_CLARIFIED
-    update_session_state(state, "clarify", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    apply_session_update(state, "clarify", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -470,7 +479,7 @@ def handle_plan(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     state["current_state"] = STATE_PLANNED
     state.setdefault("meta", {}).pop("user_approved_gate", None)
     state.setdefault("plan_versions", []).append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
-    update_session_state(state, "plan", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    apply_session_update(state, "plan", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -512,11 +521,11 @@ def handle_critique(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     atomic_write_json(plan_dir / critique_filename, worker.payload)
     registry = update_flags_after_critique(plan_dir, worker.payload, iteration=iteration)
     significant = len([f for f in registry.get("flags", []) if f.get("severity") == "significant" and f.get("status") in FLAG_BLOCKING_STATUSES])
-    state.setdefault("meta", {}).setdefault("significant_counts", []).append(significant)
+    _append_to_meta(state, "significant_counts", significant)
     recurring = compute_recurring_critiques(plan_dir, iteration)
-    state.setdefault("meta", {}).setdefault("recurring_critiques", []).append(recurring)
+    _append_to_meta(state, "recurring_critiques", recurring)
     state["current_state"] = STATE_CRITIQUED
-    update_session_state(state, "critique", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    apply_session_update(state, "critique", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -559,7 +568,7 @@ def handle_evaluate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     require_state(state, "evaluate", {STATE_CRITIQUED})
     evaluation = build_evaluation(plan_dir, state)
     iteration = state["iteration"]
-    state.setdefault("meta", {}).setdefault("weighted_scores", []).append(evaluation["signals"]["weighted_score"])
+    _append_to_meta(state, "weighted_scores", evaluation["signals"]["weighted_score"])
     filename = f"evaluation_v{iteration}.json"
     atomic_write_json(plan_dir / filename, evaluation)
     state["current_state"] = STATE_EVALUATED
@@ -628,9 +637,9 @@ def handle_integrate(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     state["current_state"] = STATE_PLANNED
     state.setdefault("meta", {}).pop("user_approved_gate", None)
     state.setdefault("plan_versions", []).append({"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]})
-    state.setdefault("meta", {}).setdefault("plan_deltas", []).append(delta)
+    _append_to_meta(state, "plan_deltas", delta)
     update_flags_after_integrate(plan_dir, payload["flags_addressed"], plan_file=plan_filename, summary=payload["changes_summary"])
-    update_session_state(state, "integrate", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    apply_session_update(state, "integrate", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -769,7 +778,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     if worker.trace_output is not None:
         atomic_write_text(plan_dir / "execution_trace.jsonl", worker.trace_output)
     state["current_state"] = STATE_EXECUTED
-    update_session_state(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    apply_session_update(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
     if auto_approve:
         approval_mode = "auto_approve"
     elif state.get("meta", {}).get("user_approved_gate", False):
@@ -825,7 +834,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     passed = sum(1 for criterion in worker.payload.get("criteria", []) if criterion.get("pass"))
     total = len(worker.payload.get("criteria", []))
     state["current_state"] = STATE_DONE
-    update_session_state(state, "review", agent, worker.session_id, mode=mode, refreshed=refreshed)
+    apply_session_update(state, "review", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
@@ -908,9 +917,9 @@ def _override_add_note(plan_dir: Path, state: PlanState, args: argparse.Namespac
     action = "add-note"
     note = args.note
     override_entry = {"action": action, "timestamp": now_utc(), "note": note}
-    entry = {"timestamp": now_utc(), "note": note}
-    state.setdefault("meta", {}).setdefault("notes", []).append(entry)
-    state.setdefault("meta", {}).setdefault("overrides", []).append(override_entry)
+    note_record = {"timestamp": now_utc(), "note": note}
+    _append_to_meta(state, "notes", note_record)
+    _append_to_meta(state, "overrides", override_entry)
     save_state(plan_dir, state)
     return {
         "success": True,
@@ -924,7 +933,7 @@ def _override_add_note(plan_dir: Path, state: PlanState, args: argparse.Namespac
 def _override_abort(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> dict[str, Any]:
     override_entry = {"action": "abort", "timestamp": now_utc(), "reason": args.reason}
     state["current_state"] = STATE_ABORTED
-    state.setdefault("meta", {}).setdefault("overrides", []).append(override_entry)
+    _append_to_meta(state, "overrides", override_entry)
     save_state(plan_dir, state)
     return {
         "success": True,
@@ -950,7 +959,7 @@ def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Nam
     atomic_write_text(plan_dir / "final.md", final_plan)
     state["current_state"] = STATE_GATED
     state.setdefault("meta", {}).pop("user_approved_gate", None)
-    state.setdefault("meta", {}).setdefault("overrides", []).append({"action": "force-proceed", "timestamp": now_utc(), "reason": args.reason})
+    _append_to_meta(state, "overrides", {"action": "force-proceed", "timestamp": now_utc(), "reason": args.reason})
     save_state(plan_dir, state)
     return {
         "success": True,
@@ -967,7 +976,7 @@ def _override_skip(plan_dir: Path, state: PlanState, args: argparse.Namespace) -
     evaluation = copy.deepcopy(state.get("last_evaluation", {}))
     evaluation["recommendation"] = "SKIP"
     state["last_evaluation"] = evaluation
-    state.setdefault("meta", {}).setdefault("overrides", []).append({"action": "skip", "timestamp": now_utc(), "reason": args.reason})
+    _append_to_meta(state, "overrides", {"action": "skip", "timestamp": now_utc(), "reason": args.reason})
     save_state(plan_dir, state)
     return {
         "success": True,
@@ -1078,14 +1087,14 @@ def handle_setup_global(force: bool = False, home: Path | None = None) -> dict[s
         routing = agents_config
 
     lines = []
-    for entry in installed:
-        if entry.get("reason") == "not installed":
-            lines.append(f"  {entry['agent']}: skipped (not installed)")
-        elif entry["skipped"]:
-            lines.append(f"  {entry['agent']}: up to date")
+    for install_record in installed:
+        if install_record.get("reason") == "not installed":
+            lines.append(f"  {install_record['agent']}: skipped (not installed)")
+        elif install_record["skipped"]:
+            lines.append(f"  {install_record['agent']}: up to date")
         else:
-            verb = "overwrote" if entry["existed"] else "created"
-            lines.append(f"  {entry['agent']}: {verb} {entry['path']}")
+            verb = "overwrote" if install_record["existed"] else "created"
+            lines.append(f"  {install_record['agent']}: {verb} {install_record['path']}")
 
     result_data: dict[str, Any] = {
         "success": True,

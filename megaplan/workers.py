@@ -19,6 +19,7 @@ from typing import Any
 from megaplan.schemas import SCHEMAS
 from megaplan._core import (
     PlanState,
+    SessionInfo,
     CliError,
     MOCK_ENV_VAR,
     read_json,
@@ -178,128 +179,147 @@ def validate_payload(step: str, payload: dict[str, Any]) -> None:
         raise CliError("parse_error", f"{step} output missing required keys: {', '.join(missing)}")
 
 
-def mock_worker_output(step: str, state: PlanState, plan_dir: Path) -> WorkerResult:
+def _mock_clarify(state: PlanState, plan_dir: Path) -> WorkerResult:
+    payload = {
+        "questions": [
+            {
+                "question": "Should the feature be behind a flag?",
+                "context": "No feature flags exist in the repo currently.",
+            },
+        ],
+        "refined_idea": f"Refined: {state['idea']}",
+        "intent_summary": f"The user wants to {state['idea']}.",
+    }
+    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+
+
+def _mock_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
+    payload = {
+        "plan": textwrap.dedent(
+            f"""
+            # Implementation Plan
+
+            ## Goal
+            Implement: {state['idea']}
+
+            ## Steps
+            1. Inspect the repository and identify the touch points.
+            2. Implement the feature with tests or local verification hooks.
+            3. Validate success criteria before finishing.
+
+            ## Risks
+            - Repository reality may differ from the initial assumption.
+            - Missing verification would block execution.
+            """
+        ).strip(),
+        "questions": ["Are there existing patterns in the repo that should be preserved?"],
+        "success_criteria": [
+            "A concrete implementation path exists.",
+            "Verification is defined before execution.",
+        ],
+        "assumptions": ["The project directory is writable."],
+    }
+    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+
+
+def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
     iteration = state["iteration"] or 1
-    if step == "clarify":
+    if iteration == 1:
         payload = {
-            "questions": [
+            "flags": [
                 {
-                    "question": "Should the feature be behind a flag?",
-                    "context": "No feature flags exist in the repo currently.",
+                    "id": "FLAG-001",
+                    "concern": "The plan does not name the files or modules it expects to touch.",
+                    "category": "completeness",
+                    "severity_hint": "likely-significant",
+                    "evidence": "Execution could drift because there is no repo-specific scope.",
+                },
+                {
+                    "id": "FLAG-002",
+                    "concern": "The plan does not define an observable verification command.",
+                    "category": "correctness",
+                    "severity_hint": "likely-significant",
+                    "evidence": "Success cannot be demonstrated without a concrete check.",
                 },
             ],
-            "refined_idea": f"Refined: {state['idea']}",
-            "intent_summary": f"The user wants to {state['idea']}.",
+            "verified_flag_ids": [],
+            "disputed_flag_ids": [],
         }
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+    else:
+        payload = {"flags": [], "verified_flag_ids": ["FLAG-001", "FLAG-002"], "disputed_flag_ids": []}
+    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
 
-    if step == "plan":
-        payload = {
-            "plan": textwrap.dedent(
-                f"""
-                # Implementation Plan
 
-                ## Goal
-                Implement: {state['idea']}
+def _mock_integrate(state: PlanState, plan_dir: Path) -> WorkerResult:
+    payload = {
+        "plan": textwrap.dedent(
+            f"""
+            # Implementation Plan
 
-                ## Steps
-                1. Inspect the repository and identify the touch points.
-                2. Implement the feature with tests or local verification hooks.
-                3. Validate success criteria before finishing.
+            ## Goal
+            Implement: {state['idea']}
 
-                ## Risks
-                - Repository reality may differ from the initial assumption.
-                - Missing verification would block execution.
-                """
-            ).strip(),
-            "questions": ["Are there existing patterns in the repo that should be preserved?"],
-            "success_criteria": [
-                "A concrete implementation path exists.",
-                "Verification is defined before execution.",
-            ],
-            "assumptions": ["The project directory is writable."],
-        }
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+            ## Concrete Scope
+            1. Inspect the repository and identify the exact files to touch before editing.
+            2. Implement the change in the smallest viable slice.
+            3. Run a concrete verification command and capture the result.
 
-    if step == "critique":
-        if iteration == 1:
-            payload = {
-                "flags": [
-                    {
-                        "id": "FLAG-001",
-                        "concern": "The plan does not name the files or modules it expects to touch.",
-                        "category": "completeness",
-                        "severity_hint": "likely-significant",
-                        "evidence": "Execution could drift because there is no repo-specific scope.",
-                    },
-                    {
-                        "id": "FLAG-002",
-                        "concern": "The plan does not define an observable verification command.",
-                        "category": "correctness",
-                        "severity_hint": "likely-significant",
-                        "evidence": "Success cannot be demonstrated without a concrete check.",
-                    },
-                ],
-                "verified_flag_ids": [],
-                "disputed_flag_ids": [],
-            }
-        else:
-            payload = {"flags": [], "verified_flag_ids": ["FLAG-001", "FLAG-002"], "disputed_flag_ids": []}
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+            ## Verification
+            - Run a repo-specific smoke test or command before closing the task.
 
-    if step == "integrate":
-        payload = {
-            "plan": textwrap.dedent(
-                f"""
-                # Implementation Plan
+            ## Risks
+            - If the repo shape differs from expectations, adapt and record the deviation.
+            """
+        ).strip(),
+        "changes_summary": "Added explicit repo-scoping and verification steps.",
+        "flags_addressed": ["FLAG-001", "FLAG-002"],
+        "assumptions": ["The repository contains enough context for implementation."],
+        "success_criteria": [
+            "The plan identifies exact touch points before editing.",
+            "A concrete verification command is defined.",
+        ],
+        "questions": [],
+    }
+    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
 
-                ## Goal
-                Implement: {state['idea']}
 
-                ## Concrete Scope
-                1. Inspect the repository and identify the exact files to touch before editing.
-                2. Implement the change in the smallest viable slice.
-                3. Run a concrete verification command and capture the result.
+def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
+    target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
+    target.write_text("mock execution completed\n", encoding="utf-8")
+    payload = {
+        "output": "Mock execution completed successfully.",
+        "files_changed": [str(target.relative_to(Path(state["config"]["project_dir"])))],
+        "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
+        "deviations": [],
+    }
+    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()), trace_output='{"event":"mock-execute"}\n')
 
-                ## Verification
-                - Run a repo-specific smoke test or command before closing the task.
 
-                ## Risks
-                - If the repo shape differs from expectations, adapt and record the deviation.
-                """
-            ).strip(),
-            "changes_summary": "Added explicit repo-scoping and verification steps.",
-            "flags_addressed": ["FLAG-001", "FLAG-002"],
-            "assumptions": ["The repository contains enough context for implementation."],
-            "success_criteria": [
-                "The plan identifies exact touch points before editing.",
-                "A concrete verification command is defined.",
-            ],
-            "questions": [],
-        }
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
+    meta = read_json(latest_plan_meta_path(plan_dir, state))
+    criteria = [
+        {"name": criterion, "pass": True, "evidence": "Mock execution and artifacts satisfy the criterion."}
+        for criterion in meta.get("success_criteria", [])
+    ]
+    payload = {"criteria": criteria, "issues": [], "summary": "Mock review passed."}
+    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
 
-    if step == "execute":
-        target = Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt"
-        target.write_text("mock execution completed\n", encoding="utf-8")
-        payload = {
-            "output": "Mock execution completed successfully.",
-            "files_changed": [str(target.relative_to(Path(state["config"]["project_dir"])))],
-            "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
-            "deviations": [],
-        }
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()), trace_output='{"event":"mock-execute"}\n')
 
-    if step == "review":
-        meta = read_json(latest_plan_meta_path(plan_dir, state))
-        criteria = [
-            {"name": criterion, "pass": True, "evidence": "Mock execution and artifacts satisfy the criterion."}
-            for criterion in meta.get("success_criteria", [])
-        ]
-        payload = {"criteria": criteria, "issues": [], "summary": "Mock review passed."}
-        return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+_MOCK_DISPATCH: dict[str, Any] = {
+    "clarify": _mock_clarify,
+    "plan": _mock_plan,
+    "critique": _mock_critique,
+    "integrate": _mock_integrate,
+    "execute": _mock_execute,
+    "review": _mock_review,
+}
 
-    raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
+
+def mock_worker_output(step: str, state: PlanState, plan_dir: Path) -> WorkerResult:
+    handler = _MOCK_DISPATCH.get(step)
+    if handler is None:
+        raise CliError("unsupported_step", f"Mock worker does not support '{step}'")
+    return handler(state, plan_dir)
 
 
 def session_key_for(step: str, agent: str) -> str:
@@ -314,31 +334,30 @@ def session_key_for(step: str, agent: str) -> str:
     return f"{agent}_{step}"
 
 
-def update_session_state(state: PlanState, step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool) -> None:
+def update_session_state(step: str, agent: str, session_id: str | None, *, mode: str, refreshed: bool, existing_sessions: dict[str, Any] | None = None) -> tuple[str, SessionInfo] | None:
+    """Build a session entry for the given step.
+
+    Returns ``(key, entry)`` so the caller can store it on the state dict,
+    or ``None`` when there is no session_id to record.
+    """
     if not session_id:
-        return
+        return None
     key = session_key_for(step, agent)
-    state.setdefault("sessions", {})[key] = {
+    if existing_sessions is None:
+        existing_sessions = {}
+    entry = {
         "id": session_id,
         "mode": mode,
-        "created_at": state.setdefault("sessions", {}).get(key, {}).get("created_at", now_utc()),
+        "created_at": existing_sessions.get(key, {}).get("created_at", now_utc()),
         "last_used_at": now_utc(),
         "refreshed": refreshed,
     }
-
-
-# Backward-compatible alias for the renamed function.
-persist_session = update_session_state
+    return key, entry
 
 
 def run_claude_step(step: str, state: PlanState, plan_dir: Path, *, root: Path, fresh: bool) -> WorkerResult:
-    # Deferred import: cli.py imports workers.py at module level, so importing
-    # cli here at call time avoids a circular import.  Tests monkeypatch
-    # _cli.mock_worker_output which is why we import the module, not the function.
-    import megaplan.cli as _cli
-
     if os.getenv(MOCK_ENV_VAR) == "1":
-        return _cli.mock_worker_output(step, state, plan_dir)
+        return mock_worker_output(step, state, plan_dir)
     project_dir = Path(state["config"]["project_dir"])
     schema_name = STEP_SCHEMA_FILENAMES[step]
     schema_text = json.dumps(read_json(schemas_root(root) / schema_name))
@@ -378,11 +397,8 @@ def run_codex_step(
     fresh: bool = False,
     json_trace: bool = False,
 ) -> WorkerResult:
-    # Deferred import: same circular-dependency reason as run_claude_step.
-    import megaplan.cli as _cli
-
     if os.getenv(MOCK_ENV_VAR) == "1":
-        return _cli.mock_worker_output(step, state, plan_dir)
+        return mock_worker_output(step, state, plan_dir)
     project_dir = Path(state["config"]["project_dir"])
     schema_file = schemas_root(root) / STEP_SCHEMA_FILENAMES[step]
     session_key = session_key_for(step, "codex")

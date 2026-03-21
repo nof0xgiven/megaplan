@@ -818,7 +818,7 @@ def test_critique_response_surfaces_scope_creep_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
-    original_mock = megaplan.cli.mock_worker_output
+    original_mock = megaplan.workers.mock_worker_output
 
     def mock_with_scope_creep(step: str, state: dict, plan_dir: Path):
         if step == "critique":
@@ -835,7 +835,7 @@ def test_critique_response_surfaces_scope_creep_warning(
                 "verified_flag_ids": [],
                 "disputed_flag_ids": [],
             }
-            return megaplan.cli.WorkerResult(
+            return megaplan.workers.WorkerResult(
                 payload=payload,
                 raw_output=json.dumps(payload),
                 duration_ms=10,
@@ -844,7 +844,7 @@ def test_critique_response_surfaces_scope_creep_warning(
             )
         return original_mock(step, state, plan_dir)
 
-    monkeypatch.setattr(megaplan.cli, "mock_worker_output", mock_with_scope_creep)
+    monkeypatch.setattr(megaplan.workers, "mock_worker_output", mock_with_scope_creep)
 
     critique_result = megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
 

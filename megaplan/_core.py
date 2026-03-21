@@ -65,9 +65,9 @@ class PlanState(TypedDict):
     iteration: int
     created_at: str
     config: PlanConfig
-    sessions: dict[str, Any]
-    plan_versions: list[dict[str, Any]]
-    history: list[dict[str, Any]]
+    sessions: dict[str, SessionInfo]
+    plan_versions: list[PlanVersionRecord]
+    history: list[HistoryEntry]
     meta: PlanMeta
     last_evaluation: dict[str, Any]
     clarification: NotRequired[dict[str, Any]]
@@ -84,6 +84,46 @@ class FlagRecord(TypedDict, total=False):
     severity: str
     verified: bool
     verified_in: str
+    addressed_in: str
+
+
+class SessionInfo(TypedDict, total=False):
+    id: str
+    mode: str
+    created_at: str
+    last_used_at: str
+    refreshed: bool
+
+
+class PlanVersionRecord(TypedDict, total=False):
+    version: int
+    file: str
+    hash: str
+    timestamp: str
+
+
+class HistoryEntry(TypedDict, total=False):
+    step: str
+    timestamp: str
+    duration_ms: int
+    cost_usd: float
+    result: str
+    session_mode: str
+    session_id: str
+    agent: str
+    output_file: str
+    artifact_hash: str
+    raw_output_file: str
+    message: str
+    flags_count: int
+    flags_addressed: list[str]
+    recommendation: str
+    approval_mode: str
+    environment: dict[str, bool]
+
+
+class FlagRegistry(TypedDict):
+    flags: list[FlagRecord]
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +196,8 @@ def slugify(text: str, max_length: int = 30) -> str:
     return truncated or "plan"
 
 
-def json_dump(data: Any) -> str:
-    return json.dumps(data, indent=2, sort_keys=False) + "\n"
+def json_dump(obj: Any) -> str:
+    return json.dumps(obj, indent=2, sort_keys=False) + "\n"
 
 
 def normalize_text(text: str) -> str:
@@ -212,6 +252,8 @@ def load_config(home: Path | None = None) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError):
+        import sys
+        print(f"megaplan: warning: ignoring malformed config at {path}", file=sys.stderr)
         return {}
     if not isinstance(data, dict):
         return {}
@@ -314,7 +356,7 @@ def save_state(plan_dir: Path, state: PlanState) -> None:
     atomic_write_json(plan_dir / "state.json", state)
 
 
-def latest_plan_record(state: PlanState) -> dict[str, Any]:
+def latest_plan_record(state: PlanState) -> PlanVersionRecord:
     plan_versions = state.get("plan_versions", [])
     if not plan_versions:
         raise CliError("missing_plan_version", "No plan version exists yet")
@@ -335,18 +377,18 @@ def latest_plan_meta_path(plan_dir: Path, state: PlanState) -> Path:
 # Flag registry
 # ---------------------------------------------------------------------------
 
-def load_flag_registry(plan_dir: Path) -> dict[str, Any]:
+def load_flag_registry(plan_dir: Path) -> FlagRegistry:
     path = plan_dir / "faults.json"
     if path.exists():
         return read_json(path)
     return {"flags": []}
 
 
-def save_flag_registry(plan_dir: Path, data: dict[str, Any]) -> None:
-    atomic_write_json(plan_dir / "faults.json", data)
+def save_flag_registry(plan_dir: Path, registry: FlagRegistry) -> None:
+    atomic_write_json(plan_dir / "faults.json", registry)
 
 
-def unresolved_significant_flags(flag_registry: dict[str, Any]) -> list[FlagRecord]:
+def unresolved_significant_flags(flag_registry: FlagRegistry) -> list[FlagRecord]:
     return [
         flag
         for flag in flag_registry.get("flags", [])
@@ -360,7 +402,7 @@ def is_scope_creep_flag(flag: FlagRecord) -> bool:
 
 
 def scope_creep_flags(
-    flag_registry: dict[str, Any],
+    flag_registry: FlagRegistry,
     *,
     statuses: set[str] | None = None,
 ) -> list[FlagRecord]:
