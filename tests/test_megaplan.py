@@ -11,8 +11,8 @@ import pytest
 import megaplan
 import megaplan.cli
 import megaplan.handlers
-import megaplan.setup_commands
-import megaplan.state_machine
+import megaplan.cli
+import megaplan._core
 import megaplan.workers
 from megaplan._core import ensure_runtime_layout, load_plan
 from megaplan.workers import WorkerResult
@@ -67,7 +67,7 @@ def plan_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PlanFixture
 
     monkeypatch.setenv(megaplan.MOCK_ENV_VAR, "1")
     monkeypatch.setattr(
-        megaplan.state_machine.shutil,
+        megaplan._core.shutil,
         "which",
         lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
     )
@@ -101,7 +101,7 @@ def test_init_response_points_to_plan(tmp_path: Path, monkeypatch: pytest.Monkey
     root.mkdir()
     project_dir.mkdir()
     monkeypatch.setattr(
-        megaplan.state_machine.shutil,
+        megaplan._core.shutil,
         "which",
         lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
     )
@@ -589,7 +589,7 @@ def test_execute_succeeds_in_auto_approve_mode(tmp_path: Path, monkeypatch: pyte
     (project_dir / ".git").mkdir()
     monkeypatch.setenv(megaplan.MOCK_ENV_VAR, "1")
     monkeypatch.setattr(
-        megaplan.state_machine.shutil,
+        megaplan._core.shutil,
         "which",
         lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
     )
@@ -721,7 +721,7 @@ def test_config_dir_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 def test_setup_global_writes_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
-    monkeypatch.setattr(megaplan.setup_commands, "detect_available_agents", lambda: ["claude"])
+    monkeypatch.setattr(megaplan.cli, "detect_available_agents", lambda: ["claude"])
     result = megaplan.handle_setup_global(force=False, home=home)
     assert "config_path" in result
     assert "routing" in result
@@ -984,7 +984,7 @@ def test_init_produces_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     root.mkdir()
     project_dir.mkdir()
     monkeypatch.setattr(
-        megaplan.state_machine.shutil,
+        megaplan._core.shutil,
         "which",
         lambda name: "/usr/bin/mock" if name in {"claude", "codex"} else None,
     )

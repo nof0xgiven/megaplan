@@ -25,7 +25,10 @@ from megaplan.types import (
     ROBUSTNESS_LEVELS,
     SCOPE_CREEP_TERMS,
     STATE_CRITIQUED,
+    STATE_EXECUTED,
+    STATE_GATED,
     STATE_INITIALIZED,
+    STATE_PLANNED,
     TERMINAL_STATES,
 )
 
@@ -345,3 +348,47 @@ def collect_git_diff_summary(project_dir: Path) -> str:
     if process.returncode != 0:
         return f"Unable to read git status: {process.stderr.strip() or process.stdout.strip()}"
     return process.stdout.strip() or "No git changes detected."
+
+
+# ---------------------------------------------------------------------------
+# State machine
+# ---------------------------------------------------------------------------
+
+def infer_next_steps(state: PlanState) -> list[str]:
+    current = state["current_state"]
+    if current == STATE_INITIALIZED:
+        return ["plan"]
+    if current == STATE_PLANNED:
+        return ["plan", "critique"]
+    if current == STATE_CRITIQUED:
+        gate = state.get("last_gate", {})
+        recommendation = gate.get("recommendation")
+        if not recommendation:
+            return ["gate"]
+        if recommendation == "ITERATE":
+            return ["revise"]
+        if recommendation == "ESCALATE":
+            return ["override add-note", "override force-proceed", "override abort"]
+        if recommendation == "PROCEED" and not gate.get("passed", False):
+            return ["revise", "override force-proceed"]
+        return ["gate"]
+    if current == STATE_GATED:
+        return ["execute", "override replan"]
+    if current == STATE_EXECUTED:
+        return ["review"]
+    return []
+
+
+def require_state(state: PlanState, step: str, allowed: set[str]) -> None:
+    current = state["current_state"]
+    if current not in allowed:
+        raise CliError(
+            "invalid_transition",
+            f"Cannot run '{step}' while current state is '{current}'",
+            valid_next=infer_next_steps(state),
+            extra={"current_state": current},
+        )
+
+
+def find_command(name: str) -> str | None:
+    return shutil.which(name)

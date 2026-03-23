@@ -33,9 +33,9 @@ from megaplan.handlers import (
     update_flags_after_critique,
     update_flags_after_revise,
 )
-from megaplan.overrides import handle_override
-from megaplan.setup_commands import handle_setup, handle_setup_global, handle_config
-from megaplan.state_machine import infer_next_steps
+from megaplan.handlers import handle_override
+from megaplan.cli import handle_setup, handle_setup_global, handle_config
+from megaplan._core import infer_next_steps
 from megaplan.cli import handle_status, handle_audit, handle_list, main, cli_entry
 
 __version__ = "0.1.0"
