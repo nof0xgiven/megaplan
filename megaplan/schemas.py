@@ -79,12 +79,45 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "finalize.json": {
         "type": "object",
         "properties": {
-            "final_plan": {"type": "string"},
-            "task_count": {"type": "integer"},
+            "tasks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "description": {"type": "string"},
+                        "depends_on": {"type": "array", "items": {"type": "string"}},
+                        "status": {"type": "string", "enum": ["pending", "done", "skipped"]},
+                        "executor_notes": {"type": "string"},
+                        "reviewer_verdict": {"type": "string"},
+                    },
+                    "required": [
+                        "id",
+                        "description",
+                        "depends_on",
+                        "status",
+                        "executor_notes",
+                        "reviewer_verdict",
+                    ],
+                },
+            },
             "watch_items": {"type": "array", "items": {"type": "string"}},
+            "sense_checks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "task_id": {"type": "string"},
+                        "question": {"type": "string"},
+                        "verdict": {"type": "string"},
+                    },
+                    "required": ["id", "task_id", "question", "verdict"],
+                },
+            },
             "meta_commentary": {"type": "string"},
         },
-        "required": ["final_plan", "task_count", "watch_items", "meta_commentary"],
+        "required": ["tasks", "watch_items", "sense_checks", "meta_commentary"],
     },
     "execution.json": {
         "type": "object",
@@ -93,8 +126,20 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "files_changed": {"type": "array", "items": {"type": "string"}},
             "commands_run": {"type": "array", "items": {"type": "string"}},
             "deviations": {"type": "array", "items": {"type": "string"}},
+            "task_updates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "status": {"type": "string", "enum": ["done", "skipped"]},
+                        "executor_notes": {"type": "string"},
+                    },
+                    "required": ["task_id", "status", "executor_notes"],
+                },
+            },
         },
-        "required": ["output", "files_changed", "commands_run", "deviations"],
+        "required": ["output", "files_changed", "commands_run", "deviations", "task_updates"],
     },
     "review.json": {
         "type": "object",
@@ -113,8 +158,30 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "issues": {"type": "array", "items": {"type": "string"}},
             "summary": {"type": "string"},
+            "task_verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "reviewer_verdict": {"type": "string"},
+                    },
+                    "required": ["task_id", "reviewer_verdict"],
+                },
+            },
+            "sense_check_verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "sense_check_id": {"type": "string"},
+                        "verdict": {"type": "string"},
+                    },
+                    "required": ["sense_check_id", "verdict"],
+                },
+            },
         },
-        "required": ["criteria", "issues"],
+        "required": ["criteria", "issues", "summary", "task_verdicts", "sense_check_verdicts"],
     },
 }
 

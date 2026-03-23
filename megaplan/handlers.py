@@ -37,6 +37,8 @@ from megaplan._core import (
     load_plan,
     now_utc,
     plans_root,
+    read_json,
+    render_final_md,
     save_flag_registry,
     save_state,
     scope_creep_flags,
@@ -123,6 +125,7 @@ def make_history_entry(
     mode: str | None = None,
     output_file: str | None = None,
     artifact_hash: str | None = None,
+    finalize_hash: str | None = None,
     raw_output_file: str | None = None,
     message: str | None = None,
     flags_count: int | None = None,
@@ -146,6 +149,8 @@ def make_history_entry(
         entry["output_file"] = output_file
     if artifact_hash is not None:
         entry["artifact_hash"] = artifact_hash
+    if finalize_hash is not None:
+        entry["finalize_hash"] = finalize_hash
     if raw_output_file is not None:
         entry["raw_output_file"] = raw_output_file
     if message is not None:
@@ -168,7 +173,45 @@ def attach_agent_fallback(response: StepResponse, args: argparse.Namespace) -> N
         response["agent_fallback"] = args._agent_fallback
 
 
-
+def _validate_merge_inputs(
+    entries: Any,
+    *,
+    required_fields: tuple[str, ...],
+    enum_fields: dict[str, set[str]] | None = None,
+    deviations: list[str] | None = None,
+    label: str,
+) -> list[dict[str, str]]:
+    enum_fields = enum_fields or {}
+    valid_entries: list[dict[str, str]] = []
+    if not isinstance(entries, list):
+        return valid_entries
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            if deviations is not None:
+                deviations.append(f"Skipped malformed {label}[{index}]: expected object.")
+            continue
+        if any(field not in entry for field in required_fields):
+            if deviations is not None:
+                deviations.append(f"Skipped malformed {label}[{index}]: missing required keys.")
+            continue
+        normalized: dict[str, str] = {}
+        malformed = False
+        for field in required_fields:
+            value = entry[field]
+            if not isinstance(value, str):
+                malformed = True
+                break
+            allowed = enum_fields.get(field)
+            if allowed is not None and value not in allowed:
+                malformed = True
+                break
+            normalized[field] = value
+        if malformed:
+            if deviations is not None:
+                deviations.append(f"Skipped malformed {label}[{index}]: invalid field types or enum values.")
+            continue
+        valid_entries.append(normalized)
+    return valid_entries
 
 def normalize_flag_record(raw_flag: dict[str, Any], fallback_id: str) -> FlagRecord:
     category = raw_flag.get("category", "other")
@@ -708,12 +751,8 @@ def handle_finalize(root: Path, args: argparse.Namespace) -> StepResponse:
         record_step_failure(plan_dir, state, step="finalize", iteration=state["iteration"], error=error)
         raise
     payload = worker.payload
-    atomic_write_text(plan_dir / "final.md", payload["final_plan"])
-    atomic_write_json(plan_dir / "finalize.json", {
-        "task_count": payload["task_count"],
-        "watch_items": payload["watch_items"],
-        "meta_commentary": payload["meta_commentary"],
-    })
+    atomic_write_json(plan_dir / "finalize.json", payload)
+    atomic_write_text(plan_dir / "final.md", render_final_md(payload))
     state["current_state"] = STATE_FINALIZED
     apply_session_update(state, "finalize", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
@@ -734,7 +773,7 @@ def handle_finalize(root: Path, args: argparse.Namespace) -> StepResponse:
     response: StepResponse = {
         "success": True,
         "step": "finalize",
-        "summary": f"Finalized plan with {payload['task_count']} tasks and {len(payload['watch_items'])} watch items.",
+        "summary": f"Finalized plan with {len(payload['tasks'])} tasks and {len(payload['watch_items'])} watch items.",
         "artifacts": ["final.md", "finalize.json"],
         "next_step": "execute",
         "state": STATE_FINALIZED,
@@ -763,6 +802,26 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         record_step_failure(plan_dir, state, step="execute", iteration=state["iteration"], error=error)
         raise
     atomic_write_json(plan_dir / "execution.json", worker.payload)
+    deviations = list(worker.payload.get("deviations", []))
+    finalize_data = read_json(plan_dir / "finalize.json")
+    task_updates = _validate_merge_inputs(
+        worker.payload.get("task_updates"),
+        required_fields=("task_id", "status", "executor_notes"),
+        enum_fields={"status": {"done", "skipped"}},
+        deviations=deviations,
+        label="task_updates",
+    )
+    tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
+    for task_update in task_updates:
+        task = tasks_by_id.get(task_update["task_id"])
+        if task is None:
+            deviations.append(f"Skipped task update for unknown task_id '{task_update['task_id']}'.")
+            continue
+        task["status"] = task_update["status"]
+        task["executor_notes"] = task_update["executor_notes"]
+    atomic_write_json(plan_dir / "finalize.json", finalize_data)
+    atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data))
+    finalize_hash = sha256_file(plan_dir / "finalize.json")
     if worker.trace_output is not None:
         atomic_write_text(plan_dir / "execution_trace.jsonl", worker.trace_output)
     state["current_state"] = STATE_EXECUTED
@@ -785,11 +844,12 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             mode=mode,
             output_file="execution.json",
             artifact_hash=sha256_file(plan_dir / "execution.json"),
+            finalize_hash=finalize_hash,
             approval_mode=approval_mode,
         ),
     )
     save_state(plan_dir, state)
-    artifacts = ["execution.json"]
+    artifacts = ["execution.json", "finalize.json", "final.md"]
     if worker.trace_output is not None:
         artifacts.append("execution_trace.jsonl")
     response: StepResponse = {
@@ -800,7 +860,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         "next_step": "review",
         "state": STATE_EXECUTED,
         "files_changed": worker.payload.get("files_changed", []),
-        "deviations": worker.payload.get("deviations", []),
+        "deviations": deviations,
         "auto_approve": auto_approve,
         "user_approved_gate": bool(state["meta"].get("user_approved_gate", False)),
     }
@@ -817,6 +877,39 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         record_step_failure(plan_dir, state, step="review", iteration=state["iteration"], error=error)
         raise
     atomic_write_json(plan_dir / "review.json", worker.payload)
+    issues = list(worker.payload.get("issues", []))
+    finalize_data = read_json(plan_dir / "finalize.json")
+    task_verdicts = _validate_merge_inputs(
+        worker.payload.get("task_verdicts"),
+        required_fields=("task_id", "reviewer_verdict"),
+        deviations=issues,
+        label="task_verdicts",
+    )
+    sense_check_verdicts = _validate_merge_inputs(
+        worker.payload.get("sense_check_verdicts"),
+        required_fields=("sense_check_id", "verdict"),
+        deviations=issues,
+        label="sense_check_verdicts",
+    )
+    tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
+    for task_verdict in task_verdicts:
+        task = tasks_by_id.get(task_verdict["task_id"])
+        if task is None:
+            issues.append(f"Skipped task verdict for unknown task_id '{task_verdict['task_id']}'.")
+            continue
+        task["reviewer_verdict"] = task_verdict["reviewer_verdict"]
+    sense_checks_by_id = {sense_check["id"]: sense_check for sense_check in finalize_data.get("sense_checks", [])}
+    for sense_check_verdict in sense_check_verdicts:
+        sense_check = sense_checks_by_id.get(sense_check_verdict["sense_check_id"])
+        if sense_check is None:
+            issues.append(
+                f"Skipped sense-check verdict for unknown sense_check_id '{sense_check_verdict['sense_check_id']}'."
+            )
+            continue
+        sense_check["verdict"] = sense_check_verdict["verdict"]
+    atomic_write_json(plan_dir / "finalize.json", finalize_data)
+    atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data))
+    finalize_hash = sha256_file(plan_dir / "finalize.json")
     passed = sum(1 for criterion in worker.payload.get("criteria", []) if criterion.get("pass"))
     total = len(worker.payload.get("criteria", []))
     state["current_state"] = STATE_DONE
@@ -833,6 +926,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
             mode=mode,
             output_file="review.json",
             artifact_hash=sha256_file(plan_dir / "review.json"),
+            finalize_hash=finalize_hash,
         ),
     )
     save_state(plan_dir, state)
@@ -840,10 +934,10 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         "success": True,
         "step": "review",
         "summary": f"Review complete: {passed}/{total} success criteria passed.",
-        "artifacts": ["review.json"],
+        "artifacts": ["review.json", "finalize.json", "final.md"],
         "next_step": None,
         "state": STATE_DONE,
-        "issues": worker.payload.get("issues", []),
+        "issues": issues,
     }
     attach_agent_fallback(response, args)
     return response

@@ -51,7 +51,44 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
         ("plan", {"plan": "x", "questions": [], "success_criteria": [], "assumptions": []}),
         ("revise", {"plan": "x", "changes_summary": "y", "flags_addressed": []}),
         ("gate", {"recommendation": "PROCEED", "rationale": "ok", "signals_assessment": "ok", "warnings": []}),
-        ("finalize", {"final_plan": "# Plan", "task_count": 1, "watch_items": [], "meta_commentary": "ok"}),
+        (
+            "finalize",
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "description": "Do work",
+                        "depends_on": [],
+                        "status": "pending",
+                        "executor_notes": "",
+                        "reviewer_verdict": "",
+                    }
+                ],
+                "watch_items": [],
+                "sense_checks": [{"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""}],
+                "meta_commentary": "ok",
+            },
+        ),
+        (
+            "execute",
+            {
+                "output": "done",
+                "files_changed": [],
+                "commands_run": [],
+                "deviations": [],
+                "task_updates": [{"task_id": "T1", "status": "done", "executor_notes": "Implemented."}],
+            },
+        ),
+        (
+            "review",
+            {
+                "criteria": [],
+                "issues": [],
+                "summary": "ok",
+                "task_verdicts": [{"task_id": "T1", "reviewer_verdict": "Pass"}],
+                "sense_check_verdicts": [{"sense_check_id": "SC1", "verdict": "Confirmed"}],
+            },
+        ),
     ],
 )
 def test_validate_payload_accepts_current_worker_steps(step: str, payload: dict[str, object]) -> None:
@@ -166,7 +203,46 @@ def _mock_state(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, dict]:
         encoding="utf-8",
     )
     (plan_dir / "execution.json").write_text(
-        json.dumps({"output": "done", "files_changed": [], "commands_run": [], "deviations": []}),
+        json.dumps(
+            {
+                "output": "done",
+                "files_changed": [],
+                "commands_run": [],
+                "deviations": [],
+                "task_updates": [{"task_id": "T1", "status": "done", "executor_notes": "Implemented."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (plan_dir / "finalize.json").write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "description": "Do work",
+                        "depends_on": [],
+                        "status": "pending",
+                        "executor_notes": "",
+                        "reviewer_verdict": "",
+                    },
+                    {
+                        "id": "T2",
+                        "description": "Verify work",
+                        "depends_on": ["T1"],
+                        "status": "pending",
+                        "executor_notes": "",
+                        "reviewer_verdict": "",
+                    },
+                ],
+                "watch_items": ["Watch repository assumptions."],
+                "sense_checks": [
+                    {"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""},
+                    {"id": "SC2", "task_id": "T2", "question": "Was it verified?", "verdict": ""},
+                ],
+                "meta_commentary": "Mock finalize output.",
+            }
+        ),
         encoding="utf-8",
     )
     return plan_dir, state
@@ -214,12 +290,14 @@ def test_mock_finalize_returns_valid_payload(tmp_path: Path) -> None:
     from megaplan.workers import mock_worker_output
     plan_dir, state = _mock_state(tmp_path)
     result = mock_worker_output("finalize", state, plan_dir)
-    assert "final_plan" in result.payload
-    assert "task_count" in result.payload
+    assert "tasks" in result.payload
     assert "watch_items" in result.payload
+    assert "sense_checks" in result.payload
     assert "meta_commentary" in result.payload
+    assert isinstance(result.payload["tasks"], list)
     assert isinstance(result.payload["watch_items"], list)
-    assert result.payload["task_count"] == 2
+    assert result.payload["tasks"][0]["status"] == "pending"
+    assert result.payload["sense_checks"][0]["task_id"] == "T1"
 
 
 def test_mock_execute_returns_valid_payload(tmp_path: Path) -> None:
@@ -230,6 +308,8 @@ def test_mock_execute_returns_valid_payload(tmp_path: Path) -> None:
     assert "files_changed" in result.payload
     assert "commands_run" in result.payload
     assert "deviations" in result.payload
+    assert "task_updates" in result.payload
+    assert result.payload["task_updates"][0]["task_id"] == "T1"
 
 
 def test_mock_review_returns_valid_payload(tmp_path: Path) -> None:
@@ -238,6 +318,9 @@ def test_mock_review_returns_valid_payload(tmp_path: Path) -> None:
     result = mock_worker_output("review", state, plan_dir)
     assert "criteria" in result.payload
     assert "issues" in result.payload
+    assert "summary" in result.payload
+    assert "task_verdicts" in result.payload
+    assert "sense_check_verdicts" in result.payload
 
 
 def test_mock_unsupported_step_raises(tmp_path: Path) -> None:

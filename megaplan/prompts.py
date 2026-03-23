@@ -271,24 +271,30 @@ def _finalize_prompt(state: PlanState, plan_dir: Path) -> str:
         {json_dump(critique_history).strip()}
 
         Requirements:
-        - Produce an execution-ready markdown document in the `final_plan` field.
-        - Start with a task checklist: `- [ ] Task description` items, ordered by execution sequence, with dependencies or sequencing notes where relevant.
-        - Each checklist item MUST be followed by an indented comment line: `  > _notes:_` — the executor is required to fill this in during execution with what they actually did, any deviations, or confirmation.
-        - Follow the checklist with a "Watch Items" section listing edge cases from critique, gate warnings, and assumptions that need runtime verification.
-        - After Watch Items, add a "Review Sense-Check" section with one `- [ ]` item per checklist task, worded as a verification question (e.g., "Verify: STATE_FINALIZED is exported and used in all routing tables"). The reviewer will check these off after reading the executor's notes and verifying the work. Each sense-check item must also have a `  > _verdict:_` line for the reviewer to fill in.
-        - End with a "Meta" section: brief commentary to help the executor succeed — context, gotchas, or judgment calls that aren't obvious from the plan alone.
-        - The document should be self-contained: an executor reading only this document should have everything they need.
-        - `task_count` should equal the number of checklist items.
-        - `watch_items` should list the watch items as an array of strings.
-        - `meta_commentary` should contain the meta section text.
+        - Produce structured JSON only.
+        - `tasks` must be an ordered array of task objects. Every task object must include:
+          - `id`: short stable task ID like `T1`
+          - `description`: concrete work item
+          - `depends_on`: array of earlier task IDs or `[]`
+          - `status`: always `"pending"` at finalize time
+          - `executor_notes`: always `""` at finalize time
+          - `reviewer_verdict`: always `""` at finalize time
+        - `watch_items` must be an array of strings covering runtime risks, critique concerns, and assumptions to keep visible during execution.
+        - `sense_checks` must be an array with one verification question per task. Every sense-check object must include:
+          - `id`: short stable ID like `SC1`
+          - `task_id`: the related task ID
+          - `question`: reviewer verification question
+          - `verdict`: always `""` at finalize time
+        - `meta_commentary` must be a single string with execution guidance, gotchas, or judgment calls that help the executor succeed.
+        - Preserve information that strong existing artifacts already capture well: execution ordering, watch-outs, reviewer checkpoints, and practical context.
+        - The structured output should be self-contained: an executor reading only `finalize.json` should have everything needed to work.
         """
     ).strip()
 
 
 def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
-    final_md = plan_dir / "final.md"
-    latest_plan = final_md.read_text(encoding="utf-8") if final_md.exists() else latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
+    finalize_data = read_json(plan_dir / "finalize.json")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     robustness = configured_robustness(state)
     gate = read_json(plan_dir / "gate.json")
@@ -310,8 +316,8 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
 
         {intent_and_notes_block(state)}
 
-        Execution-ready plan:
-        {latest_plan}
+        Execution tracking source of truth (`finalize.json`):
+        {json_dump(finalize_data).strip()}
 
         Plan metadata:
         {json_dump(latest_meta).strip()}
@@ -327,7 +333,9 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         - Adapt if repository reality contradicts the plan.
         - Report deviations explicitly.
         - Output concrete files changed and commands run.
-        - IMPORTANT: The execution-ready plan contains a task checklist. As you complete each task, update final.md: change `- [ ]` to `- [x]` and fill in the `> _notes:_` line with what you actually did, any deviations, or confirmation that it went as planned. Every checklist item must be checked off and commented before execution is complete.
+        - Use the tasks in `finalize.json` as the execution boundary. Do not create or rewrite tracking artifacts directly.
+        - Return `task_updates` with one object per completed or skipped task: `{{"task_id": "...", "status": "done|skipped", "executor_notes": "..."}}`.
+        - Keep `executor_notes` specific enough that a reviewer can map each update to the actual code and commands you ran.
         """
     ).strip()
 
@@ -338,9 +346,8 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     execution = read_json(plan_dir / "execution.json")
     gate = read_json(plan_dir / "gate.json")
+    finalize_data = read_json(plan_dir / "finalize.json")
     diff_summary = collect_git_diff_summary(project_dir)
-    final_md = plan_dir / "final.md"
-    finalized_plan = final_md.read_text(encoding="utf-8") if final_md.exists() else ""
     return textwrap.dedent(
         f"""
         Review the execution critically against user intent and observable success criteria.
@@ -353,8 +360,8 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
         Approved plan:
         {latest_plan}
 
-        Finalized plan (execution-ready document with checklist):
-        {finalized_plan}
+        Execution tracking state (`finalize.json`):
+        {json_dump(finalize_data).strip()}
 
         Plan metadata:
         {json_dump(latest_meta).strip()}
@@ -372,9 +379,10 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
         - Judge against the success criteria, not plan elegance.
         - Be critical and call out real misses.
         - If there are failures, describe them as issues.
-        - Verify the finalized plan checklist: every `- [ ]` item in the Checklist section should be `- [x]` with a filled-in `> _notes:_` comment. Flag any unchecked or uncommented items as issues.
-        - Sense-check each executor comment: does the note actually describe completing the task? Does it make sense given the git diff? Flag vague, copy-pasted, or contradictory notes as issues.
-        - Fill in the "Review Sense-Check" section in final.md: for each sense-check item, change `- [ ]` to `- [x]` if the work checks out or leave it unchecked if it doesn't, and fill in the `> _verdict:_` line with your assessment.
+        - Review `tasks` using the populated `executor_notes` plus the git diff. Flag vague, copy-pasted, or contradictory notes as issues.
+        - Review every `sense_check` explicitly.
+        - Return `task_verdicts` with one object per task: `{{"task_id": "...", "reviewer_verdict": "..."}}`.
+        - Return `sense_check_verdicts` with one object per sense check: `{{"sense_check_id": "...", "verdict": "..."}}`.
         """
     ).strip()
 
@@ -384,9 +392,8 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     execution = read_json(plan_dir / "execution.json")
+    finalize_data = read_json(plan_dir / "finalize.json")
     diff_summary = collect_git_diff_summary(project_dir)
-    final_md = plan_dir / "final.md"
-    finalized_plan = final_md.read_text(encoding="utf-8") if final_md.exists() else ""
     return textwrap.dedent(
         f"""
         Review the implementation against the success criteria.
@@ -399,8 +406,8 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
         Approved plan:
         {latest_plan}
 
-        Finalized plan (execution-ready document with checklist):
-        {finalized_plan}
+        Execution tracking state (`finalize.json`):
+        {json_dump(finalize_data).strip()}
 
         Plan metadata:
         {json_dump(latest_meta).strip()}
@@ -415,9 +422,10 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
         - Be critical.
         - Verify each success criterion explicitly.
         - Call out any concrete gaps or regressions in issues.
-        - Verify the finalized plan checklist: every `- [ ]` item in the Checklist section should be `- [x]` with a filled-in `> _notes:_` comment. Flag any unchecked or uncommented items as issues.
-        - Sense-check each executor comment: does the note actually describe completing the task? Does it make sense given the git diff? Flag vague, copy-pasted, or contradictory notes as issues.
-        - Fill in the "Review Sense-Check" section in final.md: for each sense-check item, change `- [ ]` to `- [x]` if the work checks out or leave it unchecked if it doesn't, and fill in the `> _verdict:_` line with your assessment.
+        - Review `tasks` using the populated `executor_notes` plus the git diff. Flag vague, copy-pasted, or contradictory notes as issues.
+        - Review every `sense_check` explicitly.
+        - Return `task_verdicts` with one object per task: `{{"task_id": "...", "reviewer_verdict": "..."}}`.
+        - Return `sense_check_verdicts` with one object per sense check: `{{"sense_check_id": "...", "verdict": "..."}}`.
         """
     ).strip()
 

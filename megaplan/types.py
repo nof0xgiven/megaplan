@@ -68,6 +68,7 @@ class HistoryEntry(TypedDict, total=False):
     agent: str
     output_file: str
     artifact_hash: str
+    finalize_hash: str
     raw_output_file: str
     message: str
     flags_count: int

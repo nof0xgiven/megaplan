@@ -89,6 +89,51 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def render_final_md(finalize_data: dict[str, Any]) -> str:
+    lines = ["# Execution Checklist", ""]
+    for task in finalize_data.get("tasks", []):
+        checkbox = "[x]" if task.get("status") == "done" else "[ ]"
+        status_suffix = " (skipped)" if task.get("status") == "skipped" else ""
+        lines.append(f"- {checkbox} **{task['id']}:** {task['description']}{status_suffix}")
+        depends_on = task.get("depends_on", [])
+        if depends_on:
+            lines.append(f"  Depends on: {', '.join(depends_on)}")
+        executor_notes = task.get("executor_notes", "")
+        if executor_notes:
+            lines.append(f"  Executor notes: {executor_notes}")
+        reviewer_verdict = task.get("reviewer_verdict", "")
+        if reviewer_verdict:
+            lines.append(f"  Reviewer verdict: {reviewer_verdict}")
+        lines.append("")
+
+    lines.extend(["## Watch Items", ""])
+    watch_items = finalize_data.get("watch_items", [])
+    if watch_items:
+        for item in watch_items:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- None.")
+    lines.append("")
+
+    lines.extend(["## Sense Checks", ""])
+    sense_checks = finalize_data.get("sense_checks", [])
+    if sense_checks:
+        for sense_check in sense_checks:
+            lines.append(f"- **{sense_check['id']}** ({sense_check['task_id']}): {sense_check['question']}")
+            verdict = sense_check.get("verdict", "")
+            if verdict:
+                lines.append(f"  Verdict: {verdict}")
+            lines.append("")
+    else:
+        lines.extend(["- None.", ""])
+
+    lines.extend(["## Meta", ""])
+    meta_commentary = finalize_data.get("meta_commentary", "").strip()
+    lines.append(meta_commentary or "None.")
+    lines.append("")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------

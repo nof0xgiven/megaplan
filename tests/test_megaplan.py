@@ -157,11 +157,18 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     critique2 = megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     gate2 = megaplan.handle_gate(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     finalize = megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    finalized_tracking = read_json(plan_fixture.plan_dir / "finalize.json")
+    final_md_after_finalize = (plan_fixture.plan_dir / "final.md").read_text(encoding="utf-8")
     execute = megaplan.handle_execute(
         plan_fixture.root,
         make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
     )
+    finalized_after_execute = read_json(plan_fixture.plan_dir / "finalize.json")
+    final_md_after_execute = (plan_fixture.plan_dir / "final.md").read_text(encoding="utf-8")
     review = megaplan.handle_review(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    finalized_after_review = read_json(plan_fixture.plan_dir / "finalize.json")
+    final_md_after_review = (plan_fixture.plan_dir / "final.md").read_text(encoding="utf-8")
+    state = load_state(plan_fixture.plan_dir)
 
     assert plan["state"] == megaplan.STATE_PLANNED
     assert critique1["state"] == megaplan.STATE_CRITIQUED
@@ -173,8 +180,21 @@ def test_workflow_mock_end_to_end(plan_fixture: PlanFixture) -> None:
     assert finalize["state"] == megaplan.STATE_FINALIZED
     assert (plan_fixture.plan_dir / "final.md").exists()
     assert (plan_fixture.plan_dir / "finalize.json").exists()
+    assert finalized_tracking["tasks"][0]["status"] == "pending"
+    assert "# Execution Checklist" in final_md_after_finalize
     assert execute["state"] == megaplan.STATE_EXECUTED
+    assert all(task["status"] == "done" for task in finalized_after_execute["tasks"])
+    assert all(task["executor_notes"] for task in finalized_after_execute["tasks"])
+    assert "Executor notes:" in final_md_after_execute
     assert review["state"] == megaplan.STATE_DONE
+    assert all(task["reviewer_verdict"] for task in finalized_after_review["tasks"])
+    assert all(check["verdict"] for check in finalized_after_review["sense_checks"])
+    assert "Reviewer verdict:" in final_md_after_review
+    assert "Verdict:" in final_md_after_review
+    execute_entry = next(entry for entry in state["history"] if entry["step"] == "execute")
+    review_entry = next(entry for entry in state["history"] if entry["step"] == "review")
+    assert execute_entry["finalize_hash"].startswith("sha256:")
+    assert review_entry["finalize_hash"].startswith("sha256:")
     assert (plan_fixture.project_dir / "IMPLEMENTED_BY_MEGAPLAN.txt").exists()
 
 
@@ -586,6 +606,8 @@ def test_execute_succeeds_with_user_approval(plan_fixture: PlanFixture) -> None:
     )
     assert response["success"] is True
     assert response["state"] == megaplan.STATE_EXECUTED
+    assert "finalize.json" in response["artifacts"]
+    assert "final.md" in response["artifacts"]
 
 
 def test_execute_succeeds_in_auto_approve_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -612,6 +634,7 @@ def test_execute_succeeds_in_auto_approve_mode(tmp_path: Path, monkeypatch: pyte
     )
     assert response["success"] is True
     assert response["auto_approve"] is True
+    assert "finalize.json" in response["artifacts"]
 
 
 # ---------------------------------------------------------------------------
@@ -1090,10 +1113,76 @@ def test_execute_prompt_includes_approval_note(plan_fixture: PlanFixture) -> Non
         plan_fixture.root,
         plan_fixture.make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
     )
+    megaplan.handle_finalize(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     _, state = load_plan(plan_fixture.root, plan_fixture.plan_name)
     from megaplan.prompts import create_claude_prompt
     prompt = create_claude_prompt("execute", state, plan_fixture.plan_dir)
     assert "Review mode" in prompt or "auto-approve" in prompt or "approved" in prompt
+
+
+def test_render_final_md_pending_partially_done_and_reviewed_states() -> None:
+    from megaplan._core import render_final_md
+
+    pending = {
+        "tasks": [
+            {
+                "id": "T1",
+                "description": "Do work",
+                "depends_on": [],
+                "status": "pending",
+                "executor_notes": "",
+                "reviewer_verdict": "",
+            }
+        ],
+        "watch_items": ["Watch this."],
+        "sense_checks": [{"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""}],
+        "meta_commentary": "Pending state.",
+    }
+    partial = {
+        **pending,
+        "tasks": [{**pending["tasks"][0], "status": "done", "executor_notes": "Implemented."}],
+    }
+    reviewed = {
+        **partial,
+        "tasks": [{**partial["tasks"][0], "reviewer_verdict": "Pass"}],
+        "sense_checks": [{"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": "Confirmed."}],
+    }
+
+    pending_md = render_final_md(pending)
+    partial_md = render_final_md(partial)
+    reviewed_md = render_final_md(reviewed)
+
+    assert "# Execution Checklist" in pending_md
+    assert "## Watch Items" in pending_md
+    assert "## Sense Checks" in pending_md
+    assert "## Meta" in pending_md
+    assert "- [ ] **T1:** Do work" in pending_md
+    assert "- [x] **T1:** Do work" in partial_md
+    assert "Executor notes: Implemented." in partial_md
+    assert "Reviewer verdict: Pass" in reviewed_md
+    assert "Verdict: Confirmed." in reviewed_md
+
+
+def test_validate_merge_inputs_filters_malformed_entries() -> None:
+    valid = megaplan.handlers._validate_merge_inputs(
+        [
+            {"task_id": "T1", "status": "done", "executor_notes": "Implemented."},
+            {"task_id": "T2", "status": 1, "executor_notes": "Bad type"},
+            {"task_id": "T3", "executor_notes": "Missing status"},
+            "bad-entry",
+        ],
+        required_fields=("task_id", "status", "executor_notes"),
+        enum_fields={"status": {"done", "skipped"}},
+        label="task_updates",
+    )
+    empty = megaplan.handlers._validate_merge_inputs(
+        [],
+        required_fields=("task_id", "reviewer_verdict"),
+        label="task_verdicts",
+    )
+
+    assert valid == [{"task_id": "T1", "status": "done", "executor_notes": "Implemented."}]
+    assert empty == []
 
 
 def test_codex_uses_same_prompt_builders_for_shared_steps(plan_fixture: PlanFixture) -> None:

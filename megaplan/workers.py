@@ -306,27 +306,40 @@ def _mock_gate(state: PlanState, plan_dir: Path) -> WorkerResult:
 
 
 def _mock_finalize(state: PlanState, plan_dir: Path) -> WorkerResult:
-    latest_plan = (plan_dir / f"plan_v{state['iteration']}.md").read_text(encoding="utf-8")
     payload = {
-        "final_plan": (
-            f"## Checklist\n\n"
-            f"- [ ] Implement: {state['idea']}\n"
-            f"  > _notes:_\n"
-            f"- [ ] Verify success criteria\n"
-            f"  > _notes:_\n\n"
-            f"## Watch Items\n\n"
-            f"- Ensure repository state matches plan assumptions\n\n"
-            f"## Review Sense-Check\n\n"
-            f"- [ ] Verify: implementation matches the stated idea\n"
-            f"  > _verdict:_\n"
-            f"- [ ] Verify: success criteria are testable\n"
-            f"  > _verdict:_\n\n"
-            f"## Meta\n\n"
-            f"This is a mock finalize output.\n\n"
-            f"---\n\n{latest_plan}"
-        ),
-        "task_count": 2,
+        "tasks": [
+            {
+                "id": "T1",
+                "description": f"Implement: {state['idea']}",
+                "depends_on": [],
+                "status": "pending",
+                "executor_notes": "",
+                "reviewer_verdict": "",
+            },
+            {
+                "id": "T2",
+                "description": "Verify success criteria",
+                "depends_on": ["T1"],
+                "status": "pending",
+                "executor_notes": "",
+                "reviewer_verdict": "",
+            },
+        ],
         "watch_items": ["Ensure repository state matches plan assumptions"],
+        "sense_checks": [
+            {
+                "id": "SC1",
+                "task_id": "T1",
+                "question": "Verify implementation matches the stated idea.",
+                "verdict": "",
+            },
+            {
+                "id": "SC2",
+                "task_id": "T2",
+                "question": "Verify success criteria were actually checked.",
+                "verdict": "",
+            },
+        ],
         "meta_commentary": "This is a mock finalize output.",
     }
     return _mock_result(payload)
@@ -340,6 +353,10 @@ def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
         "files_changed": [str(target.relative_to(Path(state["config"]["project_dir"])))],
         "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
         "deviations": [],
+        "task_updates": [
+            {"task_id": "T1", "status": "done", "executor_notes": "Implemented via mock."},
+            {"task_id": "T2", "status": "done", "executor_notes": "Verified via mock."},
+        ],
     }
     return _mock_result(payload, trace_output='{"event":"mock-execute"}\n')
 
@@ -350,7 +367,19 @@ def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
         {"name": criterion, "pass": True, "evidence": "Mock execution and artifacts satisfy the criterion."}
         for criterion in meta.get("success_criteria", [])
     ]
-    payload = {"criteria": criteria, "issues": [], "summary": "Mock review passed."}
+    payload = {
+        "criteria": criteria,
+        "issues": [],
+        "summary": "Mock review passed.",
+        "task_verdicts": [
+            {"task_id": "T1", "reviewer_verdict": "Pass - mock verified."},
+            {"task_id": "T2", "reviewer_verdict": "Pass - mock verified."},
+        ],
+        "sense_check_verdicts": [
+            {"sense_check_id": "SC1", "verdict": "Confirmed."},
+            {"sense_check_id": "SC2", "verdict": "Confirmed."},
+        ],
+    }
     return _mock_result(payload)
 
 

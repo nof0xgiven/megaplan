@@ -128,7 +128,31 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
     )
     atomic_write_json(
         plan_dir / "execution.json",
-        {"output": "done", "files_changed": [], "commands_run": [], "deviations": []},
+        {
+            "output": "done",
+            "files_changed": [],
+            "commands_run": [],
+            "deviations": [],
+            "task_updates": [{"task_id": "T1", "status": "done", "executor_notes": "Implemented."}],
+        },
+    )
+    atomic_write_json(
+        plan_dir / "finalize.json",
+        {
+            "tasks": [
+                {
+                    "id": "T1",
+                    "description": "Do the thing",
+                    "depends_on": [],
+                    "status": "done",
+                    "executor_notes": "Implemented.",
+                    "reviewer_verdict": "",
+                }
+            ],
+            "watch_items": ["Check assumptions."],
+            "sense_checks": [{"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""}],
+            "meta_commentary": "Stay focused.",
+        },
     )
     save_flag_registry(
         plan_dir,
@@ -188,6 +212,7 @@ def test_review_prompt_includes_execution_and_gate(tmp_path: Path) -> None:
     prompt = create_claude_prompt("review", state, plan_dir)
     assert "Gate summary" in prompt
     assert "Execution summary" in prompt
+    assert "Execution tracking state (`finalize.json`)" in prompt
 
 
 def test_plan_prompt_is_nonempty(tmp_path: Path) -> None:
@@ -239,6 +264,7 @@ def test_execute_prompt_auto_approve_note(tmp_path: Path) -> None:
     state["config"]["auto_approve"] = True
     prompt = create_claude_prompt("execute", state, plan_dir)
     assert "auto-approve" in prompt
+    assert "task_updates" in prompt
 
 
 def test_execute_prompt_user_approved_note(tmp_path: Path) -> None:
@@ -246,6 +272,31 @@ def test_execute_prompt_user_approved_note(tmp_path: Path) -> None:
     state["meta"]["user_approved_gate"] = True
     prompt = create_claude_prompt("execute", state, plan_dir)
     assert "explicitly approved" in prompt
+    assert "Execution tracking source of truth (`finalize.json`)" in prompt
+
+
+def test_finalize_prompt_requests_structured_tracking_fields(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("finalize", state, plan_dir)
+    assert "tasks" in prompt
+    assert "sense_checks" in prompt
+    assert "executor_notes" in prompt
+    assert "reviewer_verdict" in prompt
+    assert "final_plan" not in prompt
+    assert "_notes:_" not in prompt
+    assert "_verdict:_" not in prompt
+
+
+def test_review_prompts_request_verdict_arrays(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    claude_prompt = create_claude_prompt("review", state, plan_dir)
+    codex_prompt = create_codex_prompt("review", state, plan_dir)
+    assert "task_verdicts" in claude_prompt
+    assert "sense_check_verdicts" in claude_prompt
+    assert "task_verdicts" in codex_prompt
+    assert "sense_check_verdicts" in codex_prompt
+    assert "final.md" not in claude_prompt
+    assert "final.md" not in codex_prompt
 
 
 def test_plan_prompt_includes_notes_when_present(tmp_path: Path) -> None:
