@@ -13,6 +13,7 @@ from megaplan.types import (
     CliError,
     FlagRecord,
     FlagRegistry,
+    GateCheckResult,
     HistoryEntry,
     PlanState,
     STATE_ABORTED,
@@ -92,7 +93,7 @@ def append_history(state: PlanState, entry: HistoryEntry) -> None:
 def next_flag_number(flags: list[FlagRecord]) -> int:
     highest = 0
     for flag in flags:
-        match = re.fullmatch(r"FLAG-(\d+)", str(flag.get("id", "")))
+        match = re.fullmatch(r"FLAG-(\d+)", flag["id"])
         if match:
             highest = max(highest, int(match.group(1)))
     return highest + 1
@@ -166,8 +167,6 @@ def attach_agent_fallback(response: StepResponse, args: argparse.Namespace) -> N
         response["agent_fallback"] = args._agent_fallback
 
 
-def _run_step_with_worker(*args: Any, **kwargs: Any) -> tuple[WorkerResult, str, str, bool]:
-    return worker_module.run_step_with_worker(*args, **kwargs)
 
 
 def normalize_flag_record(raw_flag: dict[str, Any], fallback_id: str) -> FlagRecord:
@@ -190,7 +189,7 @@ def normalize_flag_record(raw_flag: dict[str, Any], fallback_id: str) -> FlagRec
 def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, iteration: int) -> FlagRegistry:
     registry = load_flag_registry(plan_dir)
     flags = registry.setdefault("flags", [])
-    by_id = {flag["id"]: flag for flag in flags}
+    by_id: dict[str, FlagRecord] = {flag["id"]: flag for flag in flags}
     next_number = next_flag_number(flags)
 
     for verified_id in critique.get("verified_flag_ids", []):
@@ -213,11 +212,11 @@ def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, ite
             existing = by_id[normalized["id"]]
             existing.update(normalized)
             existing["status"] = "open"
-            existing["severity"] = resolve_severity(normalized["severity_hint"])
+            existing["severity"] = resolve_severity(normalized.get("severity_hint", "uncertain"))
             existing["raised_in"] = f"critique_v{iteration}.json"
         else:
-            severity = resolve_severity(normalized["severity_hint"])
-            created = {
+            severity = resolve_severity(normalized.get("severity_hint", "uncertain"))
+            created: FlagRecord = {
                 **normalized,
                 "raised_in": f"critique_v{iteration}.json",
                 "status": "open",
@@ -360,7 +359,7 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
     rerun = state["current_state"] == STATE_PLANNED
     version = state["iteration"] if rerun else state["iteration"] + 1
     try:
-        worker, agent, mode, refreshed = _run_step_with_worker("plan", state, plan_dir, args, root=root)
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker("plan", state, plan_dir, args, root=root)
     except CliError as error:
         record_step_failure(plan_dir, state, step="plan", iteration=version, error=error)
         raise
@@ -428,7 +427,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     iteration = state["iteration"]
     state["last_gate"] = {}
     try:
-        worker, agent, mode, refreshed = _run_step_with_worker("critique", state, plan_dir, args, root=root)
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker("critique", state, plan_dir, args, root=root)
     except CliError as error:
         record_step_failure(plan_dir, state, step="critique", iteration=iteration, error=error)
         raise
@@ -439,7 +438,7 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
         [
             flag
             for flag in registry["flags"]
-            if flag.get("severity") == "significant" and flag.get("status") in FLAG_BLOCKING_STATUSES
+            if flag.get("severity") == "significant" and flag["status"] in FLAG_BLOCKING_STATUSES
         ]
     )
     _append_to_meta(state, "significant_counts", significant)
@@ -466,13 +465,13 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     scope_flags_list = scope_creep_flags(registry, statuses=FLAG_BLOCKING_STATUSES)
     open_flags_detail = [
         {
-            "id": flag.get("id"),
-            "concern": flag.get("concern", ""),
-            "category": flag.get("category", "other"),
+            "id": flag["id"],
+            "concern": flag["concern"],
+            "category": flag["category"],
             "severity": flag.get("severity", "unknown"),
         }
         for flag in registry["flags"]
-        if flag.get("status") == "open"
+        if flag["status"] == "open"
     ]
     response: StepResponse = {
         "success": True,
@@ -505,7 +504,7 @@ def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
         )
     previous_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     try:
-        worker, agent, mode, refreshed = _run_step_with_worker("revise", state, plan_dir, args, root=root)
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker("revise", state, plan_dir, args, root=root)
     except CliError as error:
         record_step_failure(plan_dir, state, step="revise", iteration=state["iteration"] + 1, error=error)
         raise
@@ -563,12 +562,12 @@ def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
     updated_registry = load_flag_registry(plan_dir)
     remaining = [
         {
-            "id": flag.get("id"),
-            "concern": flag.get("concern", ""),
-            "category": flag.get("category", "other"),
+            "id": flag["id"],
+            "concern": flag["concern"],
+            "category": flag["category"],
         }
         for flag in updated_registry["flags"]
-        if flag.get("status") in FLAG_BLOCKING_STATUSES and flag.get("severity") == "significant"
+        if flag["status"] in FLAG_BLOCKING_STATUSES and flag.get("severity") == "significant"
     ]
     response: StepResponse = {
         "success": True,
@@ -604,7 +603,7 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
     signals_filename = f"gate_signals_v{iteration}.json"
     atomic_write_json(plan_dir / signals_filename, signals_artifact)
     try:
-        worker, agent, mode, refreshed = _run_step_with_worker("gate", state, plan_dir, args, root=root)
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker("gate", state, plan_dir, args, root=root)
     except CliError as error:
         record_step_failure(plan_dir, state, step="gate", iteration=iteration, error=error)
         raise
@@ -651,10 +650,15 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
         summary = "Gate recommended PROCEED, but preflight checks are still blocking execution."
     elif gate_summary["recommendation"] == "ITERATE":
         next_step = "revise"
-    elif gate_signals["robustness"] == "light" and gate_signals["signals"]["weighted_score"] <= 4.0:
-        next_step = "override force-proceed"
+    elif gate_summary["recommendation"] == "ESCALATE":
+        if gate_signals["robustness"] == "light" and gate_signals["signals"]["weighted_score"] <= 4.0:
+            next_step = "override force-proceed"
+        else:
+            next_step = "override add-note"
     else:
         next_step = "override add-note"
+        result = "unknown_recommendation"
+        summary = f"Gate returned unknown recommendation '{gate_summary['recommendation']}'; treating as escalation."
 
     apply_session_update(state, "gate", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
@@ -682,7 +686,16 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
         "state": state["current_state"],
         "auto_approve": bool(state["config"].get("auto_approve", False)),
         "robustness": configured_robustness(state),
-        **gate_summary,
+        "recommendation": gate_summary["recommendation"],
+        "rationale": gate_summary["rationale"],
+        "signals_assessment": gate_summary["signals_assessment"],
+        "warnings": gate_summary["warnings"],
+        "passed": gate_summary["passed"],
+        "criteria_check": gate_summary["criteria_check"],
+        "preflight_results": gate_summary["preflight_results"],
+        "unresolved_flags": gate_summary["unresolved_flags"],
+        "orchestrator_guidance": gate_summary["orchestrator_guidance"],
+        "signals": gate_summary["signals"],
     }
     attach_agent_fallback(response, args)
     return response
@@ -703,7 +716,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             "Execute requires explicit user approval (--user-approved) when auto-approve is not set. The orchestrator must confirm with the user at the gate checkpoint before proceeding.",
         )
     try:
-        worker, agent, mode, refreshed = _run_step_with_worker("execute", state, plan_dir, args, root=root)
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker("execute", state, plan_dir, args, root=root)
     except CliError as error:
         record_step_failure(plan_dir, state, step="execute", iteration=state["iteration"], error=error)
         raise
@@ -757,7 +770,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "review", {STATE_EXECUTED})
     try:
-        worker, agent, mode, refreshed = _run_step_with_worker("review", state, plan_dir, args, root=root)
+        worker, agent, mode, refreshed = worker_module.run_step_with_worker("review", state, plan_dir, args, root=root)
     except CliError as error:
         record_step_failure(plan_dir, state, step="review", iteration=state["iteration"], error=error)
         raise

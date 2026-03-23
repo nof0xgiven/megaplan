@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Callable
 
 from megaplan.types import (
     CliError,
@@ -70,8 +70,8 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
         {
             "id": flag["id"],
             "severity": flag.get("severity"),
-            "status": flag.get("status"),
-            "concern": flag.get("concern"),
+            "status": flag["status"],
+            "concern": flag["concern"],
             "evidence": flag.get("evidence"),
         }
         for flag in unresolved
@@ -118,11 +118,11 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
         {
             "id": flag["id"],
             "concern": flag["concern"],
-            "status": flag.get("status"),
+            "status": flag["status"],
             "severity": flag.get("severity"),
         }
         for flag in flag_registry["flags"]
-        if flag.get("status") in {"addressed", "open", "disputed"}
+        if flag["status"] in {"addressed", "open", "disputed"}
     ]
     return textwrap.dedent(
         f"""
@@ -164,11 +164,11 @@ def _gate_prompt(state: PlanState, plan_dir: Path) -> str:
     unresolved = unresolved_significant_flags(flag_registry)
     open_flags = [
         {
-            "id": flag.get("id"),
-            "concern": flag.get("concern", ""),
-            "category": flag.get("category", "other"),
+            "id": flag["id"],
+            "concern": flag["concern"],
+            "category": flag["category"],
             "severity": flag.get("severity", "unknown"),
-            "status": flag.get("status", "unknown"),
+            "status": flag["status"],
             "weight": flag.get("weight"),
         }
         for flag in unresolved
@@ -329,7 +329,9 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
-_CLAUDE_PROMPT_BUILDERS: dict[str, Any] = {
+_PromptBuilder = Callable[[PlanState, Path], str]
+
+_CLAUDE_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "plan": _plan_prompt,
     "critique": _critique_prompt,
     "revise": _revise_prompt,
@@ -338,7 +340,7 @@ _CLAUDE_PROMPT_BUILDERS: dict[str, Any] = {
     "review": _review_claude_prompt,
 }
 
-_CODEX_PROMPT_BUILDERS: dict[str, Any] = {
+_CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "plan": _plan_prompt,
     "critique": _critique_prompt,
     "revise": _revise_prompt,

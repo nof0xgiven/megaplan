@@ -358,3 +358,125 @@ def test_validate_payload_execute_requires_output() -> None:
 def test_validate_payload_review_requires_criteria() -> None:
     with pytest.raises(CliError, match="criteria"):
         validate_payload("review", {"issues": []})
+
+
+# ---------------------------------------------------------------------------
+# Subprocess-mocked tests for run_claude_step and run_codex_step
+# ---------------------------------------------------------------------------
+
+
+def test_run_claude_step_parses_structured_output(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import CommandResult, run_claude_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    plan_payload = {
+        "plan": "# Plan\nDo it.",
+        "questions": [],
+        "success_criteria": ["criterion"],
+        "assumptions": [],
+    }
+    claude_output = json.dumps({
+        "structured_output": plan_payload,
+        "total_cost_usd": 0.05,
+        "session_id": "sess-abc",
+    })
+    fake_result = CommandResult(
+        command=["claude"],
+        cwd=tmp_path,
+        returncode=0,
+        stdout=claude_output,
+        stderr="",
+        duration_ms=500,
+    )
+    with patch("megaplan.workers.run_command", return_value=fake_result):
+        result = run_claude_step("plan", state, plan_dir, root=tmp_path, fresh=True)
+    assert result.payload == plan_payload
+    assert result.cost_usd == 0.05
+    assert result.session_id == "sess-abc"
+    assert result.duration_ms == 500
+
+
+def test_run_claude_step_raises_on_invalid_payload(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import CommandResult, run_claude_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    # Missing required keys for "plan" step
+    claude_output = json.dumps({
+        "structured_output": {"plan": "x"},
+        "total_cost_usd": 0.0,
+    })
+    fake_result = CommandResult(
+        command=["claude"],
+        cwd=tmp_path,
+        returncode=0,
+        stdout=claude_output,
+        stderr="",
+        duration_ms=100,
+    )
+    with patch("megaplan.workers.run_command", return_value=fake_result):
+        with pytest.raises(CliError, match="missing required keys"):
+            run_claude_step("plan", state, plan_dir, root=tmp_path, fresh=True)
+
+
+def test_run_codex_step_parses_output_file(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import CommandResult, run_codex_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+    plan_payload = {
+        "plan": "# Plan\nDo it.",
+        "questions": [],
+        "success_criteria": ["criterion"],
+        "assumptions": [],
+    }
+
+    def fake_run_command(command: list[str], **kwargs: object) -> CommandResult:
+        # Codex writes output to -o file; find the output path in the command
+        output_idx = command.index("-o") + 1
+        output_path = Path(command[output_idx])
+        output_path.write_text(json.dumps(plan_payload), encoding="utf-8")
+        return CommandResult(
+            command=command,
+            cwd=tmp_path,
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_ms=300,
+        )
+
+    with patch("megaplan.workers.run_command", side_effect=fake_run_command):
+        result = run_codex_step(
+            "plan", state, plan_dir, root=tmp_path, persistent=False, fresh=True,
+        )
+    assert result.payload == plan_payload
+    assert result.duration_ms == 300
+    assert result.cost_usd == 0.0
+
+
+def test_run_codex_step_raises_on_nonzero_exit(tmp_path: Path) -> None:
+    from megaplan._core import ensure_runtime_layout
+    from megaplan.workers import CommandResult, run_codex_step
+
+    ensure_runtime_layout(tmp_path)
+    plan_dir, state = _mock_state(tmp_path)
+
+    def fake_run_command(command: list[str], **kwargs: object) -> CommandResult:
+        return CommandResult(
+            command=command,
+            cwd=tmp_path,
+            returncode=1,
+            stdout="",
+            stderr="Something went wrong",
+            duration_ms=100,
+        )
+
+    with patch("megaplan.workers.run_command", side_effect=fake_run_command):
+        with pytest.raises(CliError, match="failed with exit code"):
+            run_codex_step(
+                "plan", state, plan_dir, root=tmp_path, persistent=False, fresh=True,
+            )

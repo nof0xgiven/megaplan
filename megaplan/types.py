@@ -76,6 +76,22 @@ class HistoryEntry(TypedDict, total=False):
     environment: dict[str, bool]
 
 
+class ClarificationRecord(TypedDict, total=False):
+    refined_idea: str
+    intent_summary: str
+    questions: list[str]
+
+
+class LastGateRecord(TypedDict, total=False):
+    recommendation: str
+    rationale: str
+    signals_assessment: str
+    warnings: list[str]
+    passed: bool
+    preflight_results: dict[str, bool]
+    orchestrator_guidance: str
+
+
 class PlanState(TypedDict):
     name: str
     idea: str
@@ -87,18 +103,21 @@ class PlanState(TypedDict):
     plan_versions: list[PlanVersionRecord]
     history: list[HistoryEntry]
     meta: PlanMeta
-    last_gate: dict[str, Any]
-    clarification: NotRequired[dict[str, Any]]
+    last_gate: LastGateRecord
+    clarification: NotRequired[ClarificationRecord]
 
 
-class FlagRecord(TypedDict, total=False):
+class _FlagRecordRequired(TypedDict):
     id: str
     concern: str
     category: str
+    status: str
+
+
+class FlagRecord(_FlagRecordRequired, total=False):
     severity_hint: str
     evidence: str
     raised_in: str
-    status: str
     severity: str
     verified: bool
     verified_in: str
@@ -107,6 +126,35 @@ class FlagRecord(TypedDict, total=False):
 
 class FlagRegistry(TypedDict):
     flags: list[FlagRecord]
+
+
+class GateCheckResult(TypedDict):
+    passed: bool
+    criteria_check: dict[str, Any]
+    preflight_results: dict[str, bool]
+    unresolved_flags: list[FlagRecord]
+
+
+class GatePayload(TypedDict):
+    recommendation: str
+    rationale: str
+    signals_assessment: str
+    warnings: list[str]
+
+
+class GateArtifact(TypedDict, total=False):
+    passed: bool
+    criteria_check: dict[str, Any]
+    preflight_results: dict[str, bool]
+    unresolved_flags: list[FlagRecord]
+    recommendation: str
+    rationale: str
+    signals_assessment: str
+    warnings: list[str]
+    override_forced: bool
+    orchestrator_guidance: str
+    robustness: str
+    signals: dict[str, Any]
 
 
 class GateSignals(TypedDict, total=False):

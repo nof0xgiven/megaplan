@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from megaplan.schemas import SCHEMAS
 from megaplan.types import (
@@ -180,6 +180,21 @@ def validate_payload(step: str, payload: dict[str, Any]) -> None:
         raise CliError("parse_error", f"{step} output missing required keys: {', '.join(missing)}")
 
 
+def _mock_result(
+    payload: dict[str, Any],
+    *,
+    trace_output: str | None = None,
+) -> WorkerResult:
+    return WorkerResult(
+        payload=payload,
+        raw_output=json_dump(payload),
+        duration_ms=10,
+        cost_usd=0.0,
+        session_id=str(uuid.uuid4()),
+        trace_output=trace_output,
+    )
+
+
 def _mock_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
     payload = {
         "plan": textwrap.dedent(
@@ -206,7 +221,7 @@ def _mock_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
         ],
         "assumptions": ["The project directory is writable."],
     }
-    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+    return _mock_result(payload)
 
 
 def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
@@ -234,7 +249,7 @@ def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
         }
     else:
         payload = {"flags": [], "verified_flag_ids": ["FLAG-001", "FLAG-002"], "disputed_flag_ids": []}
-    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+    return _mock_result(payload)
 
 
 def _mock_revise(state: PlanState, plan_dir: Path) -> WorkerResult:
@@ -267,7 +282,7 @@ def _mock_revise(state: PlanState, plan_dir: Path) -> WorkerResult:
         ],
         "questions": [],
     }
-    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+    return _mock_result(payload)
 
 
 def _mock_gate(state: PlanState, plan_dir: Path) -> WorkerResult:
@@ -286,7 +301,7 @@ def _mock_gate(state: PlanState, plan_dir: Path) -> WorkerResult:
         ),
         "warnings": [],
     }
-    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+    return _mock_result(payload)
 
 
 def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
@@ -298,7 +313,7 @@ def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
         "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
         "deviations": [],
     }
-    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()), trace_output='{"event":"mock-execute"}\n')
+    return _mock_result(payload, trace_output='{"event":"mock-execute"}\n')
 
 
 def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
@@ -308,10 +323,12 @@ def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
         for criterion in meta.get("success_criteria", [])
     ]
     payload = {"criteria": criteria, "issues": [], "summary": "Mock review passed."}
-    return WorkerResult(payload=payload, raw_output=json_dump(payload), duration_ms=10, cost_usd=0.0, session_id=str(uuid.uuid4()))
+    return _mock_result(payload)
 
 
-_MOCK_DISPATCH: dict[str, Any] = {
+_MockHandler = Callable[[PlanState, Path], WorkerResult]
+
+_MOCK_DISPATCH: dict[str, _MockHandler] = {
     "plan": _mock_plan,
     "critique": _mock_critique,
     "revise": _mock_revise,

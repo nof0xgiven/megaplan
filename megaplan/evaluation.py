@@ -10,6 +10,9 @@ from typing import Any, Callable
 from megaplan.types import (
     FLAG_BLOCKING_STATUSES,
     FlagRecord,
+    GateArtifact,
+    GateCheckResult,
+    GatePayload,
     GateSignals,
     PlanState,
 )
@@ -98,7 +101,7 @@ def build_gate_signals(plan_dir: Path, state: PlanState) -> GateSignals:
         [
             flag
             for flag in flag_registry["flags"]
-            if flag.get("severity") == "significant" and flag.get("status") != "verified"
+            if flag.get("severity") == "significant" and flag["status"] != "verified"
         ]
     )
     weighted_score = round(sum(flag_weight(flag) for flag in unresolved), 2)
@@ -112,12 +115,12 @@ def build_gate_signals(plan_dir: Path, state: PlanState) -> GateSignals:
     recurring = compute_recurring_critiques(plan_dir, iteration)
     resolved_flags = [
         {
-            "id": flag.get("id"),
-            "concern": flag.get("concern", ""),
+            "id": flag["id"],
+            "concern": flag["concern"],
             "resolution": flag.get("evidence", ""),
         }
         for flag in flag_registry["flags"]
-        if flag.get("status") == "verified"
+        if flag["status"] == "verified"
     ]
 
     delta_history = state["meta"].get("plan_deltas", [])
@@ -145,11 +148,11 @@ def build_gate_signals(plan_dir: Path, state: PlanState) -> GateSignals:
             "significant_flags": significant_count,
             "unresolved_flags": [
                 {
-                    "id": flag.get("id"),
-                    "concern": flag.get("concern", ""),
-                    "category": flag.get("category", "other"),
+                    "id": flag["id"],
+                    "concern": flag["concern"],
+                    "category": flag["category"],
                     "severity": flag.get("severity", "unknown"),
-                    "status": flag.get("status", "unknown"),
+                    "status": flag["status"],
                 }
                 for flag in unresolved
             ],
@@ -181,7 +184,7 @@ def run_gate_checks(
     state: PlanState,
     *,
     command_lookup: Callable[[str], str | None] | None = None,
-) -> dict[str, Any]:
+) -> GateCheckResult:
     project_dir = Path(state["config"]["project_dir"])
     meta = read_json(latest_plan_meta_path(plan_dir, state))
     flag_registry = load_flag_registry(plan_dir)
@@ -207,11 +210,11 @@ def run_gate_checks(
 
 def build_gate_artifact(
     signals: dict[str, Any],
-    gate_payload: dict[str, Any],
+    gate_payload: GatePayload,
     *,
     override_forced: bool,
     orchestrator_guidance: str = "",
-) -> dict[str, Any]:
+) -> GateArtifact:
     preflight = signals["preflight_results"]
     recommendation = gate_payload["recommendation"]
     warnings = list(signals.get("warnings", [])) + list(gate_payload.get("warnings", []))
@@ -232,10 +235,10 @@ def build_gate_artifact(
 
 
 def build_orchestrator_guidance(
-    gate_payload: dict,
-    signals: dict,
+    gate_payload: GatePayload,
+    signals: dict[str, Any],
     preflight_passed: bool,
-    preflight_results: dict,
+    preflight_results: dict[str, bool],
     robustness: str,
     plan_name: str,
 ) -> str:

@@ -265,12 +265,12 @@ def unresolved_significant_flags(flag_registry: FlagRegistry) -> list[FlagRecord
     return [
         flag
         for flag in flag_registry["flags"]
-        if flag.get("severity") == "significant" and flag.get("status") in FLAG_BLOCKING_STATUSES
+        if flag.get("severity") == "significant" and flag["status"] in FLAG_BLOCKING_STATUSES
     ]
 
 
 def is_scope_creep_flag(flag: FlagRecord) -> bool:
-    text = f"{flag.get('concern', '')} {flag.get('evidence', '')}".lower()
+    text = f"{flag['concern']} {flag.get('evidence', '')}".lower()
     return any(term in text for term in SCOPE_CREEP_TERMS)
 
 
@@ -281,7 +281,7 @@ def scope_creep_flags(
 ) -> list[FlagRecord]:
     matches = []
     for flag in flag_registry["flags"]:
-        if statuses is not None and flag.get("status") not in statuses:
+        if statuses is not None and flag["status"] not in statuses:
             continue
         if is_scope_creep_flag(flag):
             matches.append(flag)
