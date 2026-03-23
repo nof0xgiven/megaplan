@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import os
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any, Callable
 
-from megaplan._core import (
+from megaplan.types import (
     FLAG_BLOCKING_STATUSES,
-    PlanState,
     FlagRecord,
     GateSignals,
+    PlanState,
+)
+from megaplan._core import (
     configured_robustness,
     current_iteration_artifact,
+    latest_plan_meta_path,
     latest_plan_path,
     load_flag_registry,
     normalize_text,
@@ -169,3 +174,124 @@ def build_gate_signals(plan_dir: Path, state: PlanState) -> GateSignals:
             f"Iteration {iteration}: hard iteration limit reached. Escalation is likely warranted."
         )
     return result
+
+
+def run_gate_checks(
+    plan_dir: Path,
+    state: PlanState,
+    *,
+    command_lookup: Callable[[str], str | None] | None = None,
+) -> dict[str, Any]:
+    project_dir = Path(state["config"]["project_dir"])
+    meta = read_json(latest_plan_meta_path(plan_dir, state))
+    flag_registry = load_flag_registry(plan_dir)
+    unresolved = unresolved_significant_flags(flag_registry)
+    lookup = command_lookup or (lambda name: None)
+    checks = {
+        "project_dir_exists": project_dir.exists(),
+        "project_dir_writable": os.access(project_dir, os.W_OK),
+        "success_criteria_present": bool(meta.get("success_criteria")),
+        "claude_available": bool(lookup("claude")),
+        "codex_available": bool(lookup("codex")),
+    }
+    return {
+        "passed": all(checks.values()),
+        "criteria_check": {
+            "count": len(meta.get("success_criteria", [])),
+            "items": meta.get("success_criteria", []),
+        },
+        "preflight_results": checks,
+        "unresolved_flags": unresolved,
+    }
+
+
+def build_gate_artifact(
+    signals: dict[str, Any],
+    gate_payload: dict[str, Any],
+    *,
+    override_forced: bool,
+    orchestrator_guidance: str = "",
+) -> dict[str, Any]:
+    preflight = signals["preflight_results"]
+    recommendation = gate_payload["recommendation"]
+    warnings = list(signals.get("warnings", [])) + list(gate_payload.get("warnings", []))
+    return {
+        "passed": recommendation == "PROCEED" and all(preflight.values()),
+        "criteria_check": signals["criteria_check"],
+        "preflight_results": preflight,
+        "unresolved_flags": signals["unresolved_flags"],
+        "recommendation": recommendation,
+        "rationale": gate_payload["rationale"],
+        "signals_assessment": gate_payload["signals_assessment"],
+        "warnings": warnings,
+        "override_forced": override_forced,
+        "orchestrator_guidance": orchestrator_guidance,
+        "robustness": signals.get("robustness"),
+        "signals": signals["signals"],
+    }
+
+
+def build_orchestrator_guidance(
+    gate_payload: dict,
+    signals: dict,
+    preflight_passed: bool,
+    preflight_results: dict,
+    robustness: str,
+    plan_name: str,
+) -> str:
+    """Return plain-language next-step guidance for the orchestrator."""
+    recommendation = gate_payload["recommendation"]
+    iteration = int(signals.get("iteration", 0))
+    weighted_score = float(signals.get("weighted_score", 0.0))
+    weighted_history = list(signals.get("weighted_history", []))
+    recurring_critiques = list(signals.get("recurring_critiques", []))
+    unresolved_flags = list(signals.get("unresolved_flags", []))
+    scope_creep = list(signals.get("scope_creep_flags", []))
+    previous_score = float(weighted_history[-1]) if weighted_history else None
+    plateaued = previous_score is not None and weighted_score >= previous_score
+    worsening = previous_score is not None and weighted_score > previous_score
+    improving = previous_score is not None and weighted_score < previous_score
+
+    if iteration == 1:
+        guidance = f"First iteration; follow gate recommendation: {recommendation}."
+    elif recommendation == "PROCEED" and preflight_passed:
+        guidance = "Plan passed gate and preflight. Proceed to execute."
+    elif recommendation == "PROCEED":
+        failing_checks = ", ".join(
+            name for name, passed in preflight_results.items() if not passed
+        )
+        guidance = f"Gate says PROCEED but preflight blocked. Fix: {failing_checks}."
+    elif recommendation == "ESCALATE" and robustness == "light" and weighted_score <= 4.0:
+        guidance = (
+            "Auto-force-proceed eligible. Run: "
+            f'`megaplan override force-proceed --plan {plan_name} --reason "light robustness, score {weighted_score}"`'
+        )
+    elif recommendation == "ESCALATE":
+        guidance = "Gate escalated. Ask the user: force-proceed, add-note, or abort."
+    elif recommendation == "ITERATE" and plateaued and recurring_critiques:
+        guidance = (
+            "Score plateaued with recurring critiques the loop can't fix. Consider "
+            f"force-proceeding: `megaplan override force-proceed --plan {plan_name}`"
+        )
+    elif recommendation == "ITERATE" and improving:
+        guidance = f"Score improving ({previous_score} -> {weighted_score}). Continue to revise."
+    elif recommendation == "ITERATE" and worsening:
+        guidance = (
+            f"Score worsening ({previous_score} -> {weighted_score}). "
+            "Investigate; the loop may be diverging."
+        )
+    else:
+        guidance = "Gate recommends another iteration. Revise the plan."
+
+    hints: list[str] = []
+    if unresolved_flags:
+        hints.append("Verify unresolved flags against the plan and project code before accepting.")
+    if recurring_critiques:
+        critiques = ", ".join(recurring_critiques)
+        hints.append(
+            f"Recurring critiques ({critiques}); the loop likely can't fix these, so judge if they are real blockers."
+        )
+    if scope_creep:
+        hints.append("Scope creep detected; compare the current plan against the original idea.")
+
+    return " ".join([guidance, *hints]).strip()

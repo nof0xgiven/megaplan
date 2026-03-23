@@ -1,10 +1,4 @@
-"""Shared utilities, types, and constants for megaplan.
-
-This module exists to break circular dependencies.  Every symbol that
-workers.py, prompts.py, or evaluation.py needs from the package lives
-here so that those modules can import at the top level without pulling
-in cli.py (which re-exports from them).
-"""
+"""Shared utilities for megaplan — I/O, config, plan resolution, flag helpers, prompt helpers."""
 
 from __future__ import annotations
 
@@ -17,223 +11,23 @@ import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict
+from typing import Any
 
-from megaplan.schemas import SCHEMAS, strict_schema  # noqa: F401
-
-
-# ---------------------------------------------------------------------------
-# Type definitions
-# ---------------------------------------------------------------------------
-
-STATE_INITIALIZED = "initialized"
-STATE_PLANNED = "planned"
-STATE_CRITIQUED = "critiqued"
-STATE_GATED = "gated"
-STATE_EXECUTED = "executed"
-STATE_DONE = "done"
-STATE_ABORTED = "aborted"
-TERMINAL_STATES = {STATE_DONE, STATE_ABORTED}
-
-
-class PlanConfig(TypedDict, total=False):
-    project_dir: str
-    auto_approve: bool
-    robustness: str
-    agents: dict[str, str]
-
-
-class PlanMeta(TypedDict, total=False):
-    significant_counts: list[int]
-    weighted_scores: list[float]
-    plan_deltas: list[float | None]
-    recurring_critiques: list[str]
-    total_cost_usd: float
-    overrides: list[dict[str, Any]]
-    notes: list[dict[str, Any]]
-    user_approved_gate: bool
-
-
-class PlanState(TypedDict):
-    name: str
-    idea: str
-    current_state: str
-    iteration: int
-    created_at: str
-    config: PlanConfig
-    sessions: dict[str, SessionInfo]
-    plan_versions: list[PlanVersionRecord]
-    history: list[HistoryEntry]
-    meta: PlanMeta
-    last_gate: dict[str, Any]
-    clarification: NotRequired[dict[str, Any]]
-
-
-class FlagRecord(TypedDict, total=False):
-    id: str
-    concern: str
-    category: str
-    severity_hint: str
-    evidence: str
-    raised_in: str
-    status: str
-    severity: str
-    verified: bool
-    verified_in: str
-    addressed_in: str
-
-
-class SessionInfo(TypedDict, total=False):
-    id: str
-    mode: str
-    created_at: str
-    last_used_at: str
-    refreshed: bool
-
-
-class PlanVersionRecord(TypedDict, total=False):
-    version: int
-    file: str
-    hash: str
-    timestamp: str
-
-
-class HistoryEntry(TypedDict, total=False):
-    step: str
-    timestamp: str
-    duration_ms: int
-    cost_usd: float
-    result: str
-    session_mode: str
-    session_id: str
-    agent: str
-    output_file: str
-    artifact_hash: str
-    raw_output_file: str
-    message: str
-    flags_count: int
-    flags_addressed: list[str]
-    recommendation: str
-    approval_mode: str
-    environment: dict[str, bool]
-
-
-class FlagRegistry(TypedDict):
-    flags: list[FlagRecord]
-
-
-class GateSignals(TypedDict, total=False):
-    """Typed result from build_gate_signals()."""
-    robustness: str
-    signals: dict[str, Any]
-    warnings: list[str]
-
-
-class StepResponse(TypedDict, total=False):
-    """Typed response dict returned by all handler functions."""
-    success: bool
-    step: str
-    summary: str
-    artifacts: list[str]
-    next_step: str | None
-    state: str
-    # Fields returned by specific handlers
-    auto_approve: bool
-    robustness: str
-    iteration: int
-    plan: str
-    plan_dir: str
-    questions: list[str]
-    verified_flags: list[str]
-    open_flags: list[str]
-    scope_creep_flags: list[str]
-    warnings: list[str]
-    files_changed: list[str]
-    deviations: list[str]
-    user_approved_gate: bool
-    issues: list[str]
-    valid_next: list[str]
-    # Override / setup / config responses
-    mode: str
-    installed: list[dict[str, Any]]
-    config_path: str
-    routing: dict[str, str]
-    raw_config: dict[str, Any]
-    action: str
-    key: str
-    value: str
-    skipped: bool
-    file: str
-    plans: list[dict[str, Any]]
-    # Gate worker / summary fields
-    recommendation: str
-    signals: dict[str, Any]
-    rationale: str
-    gate_recommendation: str
-    gate_rationale: str
-    signals_assessment: str
-    # Gate check fields (spread via **gate)
-    passed: bool
-    criteria_check: dict[str, Any]
-    preflight_results: dict[str, bool]
-    unresolved_flags: list[Any]
-    # Error response fields
-    error: str
-    message: str
-    details: dict[str, Any]
-    # Fallback
-    agent_fallback: dict[str, str]
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-FLAG_BLOCKING_STATUSES = {"open", "disputed"}
-MOCK_ENV_VAR = "MEGAPLAN_MOCK_WORKERS"
-
-DEFAULT_AGENT_ROUTING: dict[str, str] = {
-    "plan": "claude",
-    "critique": "codex",
-    "revise": "claude",
-    "gate": "claude",
-    "execute": "codex",
-    "review": "codex",
-}
-KNOWN_AGENTS = ["claude", "codex"]
-ROBUSTNESS_LEVELS = ("light", "standard", "thorough")
-ROBUSTNESS_SKIP_THRESHOLDS = {"light": 4.0, "standard": 2.0, "thorough": 1.0}
-ROBUSTNESS_STAGNATION_FACTORS = {"light": 0.8, "standard": 0.9, "thorough": 0.95}
-SCOPE_CREEP_TERMS = (
-    "scope creep",
-    "out of scope",
-    "beyond the original idea",
-    "beyond original idea",
-    "beyond user intent",
-    "expanded scope",
+from megaplan.schemas import SCHEMAS, strict_schema
+from megaplan.types import (
+    CliError,
+    FLAG_BLOCKING_STATUSES,
+    FlagRecord,
+    FlagRegistry,
+    KNOWN_AGENTS,
+    PlanState,
+    PlanVersionRecord,
+    ROBUSTNESS_LEVELS,
+    SCOPE_CREEP_TERMS,
+    STATE_CRITIQUED,
+    STATE_INITIALIZED,
+    TERMINAL_STATES,
 )
-
-
-# ---------------------------------------------------------------------------
-# Exception
-# ---------------------------------------------------------------------------
-
-class CliError(Exception):
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        valid_next: list[str] | None = None,
-        extra: dict[str, Any] | None = None,
-        exit_code: int = 1,
-    ) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.valid_next = valid_next or []
-        self.extra = extra or {}
-        self.exit_code = exit_code
 
 
 # ---------------------------------------------------------------------------

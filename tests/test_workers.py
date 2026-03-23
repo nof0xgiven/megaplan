@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from megaplan._core import CliError
+from megaplan.types import CliError
 from megaplan.workers import (
     extract_session_id,
     parse_claude_envelope,
@@ -114,3 +114,247 @@ def test_resolve_agent_mode_for_review_claude_defaults_to_fresh() -> None:
     assert agent == "claude"
     assert mode == "persistent"
     assert refreshed is True
+
+
+# ---------------------------------------------------------------------------
+# Mock worker tests
+# ---------------------------------------------------------------------------
+
+
+def _mock_state(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, dict]:
+    import textwrap
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    state = {
+        "name": "test-plan",
+        "idea": "test the mock workers",
+        "current_state": "critiqued",
+        "iteration": iteration,
+        "created_at": "2026-03-20T00:00:00Z",
+        "config": {
+            "project_dir": str(project_dir),
+            "auto_approve": False,
+            "robustness": "standard",
+        },
+        "sessions": {},
+        "plan_versions": [
+            {"version": iteration, "file": f"plan_v{iteration}.md", "hash": "sha256:test", "timestamp": "2026-03-20T00:00:00Z"}
+        ],
+        "history": [],
+        "meta": {
+            "significant_counts": [],
+            "weighted_scores": [],
+            "plan_deltas": [],
+            "recurring_critiques": [],
+            "total_cost_usd": 0.0,
+            "overrides": [],
+            "notes": [],
+        },
+        "last_gate": {},
+    }
+    (plan_dir / f"plan_v{iteration}.md").write_text("# Plan\nDo it.\n", encoding="utf-8")
+    (plan_dir / f"plan_v{iteration}.meta.json").write_text(
+        json.dumps({"version": iteration, "timestamp": "2026-03-20T00:00:00Z", "hash": "sha256:test", "success_criteria": ["criterion"], "questions": [], "assumptions": []}),
+        encoding="utf-8",
+    )
+    (plan_dir / "faults.json").write_text(json.dumps({"flags": []}), encoding="utf-8")
+    (plan_dir / "gate.json").write_text(
+        json.dumps({"passed": True, "recommendation": "PROCEED", "rationale": "ok", "signals_assessment": "ok", "warnings": [], "criteria_check": {}, "preflight_results": {}, "unresolved_flags": [], "override_forced": False}),
+        encoding="utf-8",
+    )
+    (plan_dir / "execution.json").write_text(
+        json.dumps({"output": "done", "files_changed": [], "commands_run": [], "deviations": []}),
+        encoding="utf-8",
+    )
+    return plan_dir, state
+
+
+def test_mock_plan_returns_valid_payload(tmp_path: Path) -> None:
+    from megaplan.workers import mock_worker_output
+    plan_dir, state = _mock_state(tmp_path)
+    result = mock_worker_output("plan", state, plan_dir)
+    assert "plan" in result.payload
+    assert "questions" in result.payload
+    assert "success_criteria" in result.payload
+    assert "assumptions" in result.payload
+
+
+def test_mock_critique_returns_valid_payload(tmp_path: Path) -> None:
+    from megaplan.workers import mock_worker_output
+    plan_dir, state = _mock_state(tmp_path)
+    result = mock_worker_output("critique", state, plan_dir)
+    assert "flags" in result.payload
+    assert isinstance(result.payload["flags"], list)
+
+
+def test_mock_revise_returns_valid_payload(tmp_path: Path) -> None:
+    from megaplan.workers import mock_worker_output
+    plan_dir, state = _mock_state(tmp_path)
+    result = mock_worker_output("revise", state, plan_dir)
+    assert "plan" in result.payload
+    assert "changes_summary" in result.payload
+    assert "flags_addressed" in result.payload
+
+
+def test_mock_gate_returns_valid_payload(tmp_path: Path) -> None:
+    from megaplan.workers import mock_worker_output
+    plan_dir, state = _mock_state(tmp_path)
+    result = mock_worker_output("gate", state, plan_dir)
+    assert "recommendation" in result.payload
+    assert result.payload["recommendation"] in {"PROCEED", "ITERATE", "ESCALATE"}
+    assert "rationale" in result.payload
+    assert "signals_assessment" in result.payload
+    assert "warnings" in result.payload
+
+
+def test_mock_execute_returns_valid_payload(tmp_path: Path) -> None:
+    from megaplan.workers import mock_worker_output
+    plan_dir, state = _mock_state(tmp_path)
+    result = mock_worker_output("execute", state, plan_dir)
+    assert "output" in result.payload
+    assert "files_changed" in result.payload
+    assert "commands_run" in result.payload
+    assert "deviations" in result.payload
+
+
+def test_mock_review_returns_valid_payload(tmp_path: Path) -> None:
+    from megaplan.workers import mock_worker_output
+    plan_dir, state = _mock_state(tmp_path)
+    result = mock_worker_output("review", state, plan_dir)
+    assert "criteria" in result.payload
+    assert "issues" in result.payload
+
+
+def test_mock_unsupported_step_raises(tmp_path: Path) -> None:
+    from megaplan.workers import mock_worker_output
+    plan_dir, state = _mock_state(tmp_path)
+    with pytest.raises(CliError, match="does not support"):
+        mock_worker_output("nonexistent", state, plan_dir)
+
+
+# ---------------------------------------------------------------------------
+# Session key mapping tests
+# ---------------------------------------------------------------------------
+
+
+def test_session_key_for_all_steps() -> None:
+    assert session_key_for("plan", "claude") == "claude_planner"
+    assert session_key_for("revise", "claude") == "claude_planner"
+    assert session_key_for("critique", "claude") == "claude_critic"
+    assert session_key_for("gate", "claude") == "claude_gatekeeper"
+    assert session_key_for("execute", "claude") == "claude_executor"
+    assert session_key_for("review", "claude") == "claude_reviewer"
+    assert session_key_for("plan", "codex") == "codex_planner"
+    assert session_key_for("revise", "codex") == "codex_planner"
+    assert session_key_for("critique", "codex") == "codex_critic"
+    assert session_key_for("gate", "codex") == "codex_gatekeeper"
+    assert session_key_for("execute", "codex") == "codex_executor"
+    assert session_key_for("review", "codex") == "codex_reviewer"
+
+
+def test_session_key_for_unknown_step_uses_step_name() -> None:
+    assert session_key_for("custom", "claude") == "claude_custom"
+
+
+# ---------------------------------------------------------------------------
+# Schema filename mapping tests
+# ---------------------------------------------------------------------------
+
+
+def test_step_schema_filenames_cover_all_steps() -> None:
+    from megaplan.workers import STEP_SCHEMA_FILENAMES
+    expected_steps = {"plan", "revise", "critique", "gate", "execute", "review"}
+    assert set(STEP_SCHEMA_FILENAMES.keys()) == expected_steps
+
+
+def test_step_schema_filenames_reference_existing_schemas() -> None:
+    from megaplan.workers import STEP_SCHEMA_FILENAMES
+    from megaplan.schemas import SCHEMAS
+    for step, filename in STEP_SCHEMA_FILENAMES.items():
+        assert filename in SCHEMAS, f"Step '{step}' references non-existent schema '{filename}'"
+
+
+# ---------------------------------------------------------------------------
+# resolve_agent_mode additional tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_agent_mode_cli_flag_override() -> None:
+    with patch("megaplan.workers.shutil.which", return_value="/usr/bin/codex"):
+        agent, mode, refreshed = resolve_agent_mode("plan", _make_args(agent="codex"))
+    assert agent == "codex"
+
+
+def test_resolve_agent_mode_config_override() -> None:
+    with patch("megaplan.workers.shutil.which", return_value="/usr/bin/codex"):
+        with patch("megaplan.workers.load_config", return_value={"agents": {"plan": "codex"}}):
+            agent, mode, refreshed = resolve_agent_mode("plan", _make_args())
+    assert agent == "codex"
+
+
+def test_resolve_agent_mode_explicit_missing_raises() -> None:
+    with patch("megaplan.workers.shutil.which", return_value=None):
+        with pytest.raises(CliError, match="not found"):
+            resolve_agent_mode("plan", _make_args(agent="nosuchagent"))
+
+
+def test_resolve_agent_mode_no_agents_raises() -> None:
+    with patch("megaplan.workers.shutil.which", return_value=None):
+        with patch("megaplan.workers.load_config", return_value={}):
+            with patch("megaplan.workers.detect_available_agents", return_value=[]):
+                with pytest.raises(CliError, match="No supported agents"):
+                    resolve_agent_mode("plan", _make_args())
+
+
+def test_resolve_agent_mode_conflicting_flags_raises() -> None:
+    with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
+        with pytest.raises(CliError, match="Cannot combine"):
+            resolve_agent_mode("plan", _make_args(fresh=True, ephemeral=True))
+
+
+def test_resolve_agent_mode_ephemeral_mode() -> None:
+    with patch("megaplan.workers.shutil.which", return_value="/usr/bin/claude"):
+        agent, mode, refreshed = resolve_agent_mode("plan", _make_args(agent="claude", ephemeral=True))
+    assert mode == "ephemeral"
+    assert refreshed is True
+
+
+# ---------------------------------------------------------------------------
+# update_session_state tests
+# ---------------------------------------------------------------------------
+
+
+def test_update_session_state_returns_none_for_no_session_id() -> None:
+    result = update_session_state("plan", "claude", None, mode="persistent", refreshed=False)
+    assert result is None
+
+
+def test_update_session_state_creates_new_entry() -> None:
+    result = update_session_state("plan", "claude", "sess-abc", mode="persistent", refreshed=False)
+    assert result is not None
+    key, entry = result
+    assert key == "claude_planner"
+    assert entry["id"] == "sess-abc"
+    assert entry["mode"] == "persistent"
+
+
+# ---------------------------------------------------------------------------
+# validate_payload edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_validate_payload_critique_requires_flags() -> None:
+    with pytest.raises(CliError, match="flags"):
+        validate_payload("critique", {"verified_flag_ids": [], "disputed_flag_ids": []})
+
+
+def test_validate_payload_execute_requires_output() -> None:
+    with pytest.raises(CliError, match="output"):
+        validate_payload("execute", {"files_changed": [], "commands_run": [], "deviations": []})
+
+
+def test_validate_payload_review_requires_criteria() -> None:
+    with pytest.raises(CliError, match="criteria"):
+        validate_payload("review", {"issues": []})

@@ -6,9 +6,11 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
-from megaplan._core import (
+from megaplan.types import (
     CliError,
     PlanState,
+)
+from megaplan._core import (
     collect_git_diff_summary,
     configured_robustness,
     current_iteration_artifact,

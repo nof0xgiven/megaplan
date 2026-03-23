@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from megaplan._core import PlanState, atomic_write_json, atomic_write_text, save_flag_registry
+from megaplan.types import PlanState
+from megaplan._core import atomic_write_json, atomic_write_text, save_flag_registry
 from megaplan.prompts import create_claude_prompt, create_codex_prompt
 
 
@@ -189,7 +190,78 @@ def test_review_prompt_includes_execution_and_gate(tmp_path: Path) -> None:
     assert "Execution summary" in prompt
 
 
+def test_plan_prompt_is_nonempty(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("plan", state, plan_dir)
+    assert len(prompt) > 100
+
+
+def test_critique_prompt_contains_intent_and_robustness(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("critique", state, plan_dir)
+    assert state["idea"] in prompt
+    assert "Robustness level" in prompt
+    assert "thorough" in prompt
+
+
+def test_critique_light_robustness(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    state["config"]["robustness"] = "light"
+    prompt = create_claude_prompt("critique", state, plan_dir)
+    assert "pragmatic" in prompt.lower() or "light" in prompt.lower()
+
+
+def test_revise_prompt_contains_intent(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("revise", state, plan_dir)
+    assert state["idea"] in prompt
+    assert "Gate summary" in prompt
+
+
+def test_codex_matches_claude_for_shared_steps(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    for step in ["plan", "critique", "revise", "gate", "execute"]:
+        claude_prompt = create_claude_prompt(step, state, plan_dir)
+        codex_prompt = create_codex_prompt(step, state, plan_dir)
+        assert claude_prompt == codex_prompt, f"Prompts differ for step '{step}'"
+
+
+def test_review_prompts_differ_between_agents(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    claude_prompt = create_claude_prompt("review", state, plan_dir)
+    codex_prompt = create_codex_prompt("review", state, plan_dir)
+    # Review prompts should be different (claude has Gate summary, codex doesn't)
+    assert claude_prompt != codex_prompt
+
+
+def test_execute_prompt_auto_approve_note(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    state["config"]["auto_approve"] = True
+    prompt = create_claude_prompt("execute", state, plan_dir)
+    assert "auto-approve" in prompt
+
+
+def test_execute_prompt_user_approved_note(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    state["meta"]["user_approved_gate"] = True
+    prompt = create_claude_prompt("execute", state, plan_dir)
+    assert "explicitly approved" in prompt
+
+
+def test_plan_prompt_includes_notes_when_present(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    state["meta"]["notes"] = [{"note": "Keep it simple", "timestamp": "2026-03-20T00:00:00Z"}]
+    prompt = create_claude_prompt("plan", state, plan_dir)
+    assert "Keep it simple" in prompt
+
+
 def test_unsupported_step_raises(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     with pytest.raises(Exception):
         create_claude_prompt("clarify", state, plan_dir)
+
+
+def test_unsupported_codex_step_raises(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    with pytest.raises(Exception):
+        create_codex_prompt("clarify", state, plan_dir)
