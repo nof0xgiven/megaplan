@@ -27,8 +27,10 @@ from megaplan.schemas import SCHEMAS, strict_schema  # noqa: F401
 # ---------------------------------------------------------------------------
 
 STATE_INITIALIZED = "initialized"
+STATE_CLARIFIED = "clarified"
 STATE_PLANNED = "planned"
 STATE_CRITIQUED = "critiqued"
+STATE_EVALUATED = "evaluated"
 STATE_GATED = "gated"
 STATE_EXECUTED = "executed"
 STATE_DONE = "done"
@@ -65,7 +67,7 @@ class PlanState(TypedDict):
     plan_versions: list[PlanVersionRecord]
     history: list[HistoryEntry]
     meta: PlanMeta
-    last_gate: dict[str, Any]
+    last_evaluation: dict[str, Any]
     clarification: NotRequired[dict[str, Any]]
 
 
@@ -122,11 +124,17 @@ class FlagRegistry(TypedDict):
     flags: list[FlagRecord]
 
 
-class GateSignals(TypedDict, total=False):
-    """Typed result from build_gate_signals()."""
+class EvaluationResult(TypedDict, total=False):
+    """Typed result from build_evaluation()."""
+    recommendation: str
+    confidence: str
     robustness: str
     signals: dict[str, Any]
+    rationale: str
+    valid_next_steps: list[str]
     warnings: list[str]
+    suggested_override: str
+    override_rationale: str
 
 
 class StepResponse(TypedDict, total=False):
@@ -165,13 +173,14 @@ class StepResponse(TypedDict, total=False):
     skipped: bool
     file: str
     plans: list[dict[str, Any]]
-    # Gate worker / summary fields
+    # Evaluation fields (spread via **evaluation)
     recommendation: str
+    confidence: str
     signals: dict[str, Any]
     rationale: str
-    gate_recommendation: str
-    gate_rationale: str
-    signals_assessment: str
+    valid_next_steps: list[str]
+    suggested_override: str
+    override_rationale: str
     # Gate check fields (spread via **gate)
     passed: bool
     criteria_check: dict[str, Any]
@@ -193,10 +202,10 @@ FLAG_BLOCKING_STATUSES = {"open", "disputed"}
 MOCK_ENV_VAR = "MEGAPLAN_MOCK_WORKERS"
 
 DEFAULT_AGENT_ROUTING: dict[str, str] = {
+    "clarify": "claude",
     "plan": "claude",
     "critique": "codex",
-    "revise": "claude",
-    "gate": "claude",
+    "integrate": "claude",
     "execute": "codex",
     "review": "codex",
 }
@@ -408,24 +417,7 @@ def resolve_plan_dir(root: Path, requested_name: str | None) -> Path:
 
 def load_plan(root: Path, requested_name: str | None) -> tuple[Path, PlanState]:
     plan_dir = resolve_plan_dir(root, requested_name)
-    state = read_json(plan_dir / "state.json")
-    migrated = False
-    if state.get("current_state") == "clarified":
-        state["current_state"] = STATE_INITIALIZED
-        migrated = True
-    elif state.get("current_state") == "evaluated":
-        state["current_state"] = STATE_CRITIQUED
-        state["last_gate"] = {}
-        migrated = True
-    if "last_evaluation" in state:
-        del state["last_evaluation"]
-        migrated = True
-    if "last_gate" not in state:
-        state["last_gate"] = {}
-        migrated = True
-    if migrated:
-        atomic_write_json(plan_dir / "state.json", state)
-    return plan_dir, state
+    return plan_dir, read_json(plan_dir / "state.json")
 
 
 def save_state(plan_dir: Path, state: PlanState) -> None:
