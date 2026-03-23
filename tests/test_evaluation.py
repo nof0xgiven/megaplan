@@ -438,6 +438,48 @@ Summarize the work.
     assert validate_plan_structure(plan) == []
 
 
+def test_strip_fenced_blocks_unclosed_fence_returns_original() -> None:
+    text = """before
+```python
+inside code
+## Step 99: Hidden
+after fence
+"""
+    # Unclosed fence — should return original text to avoid silently losing content
+    assert _strip_fenced_blocks(text) == text
+
+
+def test_parse_plan_sections_unclosed_fence_still_finds_sections() -> None:
+    plan = """## Overview
+Summary.
+
+```python
+code without closing fence
+
+## Step 1: Real step
+1. Do the thing.
+
+## Step 2: Another step
+1. Do another thing.
+"""
+    sections = parse_plan_sections(plan)
+    step_ids = [s.id for s in sections if s.id is not None]
+    assert "S1" in step_ids
+    assert "S2" in step_ids
+
+
+def test_render_final_md_none_meta_commentary() -> None:
+    from megaplan._core import render_final_md
+    data = {
+        "tasks": [],
+        "watch_items": [],
+        "sense_checks": [],
+        "meta_commentary": None,
+    }
+    result = render_final_md(data)
+    assert "None." in result  # Should not crash
+
+
 # ---------------------------------------------------------------------------
 # build_gate_signals tests
 # ---------------------------------------------------------------------------

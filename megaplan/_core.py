@@ -128,7 +128,7 @@ def render_final_md(finalize_data: dict[str, Any]) -> str:
         lines.extend(["- None.", ""])
 
     lines.extend(["## Meta", ""])
-    meta_commentary = finalize_data.get("meta_commentary", "").strip()
+    meta_commentary = (finalize_data.get("meta_commentary") or "").strip()
     lines.append(meta_commentary or "None.")
     lines.append("")
     return "\n".join(lines)

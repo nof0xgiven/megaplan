@@ -101,6 +101,9 @@ def _strip_fenced_blocks(text: str) -> str:
             continue
         if not inside_fence:
             kept_lines.append(line)
+    if inside_fence:
+        # Unclosed fence — return original text rather than silently dropping content
+        return text
     return "".join(kept_lines)
 
 
@@ -111,8 +114,11 @@ def parse_plan_sections(plan_text: str) -> list[PlanSection]:
 
     boundaries: list[tuple[int, int, str, str | None]] = []
     inside_fence = False
+    fence_open_line = -1
     for index, line in enumerate(lines):
         if line.startswith("```"):
+            if not inside_fence:
+                fence_open_line = index
             inside_fence = not inside_fence
             continue
         if inside_fence or not _PLAN_HEADING_RE.match(line):
@@ -120,6 +126,16 @@ def parse_plan_sections(plan_text: str) -> list[PlanSection]:
         step_match = _PLAN_STEP_RE.match(line)
         section_id = f"S{step_match.group(1)}" if step_match else None
         boundaries.append((index, index + 1, line.rstrip("\n"), section_id))
+
+    if inside_fence:
+        # Unclosed fence — re-scan ignoring fence state so we don't silently lose sections
+        boundaries = []
+        for index, line in enumerate(lines):
+            if not _PLAN_HEADING_RE.match(line):
+                continue
+            step_match = _PLAN_STEP_RE.match(line)
+            section_id = f"S{step_match.group(1)}" if step_match else None
+            boundaries.append((index, index + 1, line.rstrip("\n"), section_id))
 
     if not boundaries:
         return [PlanSection(heading="", body=plan_text, id=None, start_line=1, end_line=len(lines))]
