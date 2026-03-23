@@ -1078,6 +1078,8 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         label="task_updates",
     )
     tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
+    total_tasks = len(tasks_by_id)
+    merged_count = 0
     for task_update in task_updates:
         task = tasks_by_id.get(task_update["task_id"])
         if task is None:
@@ -1085,6 +1087,10 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             continue
         task["status"] = task_update["status"]
         task["executor_notes"] = task_update["executor_notes"]
+        merged_count += 1
+    untracked_tasks = total_tasks - merged_count
+    if untracked_tasks > 0:
+        deviations.append(f"{untracked_tasks}/{total_tasks} tasks have no executor update — tracking is incomplete.")
     atomic_write_json(plan_dir / "finalize.json", finalize_data)
     atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data))
     finalize_hash = sha256_file(plan_dir / "finalize.json")
@@ -1118,15 +1124,17 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
     artifacts = ["execution.json", "finalize.json", "final.md"]
     if worker.trace_output is not None:
         artifacts.append("execution_trace.jsonl")
+    tracking_note = f" ({merged_count}/{total_tasks} tasks tracked)" if total_tasks > 0 else ""
     response: StepResponse = {
         "success": True,
         "step": "execute",
-        "summary": worker.payload["output"],
+        "summary": worker.payload["output"] + tracking_note,
         "artifacts": artifacts,
         "next_step": "review",
         "state": STATE_EXECUTED,
         "files_changed": worker.payload.get("files_changed", []),
         "deviations": deviations,
+        "warnings": [f"Incomplete task tracking: {untracked_tasks} tasks unaccounted for."] if untracked_tasks > 0 else [],
         "auto_approve": auto_approve,
         "user_approved_gate": bool(state["meta"].get("user_approved_gate", False)),
     }
@@ -1158,13 +1166,20 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         label="sense_check_verdicts",
     )
     tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
+    total_tasks = len(tasks_by_id)
+    verdict_count = 0
     for task_verdict in task_verdicts:
         task = tasks_by_id.get(task_verdict["task_id"])
         if task is None:
             issues.append(f"Skipped task verdict for unknown task_id '{task_verdict['task_id']}'.")
             continue
         task["reviewer_verdict"] = task_verdict["reviewer_verdict"]
+        verdict_count += 1
+    if total_tasks > 0 and verdict_count < total_tasks:
+        issues.append(f"Incomplete review: {verdict_count}/{total_tasks} tasks received a reviewer verdict.")
     sense_checks_by_id = {sense_check["id"]: sense_check for sense_check in finalize_data.get("sense_checks", [])}
+    total_checks = len(sense_checks_by_id)
+    check_count = 0
     for sense_check_verdict in sense_check_verdicts:
         sense_check = sense_checks_by_id.get(sense_check_verdict["sense_check_id"])
         if sense_check is None:
@@ -1173,6 +1188,9 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
             )
             continue
         sense_check["verdict"] = sense_check_verdict["verdict"]
+        check_count += 1
+    if total_checks > 0 and check_count < total_checks:
+        issues.append(f"Incomplete review: {check_count}/{total_checks} sense checks received a verdict.")
     atomic_write_json(plan_dir / "finalize.json", finalize_data)
     atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data))
     finalize_hash = sha256_file(plan_dir / "finalize.json")

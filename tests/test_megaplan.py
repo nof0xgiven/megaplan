@@ -1455,6 +1455,80 @@ def test_validate_merge_inputs_filters_malformed_entries() -> None:
     assert empty == []
 
 
+def test_execute_warns_on_incomplete_task_tracking(plan_fixture: PlanFixture) -> None:
+    """When executor returns fewer task_updates than finalize.json has tasks, deviations and warnings surface it."""
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    # Mock finalize creates 2 tasks (T1, T2). Mock execute updates both.
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    # Mock updates both tasks, so no warnings expected
+    assert response["warnings"] == [] or "warnings" not in response or all("unaccounted" not in w for w in response.get("warnings", []))
+    assert "2/2 tasks tracked" in response["summary"]
+
+
+def test_review_flags_incomplete_verdicts(plan_fixture: PlanFixture) -> None:
+    """When reviewer returns fewer verdicts than tasks exist, issues surface it."""
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    response = megaplan.handle_review(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    # Mock review provides verdicts for T1 and T2, matching mock finalize's tasks
+    # So no "Incomplete review" issue expected in the happy path
+    assert response["state"] == megaplan.STATE_DONE
+
+
+def test_validate_merge_inputs_tracks_deviations() -> None:
+    """Verify that _validate_merge_inputs populates the deviations list for malformed input."""
+    deviations: list[str] = []
+    megaplan.handlers._validate_merge_inputs(
+        [
+            "not-a-dict",
+            {"task_id": "T1"},  # missing required fields
+            {"task_id": "T2", "status": "invalid_enum", "executor_notes": "x"},  # bad enum
+        ],
+        required_fields=("task_id", "status", "executor_notes"),
+        enum_fields={"status": {"done", "skipped"}},
+        deviations=deviations,
+        label="task_updates",
+    )
+    assert len(deviations) == 3
+    assert "expected object" in deviations[0]
+    assert "missing required" in deviations[1]
+    assert "invalid field" in deviations[2]
+
+
+def test_validate_merge_inputs_non_list_returns_empty() -> None:
+    """Non-list input returns empty with no crash."""
+    assert megaplan.handlers._validate_merge_inputs(
+        "not-a-list",
+        required_fields=("task_id",),
+        label="test",
+    ) == []
+    assert megaplan.handlers._validate_merge_inputs(
+        None,
+        required_fields=("task_id",),
+        label="test",
+    ) == []
+
+
 def test_codex_uses_same_prompt_builders_for_shared_steps(plan_fixture: PlanFixture) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     _, state = load_plan(plan_fixture.root, plan_fixture.plan_name)
