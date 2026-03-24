@@ -89,21 +89,36 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def render_final_md(finalize_data: dict[str, Any]) -> str:
+def render_final_md(finalize_data: dict[str, Any], *, phase: str = "finalize") -> str:
+    show_execution_gaps = phase in ("execute", "review")
+    show_review_gaps = phase == "review"
+    tasks = finalize_data.get("tasks", [])
+    sense_checks = finalize_data.get("sense_checks", [])
+
     lines = ["# Execution Checklist", ""]
-    for task in finalize_data.get("tasks", []):
-        checkbox = "[x]" if task.get("status") == "done" else "[ ]"
-        status_suffix = " (skipped)" if task.get("status") == "skipped" else ""
+    gap_counts: dict[str, int] = {}
+    for task in tasks:
+        status = task.get("status")
+        checkbox = "[x]" if status == "done" else "[ ]"
+        status_suffix = " (skipped)" if status == "skipped" else ""
         lines.append(f"- {checkbox} **{task['id']}:** {task['description']}{status_suffix}")
         depends_on = task.get("depends_on", [])
         if depends_on:
             lines.append(f"  Depends on: {', '.join(depends_on)}")
         executor_notes = task.get("executor_notes", "")
-        if executor_notes:
+        if executor_notes.strip():
             lines.append(f"  Executor notes: {executor_notes}")
+        elif show_execution_gaps and status != "pending":
+            lines.append("  Executor notes: [MISSING]")
+            gap_counts["Executor notes missing"] = gap_counts.get("Executor notes missing", 0) + 1
+        if show_execution_gaps and status == "pending":
+            gap_counts["Tasks without executor updates"] = gap_counts.get("Tasks without executor updates", 0) + 1
         reviewer_verdict = task.get("reviewer_verdict", "")
-        if reviewer_verdict:
+        if reviewer_verdict.strip():
             lines.append(f"  Reviewer verdict: {reviewer_verdict}")
+        elif show_review_gaps:
+            lines.append("  Reviewer verdict: [PENDING]")
+            gap_counts["Reviewer verdicts pending"] = gap_counts.get("Reviewer verdicts pending", 0) + 1
         lines.append("")
 
     lines.extend(["## Watch Items", ""])
@@ -116,13 +131,15 @@ def render_final_md(finalize_data: dict[str, Any]) -> str:
     lines.append("")
 
     lines.extend(["## Sense Checks", ""])
-    sense_checks = finalize_data.get("sense_checks", [])
     if sense_checks:
         for sense_check in sense_checks:
             lines.append(f"- **{sense_check['id']}** ({sense_check['task_id']}): {sense_check['question']}")
             verdict = sense_check.get("verdict", "")
-            if verdict:
+            if verdict.strip():
                 lines.append(f"  Verdict: {verdict}")
+            elif show_review_gaps:
+                lines.append("  Verdict: [PENDING]")
+                gap_counts["Sense-check verdicts pending"] = gap_counts.get("Sense-check verdicts pending", 0) + 1
             lines.append("")
     else:
         lines.extend(["- None.", ""])
@@ -131,6 +148,12 @@ def render_final_md(finalize_data: dict[str, Any]) -> str:
     meta_commentary = (finalize_data.get("meta_commentary") or "").strip()
     lines.append(meta_commentary or "None.")
     lines.append("")
+
+    if gap_counts:
+        lines.extend(["## Coverage Gaps", ""])
+        for label, count in gap_counts.items():
+            lines.append(f"- {label}: {count}")
+        lines.append("")
     return "\n".join(lines)
 
 

@@ -305,6 +305,15 @@ def test_execute_prompt_user_approved_note(tmp_path: Path) -> None:
     assert "Execution tracking source of truth (`finalize.json`)" in prompt
 
 
+def test_execute_prompt_surfaces_sense_checks_and_watch_items(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("execute", state, plan_dir)
+    assert "Sense checks to keep in mind during execution" in prompt
+    assert "SC1 (T1): Did it work?" in prompt
+    assert "Watch items to keep visible during execution:" in prompt
+    assert "Check assumptions." in prompt
+
+
 def test_finalize_prompt_requests_structured_tracking_fields(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     prompt = create_claude_prompt("finalize", state, plan_dir)

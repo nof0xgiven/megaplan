@@ -355,6 +355,18 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     robustness = configured_robustness(state)
     gate = read_json(plan_dir / "gate.json")
+    nudge_lines: list[str] = []
+    sense_checks = finalize_data.get("sense_checks", [])
+    if sense_checks:
+        nudge_lines.append("Sense checks to keep in mind during execution (reviewer will verify these):")
+        for sense_check in sense_checks:
+            nudge_lines.append(f"- {sense_check['id']} ({sense_check['task_id']}): {sense_check['question']}")
+    watch_items = finalize_data.get("watch_items", [])
+    if watch_items:
+        nudge_lines.append("Watch items to keep visible during execution:")
+        for item in watch_items:
+            nudge_lines.append(f"- {item}")
+    execution_nudges = "\n".join(nudge_lines)
     if state["config"].get("auto_approve"):
         approval_note = (
             "Note: User chose auto-approve mode. This execution was not manually "
@@ -393,6 +405,8 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         - Use the tasks in `finalize.json` as the execution boundary. Do not create or rewrite tracking artifacts directly.
         - Return `task_updates` with one object per completed or skipped task: `{{"task_id": "...", "status": "done|skipped", "executor_notes": "..."}}`.
         - Keep `executor_notes` specific enough that a reviewer can map each update to the actual code and commands you ran.
+
+        {execution_nudges}
         """
     ).strip()
 

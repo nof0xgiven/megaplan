@@ -382,8 +382,8 @@ def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
         "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
         "deviations": [],
         "task_updates": [
-            {"task_id": "T1", "status": "done", "executor_notes": "Implemented via mock."},
-            {"task_id": "T2", "status": "done", "executor_notes": "Verified via mock."},
+            {"task_id": "T1", "status": "done", "executor_notes": "Implemented via mock worker output."},
+            {"task_id": "T2", "status": "done", "executor_notes": "Verified success criteria via mock worker output."},
         ],
     }
     return _mock_result(payload, trace_output='{"event":"mock-execute"}\n')
@@ -400,8 +400,8 @@ def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
         "issues": [],
         "summary": "Mock review passed.",
         "task_verdicts": [
-            {"task_id": "T1", "reviewer_verdict": "Pass - mock verified."},
-            {"task_id": "T2", "reviewer_verdict": "Pass - mock verified."},
+            {"task_id": "T1", "reviewer_verdict": "Pass - mock verified with complete coverage."},
+            {"task_id": "T2", "reviewer_verdict": "Pass - mock verified with complete coverage."},
         ],
         "sense_check_verdicts": [
             {"sense_check_id": "SC1", "verdict": "Confirmed."},

@@ -1433,6 +1433,53 @@ def test_render_final_md_pending_partially_done_and_reviewed_states() -> None:
     assert "Verdict: Confirmed." in reviewed_md
 
 
+def test_render_final_md_phase_marks_gaps_only_when_due() -> None:
+    from megaplan._core import render_final_md
+
+    data = {
+        "tasks": [
+            {
+                "id": "T1",
+                "description": "Do work",
+                "depends_on": [],
+                "status": "pending",
+                "executor_notes": "",
+                "reviewer_verdict": "",
+            },
+            {
+                "id": "T2",
+                "description": "Ship work",
+                "depends_on": ["T1"],
+                "status": "done",
+                "executor_notes": "",
+                "reviewer_verdict": "",
+            },
+        ],
+        "watch_items": [],
+        "sense_checks": [
+            {"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""},
+            {"id": "SC2", "task_id": "T2", "question": "Was it reviewed?", "verdict": ""},
+        ],
+        "meta_commentary": "Status overview.",
+    }
+
+    finalize_md = render_final_md(data)
+    execute_md = render_final_md(data, phase="execute")
+    review_md = render_final_md(data, phase="review")
+
+    assert "Executor notes: [MISSING]" not in finalize_md
+    assert "Reviewer verdict: [PENDING]" not in finalize_md
+    assert "## Coverage Gaps" not in finalize_md
+    assert "Executor notes: [MISSING]" in execute_md
+    assert "Reviewer verdict: [PENDING]" not in execute_md
+    assert "Tasks without executor updates: 1" in execute_md
+    assert "Executor notes missing: 1" in execute_md
+    assert "Reviewer verdict: [PENDING]" in review_md
+    assert "Verdict: [PENDING]" in review_md
+    assert "Reviewer verdicts pending: 2" in review_md
+    assert "Sense-check verdicts pending: 2" in review_md
+
+
 def test_validate_merge_inputs_filters_malformed_entries() -> None:
     valid = megaplan.handlers._validate_merge_inputs(
         [
@@ -1455,8 +1502,90 @@ def test_validate_merge_inputs_filters_malformed_entries() -> None:
     assert empty == []
 
 
-def test_execute_warns_on_incomplete_task_tracking(plan_fixture: PlanFixture) -> None:
-    """When executor returns fewer task_updates than finalize.json has tasks, deviations and warnings surface it."""
+def test_validate_merge_inputs_rejects_empty_required_content() -> None:
+    deviations: list[str] = []
+    valid = megaplan.handlers._validate_merge_inputs(
+        [
+            {"task_id": "T1", "status": "done", "executor_notes": "  "},
+            {"task_id": "T2", "status": "done", "executor_notes": "\t"},
+            {"task_id": "T3", "status": "skipped", "executor_notes": "Investigated and skipped."},
+        ],
+        required_fields=("task_id", "status", "executor_notes"),
+        enum_fields={"status": {"done", "skipped"}},
+        nonempty_fields={"executor_notes"},
+        deviations=deviations,
+        label="task_updates",
+    )
+
+    assert valid == [{"task_id": "T3", "status": "skipped", "executor_notes": "Investigated and skipped."}]
+    assert deviations == [
+        "Skipped task_updates[0]: 'executor_notes' must not be empty.",
+        "Skipped task_updates[1]: 'executor_notes' must not be empty.",
+    ]
+
+
+def test_validate_merge_inputs_rejects_empty_reviewer_verdict() -> None:
+    deviations: list[str] = []
+    valid = megaplan.handlers._validate_merge_inputs(
+        [
+            {"task_id": "T1", "reviewer_verdict": ""},
+            {"task_id": "T2", "reviewer_verdict": "   "},
+            {"task_id": "T3", "reviewer_verdict": "Looks good."},
+        ],
+        required_fields=("task_id", "reviewer_verdict"),
+        nonempty_fields={"reviewer_verdict"},
+        deviations=deviations,
+        label="task_verdicts",
+    )
+
+    assert valid == [{"task_id": "T3", "reviewer_verdict": "Looks good."}]
+    assert deviations == [
+        "Skipped task_verdicts[0]: 'reviewer_verdict' must not be empty.",
+        "Skipped task_verdicts[1]: 'reviewer_verdict' must not be empty.",
+    ]
+
+
+def test_validate_merge_inputs_rejects_empty_sense_check_verdict() -> None:
+    deviations: list[str] = []
+    valid = megaplan.handlers._validate_merge_inputs(
+        [
+            {"sense_check_id": "SC1", "verdict": ""},
+            {"sense_check_id": "SC2", "verdict": "Confirmed."},
+        ],
+        required_fields=("sense_check_id", "verdict"),
+        nonempty_fields={"verdict"},
+        deviations=deviations,
+        label="sense_check_verdicts",
+    )
+
+    assert valid == [{"sense_check_id": "SC2", "verdict": "Confirmed."}]
+    assert deviations == [
+        "Skipped sense_check_verdicts[0]: 'verdict' must not be empty.",
+    ]
+
+
+def test_duplicate_sense_check_verdict_dedup() -> None:
+    """Two verdicts for SC1, zero for SC2 — should count 1 unique, not 2."""
+    deviations: list[str] = []
+    valid = megaplan.handlers._validate_merge_inputs(
+        [
+            {"sense_check_id": "SC1", "verdict": "First pass."},
+            {"sense_check_id": "SC1", "verdict": "Second pass."},
+        ],
+        required_fields=("sense_check_id", "verdict"),
+        nonempty_fields={"verdict"},
+        deviations=deviations,
+        label="sense_check_verdicts",
+    )
+
+    # Both entries pass validation (last-entry-wins happens at merge time in handler)
+    assert len(valid) == 2
+    assert valid[0]["verdict"] == "First pass."
+    assert valid[1]["verdict"] == "Second pass."
+
+
+def test_execute_happy_path_tracks_all_tasks(plan_fixture: PlanFixture) -> None:
+    """The default mock execute output still covers every finalized task."""
     make_args = plan_fixture.make_args
     megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
     megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
@@ -1470,8 +1599,8 @@ def test_execute_warns_on_incomplete_task_tracking(plan_fixture: PlanFixture) ->
         plan_fixture.root,
         make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
     )
-    # Mock updates both tasks, so no warnings expected
-    assert response["warnings"] == [] or "warnings" not in response or all("unaccounted" not in w for w in response.get("warnings", []))
+    assert response["success"] is True
+    assert response["warnings"] == []
     assert "2/2 tasks tracked" in response["summary"]
 
 
@@ -1527,6 +1656,159 @@ def test_validate_merge_inputs_non_list_returns_empty() -> None:
         required_fields=("task_id",),
         label="test",
     ) == []
+
+
+def test_execute_deduplicates_task_updates_and_blocks_incomplete_coverage(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    worker = WorkerResult(
+        payload={
+            "output": "Partial execution completed.",
+            "files_changed": ["src/example.py"],
+            "commands_run": ["pytest -k partial"],
+            "deviations": [],
+            "task_updates": [
+                {"task_id": "T1", "status": "done", "executor_notes": "Initial pass."},
+                {"task_id": "T1", "status": "done", "executor_notes": "Final pass."},
+            ],
+        },
+        raw_output="partial execute",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="execute-duplicate",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "codex", "persistent", False),
+    )
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    state = load_state(plan_fixture.plan_dir)
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    execute_entry = next(entry for entry in state["history"] if entry["step"] == "execute")
+    final_md = (plan_fixture.plan_dir / "final.md").read_text(encoding="utf-8")
+
+    assert response["success"] is False
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert response["next_step"] == "execute"
+    assert response["summary"] == "Blocked: 1/2 tasks have no executor update. Re-run execute to complete tracking."
+    assert "Duplicate task_update for 'T1' — last entry wins." in response["deviations"]
+    assert finalize_data["tasks"][0]["executor_notes"] == "Final pass."
+    assert finalize_data["tasks"][1]["status"] == "pending"
+    assert execute_entry["result"] == "blocked"
+    assert (plan_fixture.plan_dir / "execution.json").exists()
+    assert "## Coverage Gaps" in final_md
+    assert "Tasks without executor updates: 1" in final_md
+
+
+def test_review_blocks_incomplete_coverage_and_allows_rerun(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+
+    first_review = WorkerResult(
+        payload={
+            "criteria": [{"name": "criterion", "pass": True, "evidence": "checked"}],
+            "issues": [],
+            "summary": "Partial review.",
+            "task_verdicts": [
+                {"task_id": "T1", "reviewer_verdict": "Pass - partial."},
+                {"task_id": "T1", "reviewer_verdict": "Pass - final."},
+            ],
+            "sense_check_verdicts": [
+                {"sense_check_id": "SC1", "verdict": "Confirmed."},
+            ],
+        },
+        raw_output="partial review",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="review-partial",
+    )
+    second_review = WorkerResult(
+        payload={
+            "criteria": [{"name": "criterion", "pass": True, "evidence": "checked again"}],
+            "issues": [],
+            "summary": "Complete review.",
+            "task_verdicts": [
+                {"task_id": "T1", "reviewer_verdict": "Pass - rerun."},
+                {"task_id": "T2", "reviewer_verdict": "Pass - rerun."},
+            ],
+            "sense_check_verdicts": [
+                {"sense_check_id": "SC1", "verdict": "Confirmed on rerun."},
+                {"sense_check_id": "SC2", "verdict": "Confirmed on rerun."},
+            ],
+        },
+        raw_output="complete review",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="review-complete",
+    )
+    results = iter([first_review, second_review])
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (next(results), "codex", "persistent", False),
+    )
+
+    blocked = megaplan.handle_review(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    after_block = read_json(plan_fixture.plan_dir / "finalize.json")
+    blocked_state = load_state(plan_fixture.plan_dir)
+    blocked_entry = blocked_state["history"][-1]
+    blocked_md = (plan_fixture.plan_dir / "final.md").read_text(encoding="utf-8")
+
+    assert blocked["success"] is False
+    assert blocked["state"] == megaplan.STATE_EXECUTED
+    assert blocked["next_step"] == "review"
+    assert blocked["summary"] == (
+        "Blocked: incomplete review coverage (1/2 task verdicts, 1/2 sense checks). "
+        "Re-run review to complete."
+    )
+    assert "Duplicate task_verdict for 'T1' — last entry wins." in blocked["issues"]
+    assert after_block["tasks"][0]["reviewer_verdict"] == "Pass - final."
+    assert after_block["tasks"][1]["reviewer_verdict"] == ""
+    assert blocked_entry["result"] == "blocked"
+    assert (plan_fixture.plan_dir / "review.json").exists()
+    assert "## Coverage Gaps" in blocked_md
+    assert "Reviewer verdicts pending: 1" in blocked_md
+    assert "Sense-check verdicts pending: 1" in blocked_md
+
+    completed = megaplan.handle_review(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    final_state = load_state(plan_fixture.plan_dir)
+    final_data = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert completed["success"] is True
+    assert completed["state"] == megaplan.STATE_DONE
+    assert completed["next_step"] is None
+    assert final_state["current_state"] == megaplan.STATE_DONE
+    assert final_data["tasks"][0]["reviewer_verdict"] == "Pass - rerun."
+    assert final_data["tasks"][1]["reviewer_verdict"] == "Pass - rerun."
+    assert all(check["verdict"] == "Confirmed on rerun." for check in final_data["sense_checks"])
 
 
 def test_codex_uses_same_prompt_builders_for_shared_steps(plan_fixture: PlanFixture) -> None:

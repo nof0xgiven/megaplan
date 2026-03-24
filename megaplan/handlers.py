@@ -185,10 +185,12 @@ def _validate_merge_inputs(
     *,
     required_fields: tuple[str, ...],
     enum_fields: dict[str, set[str]] | None = None,
+    nonempty_fields: set[str] | None = None,
     deviations: list[str] | None = None,
     label: str,
 ) -> list[dict[str, str]]:
     enum_fields = enum_fields or {}
+    nonempty_fields = nonempty_fields or set()
     valid_entries: list[dict[str, str]] = []
     if not isinstance(entries, list):
         return valid_entries
@@ -217,8 +219,38 @@ def _validate_merge_inputs(
             if deviations is not None:
                 deviations.append(f"Skipped malformed {label}[{index}]: invalid field types or enum values.")
             continue
+        empty_field = next((field for field in nonempty_fields if normalized.get(field, "").strip() == ""), None)
+        if empty_field is not None:
+            if deviations is not None:
+                deviations.append(f"Skipped {label}[{index}]: '{empty_field}' must not be empty.")
+            continue
         valid_entries.append(normalized)
     return valid_entries
+
+def _merge_validated_entries(
+    entries: list[dict[str, str]],
+    *,
+    targets_by_id: dict[str, dict[str, Any]],
+    id_field: str,
+    merge_fields: tuple[str, ...],
+    issues: list[str],
+    label: str,
+) -> int:
+    """Merge validated entries into targets, deduplicating by ID. Returns unique merge count."""
+    seen: set[str] = set()
+    for entry in entries:
+        entry_id = entry[id_field]
+        target = targets_by_id.get(entry_id)
+        if target is None:
+            issues.append(f"Skipped {label} for unknown {id_field} '{entry_id}'.")
+            continue
+        if entry_id in seen:
+            issues.append(f"Duplicate {label} for '{entry_id}' — last entry wins.")
+        for field in merge_fields:
+            target[field] = entry[field]
+        seen.add(entry_id)
+    return len(seen)
+
 
 def normalize_flag_record(raw_flag: dict[str, Any], fallback_id: str) -> FlagRecord:
     category = raw_flag.get("category", "other")
@@ -1074,29 +1106,31 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         worker.payload.get("task_updates"),
         required_fields=("task_id", "status", "executor_notes"),
         enum_fields={"status": {"done", "skipped"}},
+        nonempty_fields={"executor_notes"},
         deviations=deviations,
         label="task_updates",
     )
     tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
     total_tasks = len(tasks_by_id)
-    merged_count = 0
-    for task_update in task_updates:
-        task = tasks_by_id.get(task_update["task_id"])
-        if task is None:
-            deviations.append(f"Skipped task update for unknown task_id '{task_update['task_id']}'.")
-            continue
-        task["status"] = task_update["status"]
-        task["executor_notes"] = task_update["executor_notes"]
-        merged_count += 1
+    merged_count = _merge_validated_entries(
+        task_updates,
+        targets_by_id=tasks_by_id,
+        id_field="task_id",
+        merge_fields=("status", "executor_notes"),
+        issues=deviations,
+        label="task_update",
+    )
     untracked_tasks = total_tasks - merged_count
     if untracked_tasks > 0:
         deviations.append(f"{untracked_tasks}/{total_tasks} tasks have no executor update — tracking is incomplete.")
     atomic_write_json(plan_dir / "finalize.json", finalize_data)
-    atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data))
+    atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="execute"))
     finalize_hash = sha256_file(plan_dir / "finalize.json")
     if worker.trace_output is not None:
         atomic_write_text(plan_dir / "execution_trace.jsonl", worker.trace_output)
-    state["current_state"] = STATE_EXECUTED
+    blocked = untracked_tasks > 0
+    if not blocked:
+        state["current_state"] = STATE_EXECUTED
     apply_session_update(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
     if auto_approve:
         approval_mode = "auto_approve"
@@ -1110,7 +1144,7 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             "execute",
             duration_ms=worker.duration_ms,
             cost_usd=worker.cost_usd,
-            result="success",
+            result="blocked" if blocked else "success",
             worker=worker,
             agent=agent,
             mode=mode,
@@ -1125,16 +1159,20 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
     if worker.trace_output is not None:
         artifacts.append("execution_trace.jsonl")
     tracking_note = f" ({merged_count}/{total_tasks} tasks tracked)" if total_tasks > 0 else ""
+    blocked_message = (
+        f"Blocked: {untracked_tasks}/{total_tasks} tasks have no executor update. "
+        "Re-run execute to complete tracking."
+    )
     response: StepResponse = {
-        "success": True,
+        "success": not blocked,
         "step": "execute",
-        "summary": worker.payload["output"] + tracking_note,
+        "summary": blocked_message if blocked else worker.payload["output"] + tracking_note,
         "artifacts": artifacts,
-        "next_step": "review",
-        "state": STATE_EXECUTED,
+        "next_step": "execute" if blocked else "review",
+        "state": STATE_FINALIZED if blocked else STATE_EXECUTED,
         "files_changed": worker.payload.get("files_changed", []),
         "deviations": deviations,
-        "warnings": [f"Incomplete task tracking: {untracked_tasks} tasks unaccounted for."] if untracked_tasks > 0 else [],
+        "warnings": [blocked_message] if blocked else [],
         "auto_approve": auto_approve,
         "user_approved_gate": bool(state["meta"].get("user_approved_gate", False)),
     }
@@ -1156,47 +1194,49 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
     task_verdicts = _validate_merge_inputs(
         worker.payload.get("task_verdicts"),
         required_fields=("task_id", "reviewer_verdict"),
+        nonempty_fields={"reviewer_verdict"},
         deviations=issues,
         label="task_verdicts",
     )
     sense_check_verdicts = _validate_merge_inputs(
         worker.payload.get("sense_check_verdicts"),
         required_fields=("sense_check_id", "verdict"),
+        nonempty_fields={"verdict"},
         deviations=issues,
         label="sense_check_verdicts",
     )
     tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
     total_tasks = len(tasks_by_id)
-    verdict_count = 0
-    for task_verdict in task_verdicts:
-        task = tasks_by_id.get(task_verdict["task_id"])
-        if task is None:
-            issues.append(f"Skipped task verdict for unknown task_id '{task_verdict['task_id']}'.")
-            continue
-        task["reviewer_verdict"] = task_verdict["reviewer_verdict"]
-        verdict_count += 1
+    verdict_count = _merge_validated_entries(
+        task_verdicts,
+        targets_by_id=tasks_by_id,
+        id_field="task_id",
+        merge_fields=("reviewer_verdict",),
+        issues=issues,
+        label="task_verdict",
+    )
     if total_tasks > 0 and verdict_count < total_tasks:
         issues.append(f"Incomplete review: {verdict_count}/{total_tasks} tasks received a reviewer verdict.")
     sense_checks_by_id = {sense_check["id"]: sense_check for sense_check in finalize_data.get("sense_checks", [])}
     total_checks = len(sense_checks_by_id)
-    check_count = 0
-    for sense_check_verdict in sense_check_verdicts:
-        sense_check = sense_checks_by_id.get(sense_check_verdict["sense_check_id"])
-        if sense_check is None:
-            issues.append(
-                f"Skipped sense-check verdict for unknown sense_check_id '{sense_check_verdict['sense_check_id']}'."
-            )
-            continue
-        sense_check["verdict"] = sense_check_verdict["verdict"]
-        check_count += 1
+    check_count = _merge_validated_entries(
+        sense_check_verdicts,
+        targets_by_id=sense_checks_by_id,
+        id_field="sense_check_id",
+        merge_fields=("verdict",),
+        issues=issues,
+        label="sense_check_verdict",
+    )
     if total_checks > 0 and check_count < total_checks:
         issues.append(f"Incomplete review: {check_count}/{total_checks} sense checks received a verdict.")
     atomic_write_json(plan_dir / "finalize.json", finalize_data)
-    atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data))
+    atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="review"))
     finalize_hash = sha256_file(plan_dir / "finalize.json")
     passed = sum(1 for criterion in worker.payload.get("criteria", []) if criterion.get("pass"))
     total = len(worker.payload.get("criteria", []))
-    state["current_state"] = STATE_DONE
+    blocked = verdict_count < total_tasks or check_count < total_checks
+    if not blocked:
+        state["current_state"] = STATE_DONE
     apply_session_update(state, "review", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
@@ -1204,7 +1244,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
             "review",
             duration_ms=worker.duration_ms,
             cost_usd=worker.cost_usd,
-            result="success",
+            result="blocked" if blocked else "success",
             worker=worker,
             agent=agent,
             mode=mode,
@@ -1214,13 +1254,18 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         ),
     )
     save_state(plan_dir, state)
+    blocked_message = (
+        "Blocked: incomplete review coverage "
+        f"({verdict_count}/{total_tasks} task verdicts, {check_count}/{total_checks} sense checks). "
+        "Re-run review to complete."
+    )
     response: StepResponse = {
-        "success": True,
+        "success": not blocked,
         "step": "review",
-        "summary": f"Review complete: {passed}/{total} success criteria passed.",
+        "summary": blocked_message if blocked else f"Review complete: {passed}/{total} success criteria passed.",
         "artifacts": ["review.json", "finalize.json", "final.md"],
-        "next_step": None,
-        "state": STATE_DONE,
+        "next_step": "review" if blocked else None,
+        "state": STATE_EXECUTED if blocked else STATE_DONE,
         "issues": issues,
     }
     attach_agent_fallback(response, args)
