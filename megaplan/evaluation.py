@@ -22,8 +22,12 @@ from megaplan.types import (
 from megaplan._core import (
     configured_robustness,
     current_iteration_artifact,
+    escalated_subsystems,
+    extract_subsystem_tag,
+    find_matching_debt,
     latest_plan_meta_path,
     latest_plan_path,
+    load_debt_registry,
     load_flag_registry,
     normalize_text,
     read_json,
@@ -423,12 +427,16 @@ def _previous_iteration_plan_path(plan_dir: Path, state: PlanState) -> Path | No
     return plan_dir / matching[-1]["file"]
 
 
-def build_gate_signals(plan_dir: Path, state: PlanState) -> GateSignals:
+def build_gate_signals(plan_dir: Path, state: PlanState, root: Path | None = None) -> GateSignals:
     iteration = state["iteration"]
     flag_registry = load_flag_registry(plan_dir)
     unresolved = unresolved_significant_flags(flag_registry)
     robustness = configured_robustness(state)
     open_scope_creep = scope_creep_flags(flag_registry, statuses=FLAG_BLOCKING_STATUSES)
+    debt_root = root
+    if debt_root is None:
+        debt_root = plan_dir.parents[2] if len(plan_dir.parents) >= 3 else plan_dir
+    debt_registry = load_debt_registry(debt_root)
     significant_count = len(
         [
             flag
@@ -471,6 +479,30 @@ def build_gate_signals(plan_dir: Path, state: PlanState) -> GateSignals:
         f"Resolved flags: {len(resolved_flags)}. "
         f"Open significant flags: {len(unresolved)}."
     )
+    debt_overlaps = []
+    overlapping_escalated_subsystems: set[str] = set()
+    escalated_lookup = {
+        subsystem: total
+        for subsystem, total, _entries in escalated_subsystems(debt_registry)
+    }
+    for flag in unresolved:
+        subsystem = extract_subsystem_tag(flag["concern"])
+        match = find_matching_debt(debt_registry, subsystem, flag["concern"])
+        if match is None:
+            continue
+        debt_overlaps.append(
+            {
+                "flag_id": flag["id"],
+                "debt_id": match["id"],
+                "subsystem": subsystem,
+                "concern": flag["concern"],
+                "debt_concern": match["concern"],
+                "occurrence_count": match["occurrence_count"],
+                "plan_ids": match["plan_ids"],
+            }
+        )
+        if subsystem in escalated_lookup:
+            overlapping_escalated_subsystems.add(subsystem)
 
     result: GateSignals = {
         "robustness": robustness,
@@ -495,6 +527,14 @@ def build_gate_signals(plan_dir: Path, state: PlanState) -> GateSignals:
             "recurring_critiques": recurring,
             "scope_creep_flags": [flag["id"] for flag in open_scope_creep],
             "loop_summary": loop_summary,
+            "debt_overlaps": debt_overlaps,
+            "escalated_debt_subsystems": [
+                {
+                    "subsystem": subsystem,
+                    "total_occurrences": escalated_lookup[subsystem],
+                }
+                for subsystem in sorted(overlapping_escalated_subsystems)
+            ],
         },
         "warnings": [],
     }
@@ -507,6 +547,12 @@ def build_gate_signals(plan_dir: Path, state: PlanState) -> GateSignals:
     if iteration >= 12:
         result["warnings"].append(
             f"Iteration {iteration}: hard iteration limit reached. Escalation is likely warranted."
+        )
+    for subsystem in sorted(overlapping_escalated_subsystems):
+        result["warnings"].append(
+            "Recurring debt detected in subsystem "
+            f"'{subsystem}' (total occurrences: {escalated_lookup[subsystem]}). "
+            "Recommend holistic redesign rather than another point fix."
         )
     return result
 

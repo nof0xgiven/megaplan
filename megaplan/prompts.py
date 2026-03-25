@@ -16,10 +16,13 @@ from megaplan._core import (
     compute_task_batches,
     configured_robustness,
     current_iteration_artifact,
+    debt_by_subsystem,
+    escalated_subsystems,
     intent_and_notes_block,
     json_dump,
     latest_plan_meta_path,
     latest_plan_path,
+    load_debt_registry,
     load_flag_registry,
     read_json,
     robustness_critique_instruction,
@@ -94,6 +97,106 @@ PLAN_TEMPLATE = textwrap.dedent(
 ).strip()
 
 
+def _resolve_prompt_root(plan_dir: Path, root: Path | None) -> Path:
+    if root is not None:
+        return root
+    if len(plan_dir.parents) >= 3:
+        return plan_dir.parents[2]
+    return plan_dir
+
+
+def _grouped_debt_for_prompt(plan_dir: Path, root: Path | None) -> dict[str, list[dict[str, object]]]:
+    registry = load_debt_registry(_resolve_prompt_root(plan_dir, root))
+    grouped_entries = debt_by_subsystem(registry)
+    return {
+        subsystem: [
+            {
+                "id": entry["id"],
+                "concern": entry["concern"],
+                "occurrence_count": entry["occurrence_count"],
+                "plan_ids": entry["plan_ids"],
+            }
+            for entry in entries
+        ]
+        for subsystem, entries in sorted(grouped_entries.items())
+    }
+
+
+def _escalated_debt_for_prompt(plan_dir: Path, root: Path | None) -> list[dict[str, object]]:
+    registry = load_debt_registry(_resolve_prompt_root(plan_dir, root))
+    return [
+        {
+            "subsystem": subsystem,
+            "total_occurrences": total,
+            "plan_count": len({plan_id for entry in entries for plan_id in entry["plan_ids"]}),
+            "entries": [
+                {
+                    "id": entry["id"],
+                    "concern": entry["concern"],
+                    "occurrence_count": entry["occurrence_count"],
+                    "plan_ids": entry["plan_ids"],
+                }
+                for entry in entries
+            ],
+        }
+        for subsystem, total, entries in escalated_subsystems(registry)
+    ]
+
+
+def _debt_watch_lines(plan_dir: Path, root: Path | None) -> list[str]:
+    lines: list[str] = []
+    for subsystem, entries in sorted(_grouped_debt_for_prompt(plan_dir, root).items()):
+        for entry in entries:
+            lines.append(
+                f"[DEBT] {subsystem}: {entry['concern']} "
+                f"(flagged {entry['occurrence_count']} times across {len(entry['plan_ids'])} plans)"
+            )
+    return lines
+
+
+def _planning_debt_block(plan_dir: Path, root: Path | None) -> str:
+    return textwrap.dedent(
+        f"""
+        Known accepted debt grouped by subsystem:
+        {json_dump(_grouped_debt_for_prompt(plan_dir, root)).strip()}
+
+        Escalated debt subsystems:
+        {json_dump(_escalated_debt_for_prompt(plan_dir, root)).strip()}
+
+        Debt guidance:
+        - These are known accepted limitations. Do not re-flag them unless the current plan makes them worse, broadens them, or fails to contain them.
+        - Prefix every new concern with a subsystem tag followed by a colon, for example `Timeout recovery: retry backoff remains brittle`.
+        - When a concern is recurring debt that still needs to be flagged, prefix it with `Recurring debt:` after the subsystem tag, for example `Timeout recovery: Recurring debt: retry backoff remains brittle`.
+        """
+    ).strip()
+
+
+def _gate_debt_block(plan_dir: Path, root: Path | None) -> str:
+    return textwrap.dedent(
+        f"""
+        Known accepted debt grouped by subsystem:
+        {json_dump(_grouped_debt_for_prompt(plan_dir, root)).strip()}
+
+        Escalated debt subsystems:
+        {json_dump(_escalated_debt_for_prompt(plan_dir, root)).strip()}
+
+        Debt guidance:
+        - Treat recurring debt as decision context, not background noise.
+        - If the current unresolved flags overlap an escalated subsystem, prefer recommending holistic redesign over another point fix.
+        """
+    ).strip()
+
+
+def _finalize_debt_block(plan_dir: Path, root: Path | None) -> str:
+    watch_lines = _debt_watch_lines(plan_dir, root)
+    return textwrap.dedent(
+        f"""
+        Debt watch items (do not make these worse):
+        {json_dump(watch_lines).strip()}
+        """
+    ).strip()
+
+
 def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     clarification = state.get("clarification", {})
@@ -131,7 +234,7 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
-def _plan_light_prompt(state: PlanState, plan_dir: Path) -> str:
+def _plan_light_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     project_dir = Path(state["config"]["project_dir"])
     clarification = state.get("clarification", {})
     if clarification:
@@ -143,6 +246,7 @@ def _plan_light_prompt(state: PlanState, plan_dir: Path) -> str:
         ).strip()
     else:
         clarification_block = "No prior clarification artifact exists. Identify ambiguities, ask clarifying questions, and state your assumptions inside the plan output."
+    debt_block = _planning_debt_block(plan_dir, root)
     return textwrap.dedent(
         f"""
         You are creating a light-robustness implementation plan for the following idea.
@@ -153,6 +257,8 @@ def _plan_light_prompt(state: PlanState, plan_dir: Path) -> str:
         {project_dir}
 
         {clarification_block}
+
+        {debt_block}
 
         Requirements:
         - Inspect the actual repository before planning.
@@ -251,7 +357,7 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
-def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
+def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
@@ -268,6 +374,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
         for flag in flag_registry["flags"]
         if flag["status"] in {"addressed", "open", "disputed"}
     ]
+    debt_block = _planning_debt_block(plan_dir, root)
     return textwrap.dedent(
         f"""
         You are an independent reviewer. Critique the plan against the actual repository.
@@ -289,6 +396,8 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
         Existing flags:
         {json_dump(unresolved).strip()}
 
+        {debt_block}
+
         Requirements:
         - Consider whether the plan is at the right level of abstraction.
         - Reuse existing flag IDs when the same concern is still open.
@@ -307,7 +416,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
-def _gate_prompt(state: PlanState, plan_dir: Path) -> str:
+def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
@@ -326,6 +435,7 @@ def _gate_prompt(state: PlanState, plan_dir: Path) -> str:
         for flag in unresolved
     ]
     robustness = configured_robustness(state)
+    debt_block = _gate_debt_block(plan_dir, root)
     return textwrap.dedent(
         f"""
         You are the gatekeeper for the megaplan workflow. Make the continuation decision directly.
@@ -347,6 +457,8 @@ def _gate_prompt(state: PlanState, plan_dir: Path) -> str:
         Unresolved significant flags:
         {json_dump(open_flags).strip()}
 
+        {debt_block}
+
         Robustness level:
         {robustness}
 
@@ -359,6 +471,12 @@ def _gate_prompt(state: PlanState, plan_dir: Path) -> str:
         - `signals_assessment` should summarize the score trajectory, plan delta, recurring critiques, unresolved flag weight, and preflight posture in one compact paragraph.
         - Put any cautionary notes in `warnings`.
         - Populate `settled_decisions` with design choices that are now settled and should carry into review without being re-litigated. Return `[]` when there are no such decisions.
+        - When recommending `PROCEED` with unresolved flags, populate `accepted_tradeoffs` with one entry per accepted unresolved flag using:
+          - `flag_id`: the exact flag ID
+          - `subsystem`: a semantically meaningful subsystem tag like `timeout-recovery` or `execute-paths`, not the flag category
+          - `concern`: the accepted limitation phrased clearly
+          - `rationale`: why proceeding is still acceptable
+        - When recommending `ITERATE` or `ESCALATE`, return `"accepted_tradeoffs": []`.
         - Example output shape:
         ```json
         {{
@@ -366,6 +484,14 @@ def _gate_prompt(state: PlanState, plan_dir: Path) -> str:
           "rationale": "The remaining issues are executor-level details rather than planning blockers.",
           "signals_assessment": "Weighted score is falling, plan delta is stabilizing, and preflight remains clean.",
           "warnings": ["Double-check FLAG-005 while executing."],
+          "accepted_tradeoffs": [
+            {{
+              "flag_id": "FLAG-005",
+              "subsystem": "timeout-recovery",
+              "concern": "Timeout recovery: retry backoff remains basic for this pass.",
+              "rationale": "The plan contains enough guardrails to execute safely, and the remaining gap is a known tradeoff rather than a blocker."
+            }}
+          ],
           "settled_decisions": [
             {{
               "id": "DECISION-001",
@@ -407,13 +533,14 @@ def _flag_summary(registry: FlagRegistry) -> list[dict[str, object]]:
     ]
 
 
-def _finalize_prompt(state: PlanState, plan_dir: Path) -> str:
+def _finalize_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     gate = read_json(plan_dir / "gate.json")
     flag_registry = load_flag_registry(plan_dir)
     critique_history = _collect_critique_summaries(plan_dir, state["iteration"])
+    debt_block = _finalize_debt_block(plan_dir, root)
     return textwrap.dedent(
         f"""
         You are preparing an execution-ready briefing document from the approved plan.
@@ -438,6 +565,8 @@ def _finalize_prompt(state: PlanState, plan_dir: Path) -> str:
         Critique history:
         {json_dump(critique_history).strip()}
 
+        {debt_block}
+
         Requirements:
         - Produce structured JSON only.
         - `tasks` must be an ordered array of task objects. Every task object must include:
@@ -460,7 +589,7 @@ def _finalize_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
-def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
+def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     project_dir = Path(state["config"]["project_dir"])
     # Codex execute often cannot write back into plan_dir during --full-auto, so
     # checkpoint instructions must stay best-effort rather than mandatory.
@@ -490,6 +619,11 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     if watch_items:
         nudge_lines.append("Watch items to keep visible during execution:")
         for item in watch_items:
+            nudge_lines.append(f"- {item}")
+    debt_watch_items = _debt_watch_lines(plan_dir, root)
+    if debt_watch_items:
+        nudge_lines.append("Debt watch items (do not make these worse):")
+        for item in debt_watch_items:
             nudge_lines.append(f"- {item}")
     execution_nudges = "\n".join(nudge_lines)
     tasks = finalize_data.get("tasks", [])
@@ -618,6 +752,7 @@ def _execute_batch_prompt(
     plan_dir: Path,
     batch_task_ids: list[str],
     completed_task_ids: set[str] | None = None,
+    root: Path | None = None,
 ) -> str:
     completed = set(completed_task_ids or set())
     finalize_data = read_json(plan_dir / "finalize.json")
@@ -650,12 +785,31 @@ def _execute_batch_prompt(
     )
     batch_total = len(global_batches) or 1
     checkpoint_path = str(batch_artifact_path(plan_dir, batch_number))
+    prior_batch_deviations = "None"
+    if batch_number > 1:
+        prior_batch_artifact = batch_artifact_path(plan_dir, batch_number - 1)
+        if prior_batch_artifact.exists():
+            try:
+                prior_batch_payload = read_json(prior_batch_artifact)
+            except (OSError, ValueError):
+                prior_batch_payload = {}
+            raw_deviations = prior_batch_payload.get("deviations", [])
+            if isinstance(raw_deviations, list):
+                deviations = [item for item in raw_deviations if isinstance(item, str)]
+                if deviations:
+                    prior_batch_deviations = json_dump(deviations).strip()
     approval_note = (
         "Note: User chose auto-approve mode. This execution was not manually reviewed at the gate. Exercise extra caution on destructive operations."
         if state["config"].get("auto_approve")
         else "Note: User explicitly approved this plan at the gate checkpoint."
         if state["meta"].get("user_approved_gate")
         else "Note: Review mode is enabled. Execute should only be running after explicit gate approval."
+    )
+    debt_watch_items = _debt_watch_lines(plan_dir, root)
+    debt_watch_block = (
+        "\n".join(["Debt watch items (do not make these worse):", *[f"- {item}" for item in debt_watch_items]])
+        if debt_watch_items
+        else "Debt watch items (do not make these worse):\n- None."
     )
     return textwrap.dedent(
         f"""
@@ -677,11 +831,16 @@ def _execute_batch_prompt(
         Completed task context (already satisfied, do not re-execute unless directly required by current edits):
         {json_dump(completed_tasks).strip()}
 
+        Prior batch deviations (address if applicable):
+        {prior_batch_deviations}
+
         Batch-scoped sense checks:
         {json_dump(batch_sense_checks).strip()}
 
         Full execution tracking source of truth (`finalize.json`):
         {json_dump(finalize_data).strip()}
+
+        {debt_watch_block}
 
         {approval_note}
         Robustness level: {configured_robustness(state)}.
@@ -929,7 +1088,7 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
     ).strip()
 
 
-_PromptBuilder = Callable[[PlanState, Path], str]
+_PromptBuilder = Callable[..., str]
 
 _CLAUDE_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "plan": _plan_prompt,
@@ -952,19 +1111,23 @@ _CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
 }
 
 
-def create_claude_prompt(step: str, state: PlanState, plan_dir: Path) -> str:
+def create_claude_prompt(step: str, state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     if step == "plan" and configured_robustness(state) == "light":
-        return _plan_light_prompt(state, plan_dir)
+        return _plan_light_prompt(state, plan_dir, root=root)
     builder = _CLAUDE_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
+    if step in {"critique", "gate", "finalize", "execute"}:
+        return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)
 
 
-def create_codex_prompt(step: str, state: PlanState, plan_dir: Path) -> str:
+def create_codex_prompt(step: str, state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     if step == "plan" and configured_robustness(state) == "light":
-        return _plan_light_prompt(state, plan_dir)
+        return _plan_light_prompt(state, plan_dir, root=root)
     builder = _CODEX_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")
+    if step in {"critique", "gate", "finalize", "execute"}:
+        return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)

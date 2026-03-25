@@ -222,11 +222,30 @@ class StepResponse(TypedDict, total=False):
     agent_fallback: dict[str, str]
 
 
+class DebtEntry(TypedDict):
+    id: str
+    subsystem: str
+    concern: str
+    flag_ids: list[str]
+    plan_ids: list[str]
+    occurrence_count: int
+    created_at: str
+    updated_at: str
+    resolved: bool
+    resolved_by: str | None
+    resolved_at: str | None
+
+
+class DebtRegistry(TypedDict):
+    entries: list[DebtEntry]
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 FLAG_BLOCKING_STATUSES = {"open", "disputed"}
+DEBT_ESCALATION_THRESHOLD = 3
 MOCK_ENV_VAR = "MEGAPLAN_MOCK_WORKERS"
 
 DEFAULT_AGENT_ROUTING: dict[str, str] = {

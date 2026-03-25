@@ -3,10 +3,16 @@ from __future__ import annotations
 import pytest
 
 from megaplan._core import (
+    add_or_increment_debt,
     batch_artifact_path,
     compute_global_batches,
     compute_task_batches,
+    escalated_subsystems,
+    extract_subsystem_tag,
+    find_matching_debt,
     list_batch_artifacts,
+    load_debt_registry,
+    resolve_debt,
 )
 
 
@@ -85,3 +91,138 @@ def test_compute_global_batches_ignores_completed_status_for_stable_partition() 
     }
 
     assert compute_global_batches(finalize_data) == [["T1"], ["T2", "T3"], ["T4"]]
+
+
+def test_load_debt_registry_returns_empty_when_missing(tmp_path) -> None:
+    assert load_debt_registry(tmp_path) == {"entries": []}
+
+
+def test_add_or_increment_debt_creates_new_entry() -> None:
+    registry = {"entries": []}
+
+    entry = add_or_increment_debt(
+        registry,
+        subsystem="Timeout Recovery",
+        concern="Timeout recovery: Retry backoff is missing",
+        flag_ids=["FLAG-001"],
+        plan_id="plan-a",
+    )
+
+    assert entry["id"] == "DEBT-001"
+    assert entry["subsystem"] == "timeout-recovery"
+    assert entry["concern"] == "timeout recovery: retry backoff is missing"
+    assert entry["flag_ids"] == ["FLAG-001"]
+    assert entry["plan_ids"] == ["plan-a"]
+    assert entry["occurrence_count"] == 1
+    assert entry["resolved"] is False
+
+
+def test_add_or_increment_debt_increments_matching_entry() -> None:
+    registry = {"entries": []}
+    first = add_or_increment_debt(
+        registry,
+        subsystem="timeout-recovery",
+        concern="Timeout recovery: Retry backoff is missing",
+        flag_ids=["FLAG-001"],
+        plan_id="plan-a",
+    )
+
+    second = add_or_increment_debt(
+        registry,
+        subsystem="timeout-recovery",
+        concern="Timeout recovery: retry backoff is missing",
+        flag_ids=["FLAG-002"],
+        plan_id="plan-b",
+    )
+
+    assert second is first
+    assert len(registry["entries"]) == 1
+    assert second["occurrence_count"] == 2
+    assert second["flag_ids"] == ["FLAG-001", "FLAG-002"]
+    assert second["plan_ids"] == ["plan-a", "plan-b"]
+
+
+def test_find_matching_debt_rejects_different_subsystem_even_with_overlap() -> None:
+    registry = {"entries": []}
+    add_or_increment_debt(
+        registry,
+        subsystem="timeout-recovery",
+        concern="Timeout recovery: Retry backoff is missing",
+        flag_ids=["FLAG-001"],
+        plan_id="plan-a",
+    )
+
+    assert find_matching_debt(
+        registry,
+        "execute-paths",
+        "Timeout recovery: Retry backoff is missing",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("concern", "expected"),
+    [
+        ("Timeout recovery: Retry backoff is missing", "timeout-recovery"),
+        ("Retry backoff is missing", "untagged"),
+        ("Execute paths: queue: drain edge case", "execute-paths"),
+    ],
+)
+def test_extract_subsystem_tag_handles_expected_variants(concern: str, expected: str) -> None:
+    assert extract_subsystem_tag(concern) == expected
+
+
+def test_resolve_debt_sets_resolution_fields() -> None:
+    registry = {"entries": []}
+    entry = add_or_increment_debt(
+        registry,
+        subsystem="observation",
+        concern="Observation: Missing event logging",
+        flag_ids=["FLAG-010"],
+        plan_id="plan-a",
+    )
+
+    resolved = resolve_debt(registry, entry["id"], "plan-b")
+
+    assert resolved["resolved"] is True
+    assert resolved["resolved_by"] == "plan-b"
+    assert resolved["resolved_at"] is not None
+    assert resolved["updated_at"] == resolved["resolved_at"]
+
+
+def test_escalated_subsystems_triggers_for_single_high_occurrence_entry() -> None:
+    registry = {"entries": []}
+    entry = add_or_increment_debt(
+        registry,
+        subsystem="timeout-recovery",
+        concern="Timeout recovery: Retry backoff is missing",
+        flag_ids=["FLAG-001"],
+        plan_id="plan-a",
+    )
+    entry["occurrence_count"] = 4
+
+    escalated = escalated_subsystems(registry)
+
+    assert escalated == [("timeout-recovery", 4, [entry])]
+
+
+def test_escalated_subsystems_triggers_for_multiple_entries_in_same_subsystem() -> None:
+    registry = {"entries": []}
+    first = add_or_increment_debt(
+        registry,
+        subsystem="timeout-recovery",
+        concern="Timeout recovery: Retry backoff is missing",
+        flag_ids=["FLAG-001"],
+        plan_id="plan-a",
+    )
+    second = add_or_increment_debt(
+        registry,
+        subsystem="timeout-recovery",
+        concern="Timeout recovery: Circuit breaker stalls recovery flow",
+        flag_ids=["FLAG-002"],
+        plan_id="plan-b",
+    )
+    second["occurrence_count"] = 2
+
+    escalated = escalated_subsystems(registry)
+
+    assert escalated == [("timeout-recovery", 3, [first, second])]

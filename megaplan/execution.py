@@ -16,6 +16,7 @@ from megaplan._core import (
     compute_global_batches,
     compute_task_batches,
     list_batch_artifacts,
+    load_config,
     read_json,
     render_final_md,
     sha256_file,
@@ -23,6 +24,7 @@ from megaplan._core import (
 from megaplan.evaluation import _parse_git_status_paths, validate_execution_evidence
 from megaplan.merge import _validate_and_merge_batch
 from megaplan.prompts import _execute_batch_prompt, _execute_prompt
+from megaplan.quality import capture_before_line_counts, run_quality_checks
 from megaplan.types import CliError, PlanState, STATE_EXECUTED, STATE_FINALIZED, StepResponse
 from megaplan.workers import WorkerResult
 
@@ -330,6 +332,33 @@ def _observe_git_changes(
     return issues
 
 
+def _collect_quality_deviations(
+    *,
+    project_dir: Path,
+    before_snapshot: dict[str, str],
+    before_line_counts: dict[str, int],
+    quality_config: dict[str, Any],
+    capture_git_status_snapshot_fn: Callable[[Path], tuple[dict[str, str], str | None]],
+) -> list[str]:
+    try:
+        after_snapshot, after_error = capture_git_status_snapshot_fn(project_dir)
+    except Exception as exc:  # pragma: no cover - defensive guard for advisory-only quality checks.
+        return [f"Advisory quality: skipped quality checks because post-batch git snapshot failed: {exc}"]
+    if after_error is not None:
+        return [f"Advisory quality: skipped quality checks because post-batch git snapshot failed: {after_error}"]
+    changed_paths = _observed_batch_paths(
+        project_dir=project_dir,
+        before_snapshot=before_snapshot,
+        after_snapshot=after_snapshot,
+    )
+    return run_quality_checks(
+        project_dir,
+        changed_paths=changed_paths,
+        before_line_counts=before_line_counts,
+        config=quality_config,
+    )
+
+
 def _merge_batch_results(
     *,
     finalize_data: dict[str, Any],
@@ -410,10 +439,12 @@ def _run_and_merge_batch(
     finalize_data: dict[str, Any],
     batch_number: int,
     batches_total: int,
+    quality_config: dict[str, Any],
     capture_git_status_snapshot_fn: Callable[[Path], tuple[dict[str, str], str | None]] = _capture_git_status_snapshot,
 ) -> BatchResult:
     project_dir = Path(state["config"]["project_dir"])
     before_snapshot, before_error = capture_git_status_snapshot_fn(project_dir)
+    before_line_counts = capture_before_line_counts(project_dir, before_snapshot.keys())
     worker, agent, mode, refreshed = worker_module.run_step_with_worker(
         "execute",
         state,
@@ -434,6 +465,15 @@ def _run_and_merge_batch(
             before_error=before_error,
             batch_number=batch_number,
             batches_total=batches_total,
+            capture_git_status_snapshot_fn=capture_git_status_snapshot_fn,
+        )
+    )
+    deviations.extend(
+        _collect_quality_deviations(
+            project_dir=project_dir,
+            before_snapshot=before_snapshot,
+            before_line_counts=before_line_counts,
+            quality_config=quality_config,
             capture_git_status_snapshot_fn=capture_git_status_snapshot_fn,
         )
     )
@@ -745,6 +785,8 @@ def handle_execute_one_batch(
     capture_git_status_snapshot_fn: Callable[[Path], tuple[dict[str, str], str | None]] = _capture_git_status_snapshot,
 ) -> StepResponse:
     finalize_data = read_json(plan_dir / "finalize.json")
+    global_config = load_config()
+    quality_config = global_config.get("quality_checks", {})
     global_batches = compute_global_batches(finalize_data)
     batches_total = len(global_batches)
 
@@ -773,7 +815,7 @@ def handle_execute_one_batch(
     batch_task_ids = global_batches[batch_number - 1]
     active_task_ids = set(batch_task_ids)
     batch_sense_check_ids = _active_sense_check_ids(finalize_data, active_task_ids)
-    batch_prompt = _execute_batch_prompt(state, plan_dir, batch_task_ids, completed_ids)
+    batch_prompt = _execute_batch_prompt(state, plan_dir, batch_task_ids, completed_ids, root=root)
 
     try:
         result = _run_and_merge_batch(
@@ -790,6 +832,7 @@ def handle_execute_one_batch(
             finalize_data=finalize_data,
             batch_number=batch_number,
             batches_total=batches_total,
+            quality_config=quality_config,
             capture_git_status_snapshot_fn=capture_git_status_snapshot_fn,
         )
     except CliError as error:
@@ -937,6 +980,8 @@ def handle_execute_auto_loop(
     capture_git_status_snapshot_fn: Callable[[Path], tuple[dict[str, str], str | None]] = _capture_git_status_snapshot,
 ) -> StepResponse:
     finalize_data = read_json(plan_dir / "finalize.json")
+    global_config = load_config()
+    quality_config = global_config.get("quality_checks", {})
     project_dir = Path(state["config"]["project_dir"])
     tasks = finalize_data.get("tasks", [])
     all_task_ids = [
@@ -981,7 +1026,13 @@ def handle_execute_auto_loop(
     timeout_recovery: StepResponse | None = None
 
     for batch_index, batch_task_ids in enumerate(batches_to_run, start=1):
-        batch_prompt = None if single_batch_mode else _execute_batch_prompt(state, plan_dir, batch_task_ids, completed_task_ids)
+        batch_prompt = None if single_batch_mode else _execute_batch_prompt(
+            state,
+            plan_dir,
+            batch_task_ids,
+            completed_task_ids,
+            root=root,
+        )
         batch_number_for_artifact = 1 if single_batch_mode else global_batch_lookup.get(tuple(batch_task_ids), batch_index)
         batch_sense_check_ids = all_sense_check_ids if single_batch_mode else _active_sense_check_ids(finalize_data, set(batch_task_ids))
         batches_total_for_observation = 1 if single_batch_mode else len(global_batches)
@@ -1000,6 +1051,7 @@ def handle_execute_auto_loop(
                 finalize_data=finalize_data,
                 batch_number=batch_number_for_artifact,
                 batches_total=batches_total_for_observation,
+                quality_config=quality_config,
                 capture_git_status_snapshot_fn=capture_git_status_snapshot_fn,
             )
         except CliError as error:

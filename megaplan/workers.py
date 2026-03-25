@@ -688,7 +688,7 @@ def run_claude_step(
     else:
         session_id = str(uuid.uuid4())
         command.extend(["--session-id", session_id])
-    prompt = prompt_override if prompt_override is not None else create_claude_prompt(step, state, plan_dir)
+    prompt = prompt_override if prompt_override is not None else create_claude_prompt(step, state, plan_dir, root=root)
     try:
         result = run_command(command, cwd=project_dir, stdin_text=prompt)
     except CliError as error:
@@ -730,7 +730,7 @@ def run_codex_step(
     out_handle = tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False)
     out_handle.close()
     output_path = Path(out_handle.name)
-    prompt = prompt_override if prompt_override is not None else create_codex_prompt(step, state, plan_dir)
+    prompt = prompt_override if prompt_override is not None else create_codex_prompt(step, state, plan_dir, root=root)
 
     if persistent and session.get("id") and not fresh:
         # codex exec resume does not support --output-schema; we rely on

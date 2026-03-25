@@ -10,6 +10,8 @@ import pytest
 
 import megaplan
 import megaplan.cli
+import megaplan.execution
+import megaplan.evaluation
 import megaplan.handlers
 import megaplan.cli
 import megaplan._core
@@ -22,6 +24,23 @@ from megaplan.workers import WorkerResult, _build_mock_payload
 
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def run_main_json(
+    argv: list[str],
+    *,
+    cwd: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[int, dict]:
+    monkeypatch.chdir(cwd)
+    exit_code = megaplan.main(argv)
+    return exit_code, json.loads(capsys.readouterr().out)
+
+
+def _write_lines(path: Path, count: int, *, prefix: str = "line") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(f"{prefix}_{index}" for index in range(count)) + "\n", encoding="utf-8")
 
 
 def make_args_factory(project_dir: Path) -> Callable[..., Namespace]:
@@ -102,6 +121,19 @@ def load_state(plan_dir: Path) -> dict:
 
 def latest_plan_name(plan_dir: Path) -> str:
     return load_state(plan_dir)["plan_versions"][-1]["file"]
+
+
+def debt_registry_path(root: Path) -> Path:
+    return root / ".megaplan" / "debt.json"
+
+
+def first_open_significant_flag(plan_dir: Path) -> dict:
+    registry = read_json(plan_dir / "faults.json")
+    return next(
+        flag
+        for flag in registry["flags"]
+        if flag["status"] in {"open", "disputed"} and flag.get("severity") == "significant"
+    )
 
 
 def test_init_sets_last_gate_and_next_step_plan(plan_fixture: PlanFixture) -> None:
@@ -458,6 +490,50 @@ def test_force_proceed_from_critiqued_writes_override_gate(plan_fixture: PlanFix
     assert state["last_gate"] == {}
 
 
+def test_force_proceed_registers_unresolved_flags_as_debt(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    response = megaplan.handle_override(
+        plan_fixture.root,
+        plan_fixture.make_args(
+            plan=plan_fixture.plan_name,
+            override_action="force-proceed",
+            reason="executor can resolve remaining issues",
+        ),
+    )
+    registry = read_json(debt_registry_path(plan_fixture.root))
+
+    assert response["debt_entries_added"] >= 1
+    assert len(registry["entries"]) >= 1
+    assert all(entry["resolved"] is False for entry in registry["entries"])
+
+
+def test_repeated_force_proceed_increments_existing_debt_instead_of_duplicating(plan_fixture: PlanFixture) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="first pass"),
+    )
+    first_registry = read_json(debt_registry_path(plan_fixture.root))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="replan", reason="loop back"),
+    )
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="second pass"),
+    )
+
+    registry = read_json(debt_registry_path(plan_fixture.root))
+
+    assert len(registry["entries"]) == len(first_registry["entries"])
+    assert all(entry["occurrence_count"] == 2 for entry in registry["entries"])
+
+
 def test_replan_from_gated_resets_to_planned(plan_fixture: PlanFixture) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
@@ -483,6 +559,111 @@ def test_replan_from_gated_resets_to_planned(plan_fixture: PlanFixture) -> None:
     assert response["state"] == megaplan.STATE_PLANNED
     assert state["last_gate"] == {}
     assert response["next_step"] == "critique"
+
+
+def test_gate_proceed_with_accepted_tradeoffs_creates_debt(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    flag = first_open_significant_flag(plan_fixture.plan_dir)
+    worker = WorkerResult(
+        payload={
+            "recommendation": "PROCEED",
+            "rationale": "Known tradeoff accepted.",
+            "signals_assessment": "Proceeding with one accepted limitation.",
+            "warnings": [],
+            "accepted_tradeoffs": [
+                {
+                    "flag_id": flag["id"],
+                    "subsystem": "timeout-recovery",
+                    "concern": flag["concern"],
+                    "rationale": "Tracked as debt for a later redesign.",
+                }
+            ],
+        },
+        raw_output="{}",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="gate-debt-1",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "claude", "persistent", False),
+    )
+
+    response = megaplan.handle_gate(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    registry = read_json(debt_registry_path(plan_fixture.root))
+
+    assert response["debt_entries_added"] == 1
+    assert len(registry["entries"]) == 1
+    assert registry["entries"][0]["flag_ids"] == [flag["id"]]
+
+
+def test_gate_iterate_with_empty_accepted_tradeoffs_creates_no_debt(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    worker = WorkerResult(
+        payload={
+            "recommendation": "ITERATE",
+            "rationale": "Still needs plan work.",
+            "signals_assessment": "Revisions are still needed.",
+            "warnings": [],
+            "accepted_tradeoffs": [],
+        },
+        raw_output="{}",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="gate-debt-2",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "claude", "persistent", False),
+    )
+
+    response = megaplan.handle_gate(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert response["debt_entries_added"] == 0
+    assert not debt_registry_path(plan_fixture.root).exists()
+
+
+def test_gate_proceed_without_accepted_tradeoffs_registers_fallback_debt(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    flag = first_open_significant_flag(plan_fixture.plan_dir)
+    worker = WorkerResult(
+        payload={
+            "recommendation": "PROCEED",
+            "rationale": "Proceed despite the remaining planning-level debt.",
+            "signals_assessment": "Proceeding with unresolved flags recorded as debt.",
+            "warnings": [],
+        },
+        raw_output="{}",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="gate-debt-3",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "claude", "persistent", False),
+    )
+
+    response = megaplan.handle_gate(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    registry = read_json(debt_registry_path(plan_fixture.root))
+
+    assert response["debt_entries_added"] >= 1
+    assert len(registry["entries"]) == response["debt_entries_added"]
+    assert any(entry["flag_ids"] == [flag["id"]] for entry in registry["entries"])
 
 
 def test_step_add(plan_fixture: PlanFixture) -> None:
@@ -1450,6 +1631,129 @@ def test_invalid_command_returns_error(tmp_path: Path, monkeypatch: pytest.Monke
     assert exit_code == 0  # init should succeed
 
 
+def test_debt_list_on_empty_registry_returns_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+
+    exit_code, payload = run_main_json(["debt", "list"], cwd=root, capsys=capsys, monkeypatch=monkeypatch)
+
+    assert exit_code == 0
+    assert payload["success"] is True
+    assert payload["step"] == "debt"
+    assert payload["action"] == "list"
+    assert payload["details"]["entries"] == []
+    assert payload["details"]["by_subsystem"] == []
+
+
+def test_debt_add_and_list_increment_matching_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+
+    exit_code, add_one = run_main_json(
+        [
+            "debt",
+            "add",
+            "--subsystem",
+            "timeout-recovery",
+            "--concern",
+            "Timeout recovery: Retry backoff is missing",
+            "--flag-ids",
+            "FLAG-001",
+            "--plan",
+            "plan-a",
+        ],
+        cwd=root,
+        capsys=capsys,
+        monkeypatch=monkeypatch,
+    )
+    assert exit_code == 0
+    assert add_one["details"]["entry"]["id"] == "DEBT-001"
+
+    exit_code, _add_two = run_main_json(
+        [
+            "debt",
+            "add",
+            "--subsystem",
+            "timeout-recovery",
+            "--concern",
+            "Timeout recovery: retry backoff is missing",
+            "--flag-ids",
+            "FLAG-002",
+            "--plan",
+            "plan-b",
+        ],
+        cwd=root,
+        capsys=capsys,
+        monkeypatch=monkeypatch,
+    )
+    assert exit_code == 0
+
+    exit_code, payload = run_main_json(["debt", "list"], cwd=root, capsys=capsys, monkeypatch=monkeypatch)
+
+    assert exit_code == 0
+    assert len(payload["details"]["entries"]) == 1
+    entry = payload["details"]["entries"][0]
+    assert entry["occurrence_count"] == 2
+    assert entry["flag_ids"] == ["FLAG-001", "FLAG-002"]
+    assert entry["plan_ids"] == ["plan-a", "plan-b"]
+    assert payload["details"]["by_subsystem"][0]["subsystem"] == "timeout-recovery"
+
+
+def test_debt_resolve_hides_entry_from_default_list_but_not_all(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+
+    _exit_code, add_payload = run_main_json(
+        [
+            "debt",
+            "add",
+            "--subsystem",
+            "observation",
+            "--concern",
+            "Observation: Missing event logging",
+            "--flag-ids",
+            "FLAG-010",
+            "--plan",
+            "plan-a",
+        ],
+        cwd=root,
+        capsys=capsys,
+        monkeypatch=monkeypatch,
+    )
+    debt_id = add_payload["details"]["entry"]["id"]
+
+    exit_code, resolve_payload = run_main_json(
+        ["debt", "resolve", debt_id, "--plan", "plan-b"],
+        cwd=root,
+        capsys=capsys,
+        monkeypatch=monkeypatch,
+    )
+    assert exit_code == 0
+    assert resolve_payload["details"]["entry"]["resolved"] is True
+    assert resolve_payload["details"]["entry"]["resolved_by"] == "plan-b"
+
+    exit_code, list_payload = run_main_json(["debt", "list"], cwd=root, capsys=capsys, monkeypatch=monkeypatch)
+    assert exit_code == 0
+    assert list_payload["details"]["entries"] == []
+
+    exit_code, list_all_payload = run_main_json(["debt", "list", "--all"], cwd=root, capsys=capsys, monkeypatch=monkeypatch)
+    assert exit_code == 0
+    assert len(list_all_payload["details"]["entries"]) == 1
+    assert list_all_payload["details"]["entries"][0]["resolved"] is True
+
+
 def test_setup_local_creates_agents_file(tmp_path: Path) -> None:
     args = Namespace(
         local=True,
@@ -1528,6 +1832,27 @@ def test_execute_prompt_includes_approval_note(plan_fixture: PlanFixture) -> Non
     from megaplan.prompts import create_claude_prompt
     prompt = create_claude_prompt("execute", state, plan_fixture.plan_dir)
     assert "Review mode" in prompt or "auto-approve" in prompt or "approved" in prompt
+
+
+def test_build_gate_signals_includes_debt_overlaps_when_flags_match(plan_fixture: PlanFixture) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    flag = first_open_significant_flag(plan_fixture.plan_dir)
+    registry = {"entries": []}
+    megaplan._core.add_or_increment_debt(
+        registry,
+        megaplan._core.extract_subsystem_tag(flag["concern"]),
+        flag["concern"],
+        [flag["id"]],
+        plan_fixture.plan_name,
+    )
+    megaplan._core.save_debt_registry(plan_fixture.root, registry)
+    _, state = load_plan(plan_fixture.root, plan_fixture.plan_name)
+
+    signals = megaplan.evaluation.build_gate_signals(plan_fixture.plan_dir, state, plan_fixture.root)
+
+    assert signals["signals"]["debt_overlaps"]
+    assert signals["signals"]["debt_overlaps"][0]["flag_id"] == flag["id"]
 
 
 def test_render_final_md_pending_partially_done_and_reviewed_states() -> None:
@@ -2480,6 +2805,8 @@ def test_execute_multi_batch_happy_path_aggregates_results(
         ({}, None),
         ({"batch1.py": "hash-1"}, None),
         ({"batch1.py": "hash-1"}, None),
+        ({"batch1.py": "hash-1"}, None),
+        ({"batch1.py": "hash-1", "batch2.py": "hash-2"}, None),
         ({"batch1.py": "hash-1", "batch2.py": "hash-2"}, None),
     ])
     monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
@@ -2576,6 +2903,7 @@ def test_execute_multi_batch_timeout_preserves_prior_batches(
 
     snapshots = iter([
         ({}, None),
+        ({"batch1.py": "hash-1"}, None),
         ({"batch1.py": "hash-1"}, None),
         ({"batch1.py": "hash-1"}, None),
     ])
@@ -2712,6 +3040,8 @@ def test_execute_multi_batch_observation_allows_cross_batch_reedit_and_flags_pha
         ({}, None),
         ({"megaplan/handlers.py": "hash-1"}, None),
         ({"megaplan/handlers.py": "hash-1"}, None),
+        ({"megaplan/handlers.py": "hash-1"}, None),
+        ({"megaplan/handlers.py": "hash-2"}, None),
         ({"megaplan/handlers.py": "hash-2"}, None),
     ])
     monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
@@ -3237,6 +3567,161 @@ def test_batch_2_after_batch_1_transitions_to_executed(
     execution = read_json(plan_fixture.plan_dir / "execution.json")
     assert [item["task_id"] for item in execution["task_updates"]] == ["T1", "T2"]
     assert all(t["status"] == "done" for t in finalize_data["tasks"])
+
+
+def test_execute_quality_advisories_flow_into_batch_artifacts_aggregate_and_next_prompt(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    batch1_path = plan_fixture.project_dir / "batch1.txt"
+    batch2_path = plan_fixture.project_dir / "batch2.txt"
+    _write_lines(batch1_path, 10, prefix="batch1_before")
+    _write_lines(batch2_path, 10, prefix="batch2_before")
+
+    snapshots = iter([
+        ({"batch1.txt": "before-1"}, None),
+        ({"batch1.txt": "after-1"}, None),
+        ({"batch1.txt": "after-1"}, None),
+        ({"batch1.txt": "after-1", "batch2.txt": "before-2"}, None),
+        ({"batch1.txt": "after-1", "batch2.txt": "after-2"}, None),
+        ({"batch1.txt": "after-1", "batch2.txt": "after-2"}, None),
+    ])
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+    monkeypatch.setattr(megaplan.execution, "load_config", lambda *_: {})
+
+    seen_prompts: list[str | None] = []
+
+    def quality_batch_worker(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
+        seen_prompts.append(prompt_override)
+        assert prompt_override is not None
+        if "[T1]" in prompt_override:
+            _write_lines(batch1_path, 310, prefix="batch1_after")
+            payload = {
+                "output": "Batch one complete.",
+                "files_changed": ["batch1.txt"],
+                "commands_run": ["pytest -k batch1"],
+                "deviations": [],
+                "task_updates": [
+                    {
+                        "task_id": "T1",
+                        "status": "done",
+                        "executor_notes": "Completed the first batch and verified the file growth trigger.",
+                        "files_changed": ["batch1.txt"],
+                        "commands_run": ["pytest -k batch1"],
+                    }
+                ],
+                "sense_check_acknowledgments": [
+                    {"sense_check_id": "SC1", "executor_note": "Confirmed batch one output."}
+                ],
+            }
+            return WorkerResult(payload=payload, raw_output="batch1", duration_ms=2, cost_usd=0.1, session_id="batch-1"), "codex", "persistent", False
+        if "[T2]" in prompt_override:
+            assert "Prior batch deviations (address if applicable):" in prompt_override
+            assert "Advisory quality: batch1.txt grew by 300 lines (threshold 200)." in prompt_override
+            _write_lines(batch2_path, 20, prefix="batch2_after")
+            payload = {
+                "output": "Batch two complete.",
+                "files_changed": ["batch2.txt"],
+                "commands_run": ["pytest -k batch2"],
+                "deviations": [],
+                "task_updates": [
+                    {
+                        "task_id": "T2",
+                        "status": "done",
+                        "executor_notes": "Completed the second batch after reviewing prior advisories.",
+                        "files_changed": ["batch2.txt"],
+                        "commands_run": ["pytest -k batch2"],
+                    }
+                ],
+                "sense_check_acknowledgments": [
+                    {"sense_check_id": "SC2", "executor_note": "Confirmed batch two output."}
+                ],
+            }
+            return WorkerResult(payload=payload, raw_output="batch2", duration_ms=3, cost_usd=0.2, session_id="batch-2"), "codex", "persistent", False
+        raise AssertionError(f"Unexpected batch prompt: {prompt_override}")
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", quality_batch_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    batch_1 = read_json(plan_fixture.plan_dir / "execution_batch_1.json")
+    execution = read_json(plan_fixture.plan_dir / "execution.json")
+
+    assert response["success"] is True
+    assert "Advisory quality: batch1.txt grew by 300 lines (threshold 200)." in batch_1["deviations"]
+    assert any(deviation.startswith("Advisory quality:") for deviation in batch_1["deviations"])
+    assert "Advisory quality: batch1.txt grew by 300 lines (threshold 200)." in execution["deviations"]
+    assert any(
+        prompt is not None and "Prior batch deviations (address if applicable):" in prompt and "[T2]" in prompt
+        for prompt in seen_prompts
+    )
+
+
+def test_execute_quality_config_disable_suppresses_file_growth_deviation_end_to_end(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+    finalize_data["tasks"] = [finalize_data["tasks"][0]]
+    finalize_data["sense_checks"] = [finalize_data["sense_checks"][0]]
+    (plan_fixture.plan_dir / "finalize.json").write_text(
+        json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8"
+    )
+
+    notes_path = plan_fixture.project_dir / "notes.txt"
+    _write_lines(notes_path, 10, prefix="notes_before")
+
+    snapshots = iter([
+        ({"notes.txt": "before-1"}, None),
+        ({"notes.txt": "after-1"}, None),
+        ({"notes.txt": "after-1"}, None),
+    ])
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+    monkeypatch.setattr(
+        megaplan.execution,
+        "load_config",
+        lambda *_: {"quality_checks": {"file_growth": {"enabled": False}}},
+    )
+
+    def single_quality_worker(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
+        _write_lines(notes_path, 310, prefix="notes_after")
+        payload = {
+            "output": "Single batch complete.",
+            "files_changed": ["notes.txt"],
+            "commands_run": ["pytest -k quality-disable"],
+            "deviations": [],
+            "task_updates": [
+                {
+                    "task_id": "T1",
+                    "status": "done",
+                    "executor_notes": "Completed the batch with file growth disabled in config.",
+                    "files_changed": ["notes.txt"],
+                    "commands_run": ["pytest -k quality-disable"],
+                }
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Confirmed config-disabled batch output."}
+            ],
+        }
+        return WorkerResult(payload=payload, raw_output="single", duration_ms=1, cost_usd=0.1, session_id="single"), "codex", "persistent", False
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", single_quality_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    batch_1 = read_json(plan_fixture.plan_dir / "execution_batch_1.json")
+    execution = read_json(plan_fixture.plan_dir / "execution.json")
+
+    assert response["success"] is True
+    assert not any("notes.txt grew by" in deviation for deviation in batch_1["deviations"])
+    assert not any("notes.txt grew by" in deviation for deviation in execution["deviations"])
+    assert not any("notes.txt grew by" in deviation for deviation in response["deviations"])
 
 
 def test_batch_out_of_range_raises(

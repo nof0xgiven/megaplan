@@ -35,25 +35,30 @@ from megaplan.types import (
     StepResponse,
 )
 from megaplan._core import (
+    add_or_increment_debt,
     atomic_write_json,
     atomic_write_text,
     configured_robustness,
     current_iteration_raw_artifact,
     ensure_runtime_layout,
+    extract_subsystem_tag,
     latest_plan_meta_path,
     latest_plan_path,
+    load_debt_registry,
     load_flag_registry,
     load_plan,
     now_utc,
     plans_root,
     read_json,
     render_final_md,
+    save_debt_registry,
     save_flag_registry,
     save_state,
     scope_creep_flags,
     sha256_file,
     sha256_text,
     slugify,
+    unresolved_significant_flags,
 )
 from megaplan.evaluation import (
     PLAN_STRUCTURE_REQUIRED_STEP_ISSUE,
@@ -632,6 +637,7 @@ def _synthetic_signals_assessment(signals_artifact: dict[str, Any]) -> str:
 
 def _maybe_fast_forward_light_plan(
     *,
+    root: Path,
     plan_dir: Path,
     state: PlanState,
     payload: dict[str, Any],
@@ -680,7 +686,7 @@ def _maybe_fast_forward_light_plan(
         ),
     )
 
-    gate_signals = build_gate_signals(plan_dir, state)
+    gate_signals = build_gate_signals(plan_dir, state, root=root)
     gate_checks = run_gate_checks(plan_dir, state, command_lookup=find_command)
     signals_artifact = {
         "robustness": gate_signals["robustness"],
@@ -897,6 +903,7 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
         ),
     )
     response = _maybe_fast_forward_light_plan(
+        root=root,
         plan_dir=plan_dir,
         state=state,
         payload=payload,
@@ -1103,7 +1110,7 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "gate", {STATE_CRITIQUED})
     iteration = state["iteration"]
-    gate_signals = build_gate_signals(plan_dir, state)
+    gate_signals = build_gate_signals(plan_dir, state, root=root)
     gate_checks = run_gate_checks(plan_dir, state, command_lookup=find_command)
     signals_artifact = {
         "robustness": gate_signals["robustness"],
@@ -1135,6 +1142,51 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
         orchestrator_guidance=guidance,
     )
     atomic_write_json(plan_dir / "gate.json", gate_summary)
+    debt_entries_added = 0
+    if gate_summary["recommendation"] == "PROCEED":
+        raw_tradeoffs = worker.payload.get("accepted_tradeoffs", [])
+        accepted_tradeoffs = [
+            item
+            for item in raw_tradeoffs
+            if isinstance(item, dict)
+            and isinstance(item.get("flag_id"), str)
+            and isinstance(item.get("concern"), str)
+        ] if isinstance(raw_tradeoffs, list) else []
+        debt_registry = load_debt_registry(root)
+        if accepted_tradeoffs:
+            for tradeoff in accepted_tradeoffs:
+                subsystem_value = tradeoff.get("subsystem")
+                subsystem = (
+                    subsystem_value
+                    if isinstance(subsystem_value, str) and subsystem_value.strip()
+                    else extract_subsystem_tag(tradeoff["concern"])
+                )
+                add_or_increment_debt(
+                    debt_registry,
+                    subsystem=subsystem,
+                    concern=tradeoff["concern"],
+                    flag_ids=[tradeoff["flag_id"]],
+                    plan_id=state["name"],
+                )
+                debt_entries_added += 1
+        elif gate_summary["unresolved_flags"]:
+            for flag in gate_summary["unresolved_flags"]:
+                if not isinstance(flag, dict):
+                    continue
+                flag_id = flag.get("id")
+                concern = flag.get("concern")
+                if not isinstance(flag_id, str) or not isinstance(concern, str):
+                    continue
+                add_or_increment_debt(
+                    debt_registry,
+                    subsystem=extract_subsystem_tag(concern),
+                    concern=concern,
+                    flag_ids=[flag_id],
+                    plan_id=state["name"],
+                )
+                debt_entries_added += 1
+        if debt_entries_added:
+            save_debt_registry(root, debt_registry)
     _store_last_gate(state, gate_summary)
     if len(state["meta"].get("weighted_scores", [])) < iteration:
         _append_to_meta(state, "weighted_scores", gate_signals["signals"]["weighted_score"])
@@ -1182,6 +1234,7 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
         "unresolved_flags": gate_summary["unresolved_flags"],
         "orchestrator_guidance": gate_summary["orchestrator_guidance"],
         "signals": gate_summary["signals"],
+        "debt_entries_added": debt_entries_added,
     }
     attach_agent_fallback(response, args)
     return response
@@ -1409,7 +1462,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
 # Overrides
 # ---------------------------------------------------------------------------
 
-def _override_add_note(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
+def _override_add_note(root: Path, plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
     note = args.note
     _append_to_meta(state, "notes", {"timestamp": now_utc(), "note": note})
     _append_to_meta(state, "overrides", {"action": "add-note", "timestamp": now_utc(), "note": note})
@@ -1424,7 +1477,7 @@ def _override_add_note(plan_dir: Path, state: PlanState, args: argparse.Namespac
     }
 
 
-def _override_abort(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
+def _override_abort(root: Path, plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
     state["current_state"] = STATE_ABORTED
     _append_to_meta(state, "overrides", {"action": "abort", "timestamp": now_utc(), "reason": args.reason})
     save_state(plan_dir, state)
@@ -1437,7 +1490,7 @@ def _override_abort(plan_dir: Path, state: PlanState, args: argparse.Namespace) 
     }
 
 
-def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
+def _override_force_proceed(root: Path, plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
     if state["current_state"] != STATE_CRITIQUED:
         raise CliError(
             "invalid_transition",
@@ -1447,7 +1500,7 @@ def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Nam
     gate_checks = run_gate_checks(plan_dir, state, command_lookup=find_command)
     if not gate_checks["preflight_results"]["project_dir_exists"] or not gate_checks["preflight_results"]["success_criteria_present"]:
         raise CliError("unsafe_override", "force-proceed cannot bypass missing project directory or success criteria")
-    signals = build_gate_signals(plan_dir, state)
+    signals = build_gate_signals(plan_dir, state, root=root)
     merged_signals = {
         "robustness": signals["robustness"],
         "signals": signals["signals"],
@@ -1468,6 +1521,18 @@ def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Nam
         orchestrator_guidance="Force-proceed override applied. Proceed to finalize.",
     )
     atomic_write_json(plan_dir / "gate.json", gate)
+    flag_registry = load_flag_registry(plan_dir)
+    unresolved_flags = unresolved_significant_flags(flag_registry)
+    debt_registry = load_debt_registry(root)
+    for flag in unresolved_flags:
+        add_or_increment_debt(
+            debt_registry,
+            subsystem=extract_subsystem_tag(flag["concern"]),
+            concern=flag["concern"],
+            flag_ids=[flag["id"]],
+            plan_id=state["name"],
+        )
+    save_debt_registry(root, debt_registry)
     state["current_state"] = STATE_GATED
     state["meta"].pop("user_approved_gate", None)
     state["last_gate"] = {}
@@ -1480,10 +1545,11 @@ def _override_force_proceed(plan_dir: Path, state: PlanState, args: argparse.Nam
         "next_step": "finalize",
         "state": STATE_GATED,
         "orchestrator_guidance": gate["orchestrator_guidance"],
+        "debt_entries_added": len(unresolved_flags),
     }
 
 
-def _override_replan(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
+def _override_replan(root: Path, plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
     allowed = {STATE_GATED, STATE_FINALIZED, STATE_CRITIQUED}
     if state["current_state"] not in allowed:
         raise CliError(
@@ -1510,7 +1576,7 @@ def _override_replan(plan_dir: Path, state: PlanState, args: argparse.Namespace)
     }
 
 
-_OVERRIDE_ACTIONS: dict[str, Callable[[Path, PlanState, argparse.Namespace], StepResponse]] = {
+_OVERRIDE_ACTIONS: dict[str, Callable[[Path, Path, PlanState, argparse.Namespace], StepResponse]] = {
     "add-note": _override_add_note,
     "abort": _override_abort,
     "force-proceed": _override_force_proceed,
@@ -1524,4 +1590,4 @@ def handle_override(root: Path, args: argparse.Namespace) -> StepResponse:
     handler = _OVERRIDE_ACTIONS.get(action)
     if handler is None:
         raise CliError("invalid_override", f"Unknown override action: {action}")
-    return handler(plan_dir, state, args)
+    return handler(root, plan_dir, state, args)

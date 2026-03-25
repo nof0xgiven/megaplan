@@ -16,17 +16,24 @@ from megaplan.types import (
 )
 from megaplan._core import (
     active_plan_dirs,
+    add_or_increment_debt,
     atomic_write_text,
     compute_global_batches,
     config_dir,
+    debt_by_subsystem,
     detect_available_agents,
+    escalated_subsystems,
     ensure_runtime_layout,
     infer_next_steps,
     json_dump,
     load_config,
+    load_debt_registry,
     load_plan,
     read_json,
+    resolve_debt,
+    save_debt_registry,
     save_config,
+    subsystem_occurrence_total,
 )
 from megaplan.handlers import (
     handle_critique,
@@ -173,6 +180,83 @@ def handle_list(root: Path, args: argparse.Namespace) -> StepResponse:
         "summary": f"Found {len(items)} plans.",
         "plans": items,
     }
+
+
+def handle_debt(root: Path, args: argparse.Namespace) -> StepResponse:
+    ensure_runtime_layout(root)
+    action = args.debt_action
+    registry = load_debt_registry(root)
+    default_plan_id = getattr(args, "plan", None) or "manual"
+
+    if action == "list":
+        entries = registry["entries"] if args.all else [entry for entry in registry["entries"] if not entry["resolved"]]
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for entry in entries:
+            grouped.setdefault(entry["subsystem"], []).append(entry)
+        escalated = {
+            subsystem: total
+            for subsystem, total, _entries in escalated_subsystems(registry)
+        }
+        by_subsystem = [
+            {
+                "subsystem": subsystem,
+                "escalated": subsystem in escalated,
+                "total_occurrences": subsystem_occurrence_total(entries_for_subsystem)
+                if not args.all
+                else sum(entry["occurrence_count"] for entry in entries_for_subsystem if not entry["resolved"]),
+                "entries": entries_for_subsystem,
+            }
+            for subsystem, entries_for_subsystem in sorted(grouped.items())
+        ]
+        return {
+            "success": True,
+            "step": "debt",
+            "action": "list",
+            "summary": f"Found {len(entries)} debt entries across {len(by_subsystem)} subsystem groups.",
+            "details": {
+                "entries": entries,
+                "by_subsystem": by_subsystem,
+                "escalated_subsystems": [
+                    {"subsystem": subsystem, "total_occurrences": total}
+                    for subsystem, total in sorted(escalated.items())
+                ],
+            },
+        }
+
+    if action == "add":
+        flag_ids = [
+            flag_id.strip()
+            for flag_id in (args.flag_ids or "").split(",")
+            if flag_id.strip()
+        ]
+        entry = add_or_increment_debt(
+            registry,
+            subsystem=args.subsystem,
+            concern=args.concern,
+            flag_ids=flag_ids,
+            plan_id=default_plan_id,
+        )
+        save_debt_registry(root, registry)
+        return {
+            "success": True,
+            "step": "debt",
+            "action": "add",
+            "summary": f"Tracked debt entry {entry['id']} for subsystem '{entry['subsystem']}'.",
+            "details": {"entry": entry},
+        }
+
+    if action == "resolve":
+        entry = resolve_debt(registry, args.debt_id, default_plan_id)
+        save_debt_registry(root, registry)
+        return {
+            "success": True,
+            "step": "debt",
+            "action": "resolve",
+            "summary": f"Resolved debt entry {entry['id']}.",
+            "details": {"entry": entry},
+        }
+
+    raise CliError("invalid_args", f"Unknown debt action: {action}")
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +472,22 @@ def build_parser() -> argparse.ArgumentParser:
     override_parser.add_argument("--reason", default="")
     override_parser.add_argument("--note")
 
+    debt_parser = subparsers.add_parser("debt", help="Inspect or manage persistent tech debt entries")
+    debt_subparsers = debt_parser.add_subparsers(dest="debt_action", required=True)
+
+    debt_list_parser = debt_subparsers.add_parser("list", help="List debt entries")
+    debt_list_parser.add_argument("--all", action="store_true", help="Include resolved entries")
+
+    debt_add_parser = debt_subparsers.add_parser("add", help="Add or increment a debt entry")
+    debt_add_parser.add_argument("--subsystem", required=True)
+    debt_add_parser.add_argument("--concern", required=True)
+    debt_add_parser.add_argument("--flag-ids", default="")
+    debt_add_parser.add_argument("--plan")
+
+    debt_resolve_parser = debt_subparsers.add_parser("resolve", help="Resolve a debt entry")
+    debt_resolve_parser.add_argument("debt_id")
+    debt_resolve_parser.add_argument("--plan")
+
     return parser
 
 
@@ -404,6 +504,7 @@ COMMAND_HANDLERS: dict[str, Callable[..., StepResponse]] = {
     "audit": handle_audit,
     "progress": handle_progress,
     "list": handle_list,
+    "debt": handle_debt,
     "step": handle_step,
     "override": handle_override,
 }

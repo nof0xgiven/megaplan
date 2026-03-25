@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from megaplan.types import PlanState
-from megaplan._core import atomic_write_json, atomic_write_text, save_flag_registry
+from megaplan._core import (
+    atomic_write_json,
+    atomic_write_text,
+    load_debt_registry,
+    resolve_debt,
+    save_debt_registry,
+    save_flag_registry,
+)
 from megaplan.prompts import _execute_batch_prompt, create_claude_prompt, create_codex_prompt
 from megaplan.workers import _build_mock_payload
 
@@ -208,6 +215,35 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
     return plan_dir, state
 
 
+def _write_debt_registry(tmp_path: Path, entries: list[dict[str, object]]) -> None:
+    save_debt_registry(tmp_path, {"entries": entries})
+
+
+def _debt_entry(
+    *,
+    debt_id: str = "DEBT-001",
+    subsystem: str = "timeout-recovery",
+    concern: str = "timeout recovery: retry backoff remains brittle",
+    flag_ids: list[str] | None = None,
+    plan_ids: list[str] | None = None,
+    occurrence_count: int = 1,
+    resolved: bool = False,
+) -> dict[str, object]:
+    return {
+        "id": debt_id,
+        "subsystem": subsystem,
+        "concern": concern,
+        "flag_ids": flag_ids or ["FLAG-001"],
+        "plan_ids": plan_ids or ["plan-a"],
+        "occurrence_count": occurrence_count,
+        "created_at": "2026-03-20T00:00:00Z",
+        "updated_at": "2026-03-20T00:00:00Z",
+        "resolved": resolved,
+        "resolved_by": "plan-fixed" if resolved else None,
+        "resolved_at": "2026-03-21T00:00:00Z" if resolved else None,
+    }
+
+
 def test_plan_prompt_absorbs_clarification_when_missing(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     prompt = create_claude_prompt("plan", state, plan_dir)
@@ -251,6 +287,26 @@ def test_gate_prompt_includes_loop_signals_and_preflight(tmp_path: Path) -> None
     assert "PROCEED, ITERATE, ESCALATE" in prompt
 
 
+def test_gate_prompt_includes_escalated_debt_warning_when_threshold_met(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path, iteration=2)
+    _write_debt_registry(
+        tmp_path,
+        [
+            _debt_entry(
+                concern="timeout recovery: retry backoff remains brittle",
+                occurrence_count=4,
+                plan_ids=["plan-a", "plan-b", "plan-c"],
+            )
+        ],
+    )
+
+    prompt = create_codex_prompt("gate", state, plan_dir, root=tmp_path)
+
+    assert "Escalated debt subsystems" in prompt
+    assert '"total_occurrences": 4' in prompt
+    assert "holistic redesign" in prompt
+
+
 def test_review_prompt_includes_execution_and_gate(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     prompt = create_claude_prompt("review", state, plan_dir)
@@ -285,6 +341,27 @@ def test_critique_prompt_contains_intent_and_robustness(tmp_path: Path) -> None:
     assert "simplest approach" in prompt
     assert "Over-engineering:" in prompt
     assert "maintainability" in prompt
+
+
+def test_critique_prompt_includes_debt_context_when_registry_exists(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    _write_debt_registry(
+        tmp_path,
+        [
+            _debt_entry(
+                concern="timeout recovery: retry backoff remains brittle",
+                occurrence_count=2,
+                plan_ids=["plan-a", "plan-b"],
+            )
+        ],
+    )
+
+    prompt = create_claude_prompt("critique", state, plan_dir, root=tmp_path)
+
+    assert "Known accepted debt grouped by subsystem" in prompt
+    assert "timeout-recovery" in prompt
+    assert "retry backoff remains brittle" in prompt
+    assert "Do not re-flag them unless the current plan makes them worse" in prompt
 
 
 def test_critique_prompt_includes_structure_guidance_and_warnings(tmp_path: Path) -> None:
@@ -363,6 +440,40 @@ def test_execute_prompt_surfaces_sense_checks_and_watch_items(tmp_path: Path) ->
     assert "SC1 (T1): Did it work?" in prompt
     assert "Watch items to keep visible during execution:" in prompt
     assert "Check assumptions." in prompt
+
+
+def test_execute_prompt_includes_debt_watch_items(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    _write_debt_registry(
+        tmp_path,
+        [
+            _debt_entry(
+                concern="timeout recovery: retry backoff remains brittle",
+                occurrence_count=3,
+                plan_ids=["plan-a", "plan-b"],
+            )
+        ],
+    )
+
+    prompt = create_claude_prompt("execute", state, plan_dir, root=tmp_path)
+
+    assert "Debt watch items (do not make these worse):" in prompt
+    assert "[DEBT] timeout-recovery: timeout recovery: retry backoff remains brittle" in prompt
+    assert "flagged 3 times across 2 plans" in prompt
+
+
+def test_resolved_debt_no_longer_appears_in_subsequent_prompts(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    _write_debt_registry(tmp_path, [_debt_entry()])
+
+    before_prompt = create_claude_prompt("execute", state, plan_dir, root=tmp_path)
+    registry = load_debt_registry(tmp_path)
+    resolve_debt(registry, "DEBT-001", "plan-fixed")
+    save_debt_registry(tmp_path, registry)
+    after_prompt = create_claude_prompt("execute", state, plan_dir, root=tmp_path)
+
+    assert "retry backoff remains brittle" in before_prompt
+    assert "retry backoff remains brittle" not in after_prompt
 
 
 def test_execute_prompt_includes_finalize_path_and_checkpoint_instructions(tmp_path: Path) -> None:
@@ -473,15 +584,60 @@ def test_execute_batch_prompt_scopes_tasks_and_sense_checks(tmp_path: Path) -> N
             ],
         ),
     )
+    atomic_write_json(
+        plan_dir / "execution_batch_1.json",
+        _build_mock_payload(
+            "execute",
+            state,
+            plan_dir,
+            deviations=["Advisory quality: megaplan/prompts.py grew by 220 lines (threshold 200)."],
+        ),
+    )
     prompt = _execute_batch_prompt(state, plan_dir, ["T2"], {"T1"})
     assert "Execute batch 2 of 2." in prompt
     assert "Only produce `task_updates` for these tasks: [T2]" in prompt
     assert "Only produce `sense_check_acknowledgments` for these sense checks: [SC2]" in prompt
     assert '"id": "T2"' in prompt
     assert '"id": "SC2"' in prompt
+    assert "Prior batch deviations (address if applicable):" in prompt
+    assert "Advisory quality: megaplan/prompts.py grew by 220 lines (threshold 200)." in prompt
     # Batch prompt checkpoint should reference execution_batch_2.json, not finalize.json
     assert "execution_batch_2.json" in prompt
     assert "not `finalize.json`" in prompt.lower() or "harness owns" in prompt.lower()
+
+
+def test_execute_batch_prompt_handles_first_batch_without_prior_deviations(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    atomic_write_json(
+        plan_dir / "finalize.json",
+        _build_mock_payload(
+            "finalize",
+            state,
+            plan_dir,
+            tasks=[
+                {
+                    "id": "T1",
+                    "description": "First",
+                    "depends_on": [],
+                    "status": "pending",
+                    "executor_notes": "",
+                    "files_changed": [],
+                    "commands_run": [],
+                    "evidence_files": [],
+                    "reviewer_verdict": "",
+                }
+            ],
+            sense_checks=[
+                {"id": "SC1", "task_id": "T1", "question": "Done?", "executor_note": "", "verdict": ""},
+            ],
+        ),
+    )
+
+    prompt = _execute_batch_prompt(state, plan_dir, ["T1"], set())
+
+    assert "Execute batch 1 of 1." in prompt
+    assert "Prior batch deviations (address if applicable):" in prompt
+    assert "None" in prompt
 
 
 def test_review_prompt_gracefully_handles_missing_audit(tmp_path: Path) -> None:

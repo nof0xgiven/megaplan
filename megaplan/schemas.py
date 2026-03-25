@@ -94,6 +94,19 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                     "required": ["id", "decision"],
                 },
             },
+            "accepted_tradeoffs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "flag_id": {"type": "string"},
+                        "concern": {"type": "string"},
+                        "subsystem": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["flag_id", "concern"],
+                },
+            },
         },
         "required": ["recommendation", "rationale", "signals_assessment", "warnings", "settled_decisions"],
     },
