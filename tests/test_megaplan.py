@@ -1898,6 +1898,60 @@ def test_execute_timeout_recovers_partial_progress_from_finalize_json(
     assert state["sessions"][megaplan.workers.session_key_for("execute", "codex")]["id"] == "test-session"
 
 
+def test_execute_timeout_reads_execution_checkpoint_json(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    checkpoint_payload = {
+        "task_updates": [
+            {
+                "task_id": "T1",
+                "status": "done",
+                "executor_notes": "Recovered from execution checkpoint.",
+                "files_changed": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+                "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
+            }
+        ],
+        "sense_check_acknowledgments": [
+            {"sense_check_id": "SC1", "executor_note": "Recovered checkpoint sense check."}
+        ],
+    }
+    (plan_fixture.plan_dir / "execution_checkpoint.json").write_text(
+        json.dumps(checkpoint_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    def timing_out_worker(*args, **kwargs):
+        raise megaplan.CliError("worker_timeout", "execute timed out", extra={"session_id": "checkpoint-session", "raw_output": ""})
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", timing_out_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    recovered = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert response["success"] is False
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert recovered["tasks"][0]["status"] == "done"
+    assert recovered["tasks"][0]["files_changed"] == ["IMPLEMENTED_BY_MEGAPLAN.txt"]
+    assert recovered["sense_checks"][0]["executor_note"] == "Recovered checkpoint sense check."
+    assert any(
+        "Recovered timeout checkpoint from execution_checkpoint.json" in deviation
+        for deviation in response["deviations"]
+    )
+
+
 def test_execute_timeout_resets_done_tasks_without_any_evidence(
     plan_fixture: PlanFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -3103,6 +3157,56 @@ def test_batch_1_on_two_batch_plan_stays_finalized(
     assert finalize_data["tasks"][1]["status"] == "pending"
 
 
+def test_batch_timeout_reads_execution_batch_n_json(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+
+    checkpoint_payload = {
+        "task_updates": [
+            {
+                "task_id": "T1",
+                "status": "done",
+                "executor_notes": "Recovered from batch checkpoint.",
+                "files_changed": ["batch1.py"],
+                "commands_run": ["pytest -k batch1"],
+            }
+        ],
+        "sense_check_acknowledgments": [
+            {"sense_check_id": "SC1", "executor_note": "Recovered batch checkpoint sense check."}
+        ],
+    }
+    (plan_fixture.plan_dir / "execution_batch_1.json").write_text(
+        json.dumps(checkpoint_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    def timing_out_batch_worker(*args, **kwargs):
+        raise megaplan.CliError("worker_timeout", "execute timed out", extra={"session_id": "batch-timeout", "raw_output": ""})
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", timing_out_batch_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=1),
+    )
+    recovered = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert response["success"] is False
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert response["next_step"] == "execute"
+    assert recovered["tasks"][0]["status"] == "done"
+    assert recovered["tasks"][0]["files_changed"] == ["batch1.py"]
+    assert recovered["tasks"][1]["status"] == "pending"
+    assert recovered["sense_checks"][0]["executor_note"] == "Recovered batch checkpoint sense check."
+    assert any(
+        "Recovered timeout checkpoint from execution_batch_1.json" in deviation
+        for deviation in response["deviations"]
+    )
+
+
 def test_batch_2_after_batch_1_transitions_to_executed(
     plan_fixture: PlanFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -3202,6 +3306,50 @@ def test_batch_1_on_single_batch_plan_transitions_to_executed(
     assert response["next_step"] == "review"
     assert (plan_fixture.plan_dir / "execution_batch_1.json").exists()
     assert (plan_fixture.plan_dir / "execution.json").exists()
+
+
+def test_batch_1_incomplete_tracking_returns_blocked(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_two_batch_plan(plan_fixture)
+    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+
+    def incomplete_batch_worker(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
+        assert prompt_override is not None
+        return WorkerResult(
+            payload={
+                "output": "Batch one incomplete.",
+                "files_changed": [],
+                "commands_run": [],
+                "deviations": [],
+                "task_updates": [],
+                "sense_check_acknowledgments": [],
+            },
+            raw_output="batch incomplete",
+            duration_ms=1,
+            cost_usd=0.0,
+            session_id="batch-incomplete",
+        ), "codex", "persistent", False
+
+    monkeypatch.setattr(megaplan.workers, "run_step_with_worker", incomplete_batch_worker)
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        plan_fixture.make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True, batch=1),
+    )
+    state = load_state(plan_fixture.plan_dir)
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert response["success"] is False
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert response["next_step"] == "execute"
+    assert response["summary"] == (
+        "Blocked: 1/1 tasks have no executor update; 1/1 sense checks have no executor acknowledgment. "
+        "Re-run execute to complete tracking."
+    )
+    assert finalize_data["tasks"][0]["status"] == "pending"
+    assert state["history"][-1]["result"] == "blocked"
 
 
 def test_review_works_after_batch_by_batch_execution(
