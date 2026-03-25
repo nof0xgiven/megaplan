@@ -396,6 +396,26 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         for item in watch_items:
             nudge_lines.append(f"- {item}")
     execution_nudges = "\n".join(nudge_lines)
+    tasks = finalize_data.get("tasks", [])
+    done_tasks = [t for t in tasks if t.get("status") in ("done", "skipped")]
+    pending_tasks = [t for t in tasks if t.get("status") == "pending"]
+    if done_tasks and pending_tasks:
+        done_ids = ", ".join(t["id"] for t in done_tasks)
+        pending_ids = ", ".join(t["id"] for t in pending_tasks)
+        rerun_guidance = (
+            f"Re-execution: {len(done_tasks)} tasks already tracked ({done_ids}). "
+            f"Focus on the {len(pending_tasks)} remaining tasks ({pending_ids}). "
+            "You must still return task_updates for ALL tasks (including already-tracked ones) — "
+            "for previously done tasks, preserve their existing status and notes."
+        )
+    elif done_tasks and not pending_tasks:
+        rerun_guidance = (
+            "Re-execution: all tasks are already tracked but execution was blocked or kicked back. "
+            "Check the review findings above and address the specific issues raised. "
+            "Return task_updates for all tasks with updated evidence where needed."
+        )
+    else:
+        rerun_guidance = ""
     if state["config"].get("auto_approve"):
         approval_note = (
             "Note: User chose auto-approve mode. This execution was not manually "
@@ -424,6 +444,8 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         {json_dump(gate).strip()}
 
         {prior_review_block}
+
+        {rerun_guidance}
 
         {approval_note}
         Robustness level: {robustness}.
