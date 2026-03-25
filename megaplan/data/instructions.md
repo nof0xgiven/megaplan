@@ -52,7 +52,7 @@ megaplan override replan --plan <name> --reason "expanding scope" --note "Also c
 ```
 After `replan`, read the returned plan file, edit it directly, then run `megaplan critique`.
 ## Step Editing
-Use `step` when you need to insert, remove, or reorder `## Step N:` sections without hand-editing the markdown.
+Use `step` when you need to insert, remove, or reorder step sections (`## Step N:` or `### Step N:`) without hand-editing the markdown.
 ```bash
 megaplan step add --plan <name> --after S3 "Add regression coverage for the parser"
 megaplan step remove --plan <name> S4

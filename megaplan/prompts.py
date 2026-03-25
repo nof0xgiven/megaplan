@@ -28,18 +28,20 @@ from megaplan.types import FlagRegistry
 
 PLAN_TEMPLATE = textwrap.dedent(
     """
-    Plan template (adapt to the actual repo and scope):
+    Plan template — simple format (adapt to the actual repo and scope):
     ````md
     # Implementation Plan: [Title]
 
     ## Overview
     Summarize the goal, current repository shape, and the constraints that matter.
 
-    ## Step 1: Audit the current behavior (`megaplan/prompts.py`)
+    ## Main Phase
+
+    ### Step 1: Audit the current behavior (`megaplan/prompts.py`)
     **Scope:** Small
     1. **Inspect** the current implementation and call out the exact insertion points (`megaplan/prompts.py:29`).
 
-    ## Step 2: Add the first change (`megaplan/evaluation.py`)
+    ### Step 2: Add the first change (`megaplan/evaluation.py`)
     **Scope:** Medium
     1. **Implement** the smallest viable change with exact file references (`megaplan/evaluation.py:1`).
     2. **Capture** any tricky behavior with a short example.
@@ -47,11 +49,11 @@ PLAN_TEMPLATE = textwrap.dedent(
        issues = validate_plan_structure(plan_text)
        ```
 
-    ## Step 3: Wire downstream behavior (`megaplan/handlers.py`, `megaplan/workers.py`)
+    ### Step 3: Wire downstream behavior (`megaplan/handlers.py`, `megaplan/workers.py`)
     **Scope:** Medium
     1. **Update** the runtime flow in the touched files (`megaplan/handlers.py:400`, `megaplan/workers.py:199`).
 
-    ## Step 4: Prove the change (`tests/test_evaluation.py`, `tests/test_megaplan.py`)
+    ### Step 4: Prove the change (`tests/test_evaluation.py`, `tests/test_megaplan.py`)
     **Scope:** Small
     1. **Run** the cheapest targeted checks first (`tests/test_evaluation.py:1`).
     2. **Finish** with broader verification once the wiring is in place (`tests/test_megaplan.py:1`).
@@ -65,10 +67,27 @@ PLAN_TEMPLATE = textwrap.dedent(
     2. Run the broader suite after the flow changes are in place.
     ````
 
+    For complex plans, use multiple phases:
+    ````md
+    ## Phase 1: Foundation — Dependencies, DB, Types
+
+    ### Step 1: Install dependencies (`package.json`)
+    ...
+
+    ### Step 2: Create database migration (`supabase/migrations/`)
+    ...
+
+    ## Phase 2: Core Integration
+
+    ### Step 3: Port the main component (`src/components/`)
+    ...
+    ````
+
     Template guidance:
-    - Plans with 2-3 steps can collapse `## Execution Order` and `## Validation Order` into one ordering section.
-    - Plans with 15+ steps should use the full structure and group work into coherent phases when helpful.
-    - Key invariants: one H1 title, one `## Overview`, numbered `## Step N:` sections, and at least one ordering section.
+    - Simple plans: use `## Main Phase` with `### Step N:` sections underneath.
+    - Complex plans: use multiple `## Phase N:` sections, each containing `### Step N:` steps. Step numbers are global (not per-phase).
+    - The flat `## Step N:` format (without phases) also works for backwards compatibility.
+    - Key invariants: one H1 title, one `## Overview`, numbered step sections (`### Step N:` or `## Step N:`), and at least one ordering section.
     """
 ).strip()
 
@@ -154,7 +173,7 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
         - Preserve or improve success criteria quality.
         - Verify that the plan remains aligned with the user's original intent, not just internal plan quality.
         - Remove unjustified scope growth. If critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
-        - Maintain the structural template: H1 title, ## Overview, numbered ## Step N sections, ## Execution Order or ## Validation Order.
+        - Maintain the structural template: H1 title, ## Overview, phase sections with numbered step sections, ## Execution Order or ## Validation Order.
 
         {PLAN_TEMPLATE}
         """
@@ -206,7 +225,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path) -> str:
         - Focus on concrete issues that would cause real problems.
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
         - Verify that the plan remains aligned with the user's original intent.
-        - Verify that the plan follows the expected structure: one H1 title, `## Overview`, numbered `## Step N:` sections with file references and numbered substeps, plus `## Execution Order` or `## Validation Order`. Missing structure should be flagged as category `completeness` with severity_hint `likely-significant`.
+        - Verify that the plan follows the expected structure: one H1 title, `## Overview`, numbered step sections (`### Step N:` under `## Phase` headers, or flat `## Step N:`) with file references and numbered substeps, plus `## Execution Order` or `## Validation Order`. Missing structure should be flagged as category `completeness` with severity_hint `likely-significant`.
         - Flag scope creep explicitly when the plan grows beyond the original idea or recorded user notes. Use the phrase "Scope creep:" in the concern.
         - Assign severity_hint carefully. Implementation details the executor will naturally resolve should usually be `likely-minor`.
         """

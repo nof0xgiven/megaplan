@@ -373,16 +373,24 @@ def _default_step_insert_index(sections: list[PlanSection]) -> int:
     return len(sections)
 
 
-def _make_step_scaffold(description: str) -> PlanSection:
+def _make_step_scaffold(description: str, *, heading_level: str = "##") -> PlanSection:
     clean_description = description.strip()
     if not clean_description:
         raise CliError("invalid_args", "step add requires a non-empty description")
     body = (
-        f"## Step 0: {clean_description}\n"
+        f"{heading_level} Step 0: {clean_description}\n"
         "**Scope:** Small\n"
         "1. **TODO** Fill in implementation details (`path/to/file`).\n\n"
     )
-    return PlanSection(heading=f"## Step 0: {clean_description}", body=body, id="S0", start_line=0, end_line=0)
+    return PlanSection(heading=f"{heading_level} Step 0: {clean_description}", body=body, id="S0", start_line=0, end_line=0)
+
+
+def _detect_step_heading_level(sections: list[PlanSection]) -> str:
+    """Detect whether existing steps use ## or ### headings."""
+    for section in sections:
+        if section.id is not None and section.heading.startswith("### "):
+            return "###"
+    return "##"
 
 
 def _commit_step_edit(
@@ -445,7 +453,7 @@ def _commit_step_edit(
 
 def _step_add(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
     sections = parse_plan_sections(latest_plan_path(plan_dir, state).read_text(encoding="utf-8"))
-    new_section = _make_step_scaffold(args.description)
+    new_section = _make_step_scaffold(args.description, heading_level=_detect_step_heading_level(sections))
     if args.after:
         after_step_id = _normalize_step_id(args.after, label="--after")
         insert_index = _step_section_index(sections, after_step_id) + 1

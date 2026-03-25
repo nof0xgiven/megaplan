@@ -31,9 +31,11 @@ from megaplan._core import (
 )
 
 
-PLAN_STRUCTURE_REQUIRED_STEP_ISSUE = "Plan must include at least one `## Step N:` section."
+PLAN_STRUCTURE_REQUIRED_STEP_ISSUE = "Plan must include at least one step section (`## Step N:` or `### Step N:` under a phase)."
 _PLAN_HEADING_RE = re.compile(r"^##\s+.+$")
+_PLAN_PHASE_HEADING_RE = re.compile(r"^###\s+.+$")
 _PLAN_STEP_RE = re.compile(r"^##\s+Step\s+(\d+):\s+.+$")
+_PLAN_PHASE_STEP_RE = re.compile(r"^###\s+Step\s+(\d+):\s+.+$")
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,16 @@ def _strip_fenced_blocks(text: str) -> str:
     return "".join(kept_lines)
 
 
+def _match_section_boundary(line: str) -> tuple[bool, str | None]:
+    """Check if a line is a section boundary. Returns (is_boundary, section_id)."""
+    step_match = _PLAN_STEP_RE.match(line) or _PLAN_PHASE_STEP_RE.match(line)
+    if step_match:
+        return True, f"S{step_match.group(1)}"
+    if _PLAN_HEADING_RE.match(line) or _PLAN_PHASE_HEADING_RE.match(line):
+        return True, None
+    return False, None
+
+
 def parse_plan_sections(plan_text: str) -> list[PlanSection]:
     lines = plan_text.splitlines(keepends=True)
     if not lines:
@@ -121,21 +133,19 @@ def parse_plan_sections(plan_text: str) -> list[PlanSection]:
                 fence_open_line = index
             inside_fence = not inside_fence
             continue
-        if inside_fence or not _PLAN_HEADING_RE.match(line):
+        if inside_fence:
             continue
-        step_match = _PLAN_STEP_RE.match(line)
-        section_id = f"S{step_match.group(1)}" if step_match else None
-        boundaries.append((index, index + 1, line.rstrip("\n"), section_id))
+        is_boundary, section_id = _match_section_boundary(line)
+        if is_boundary:
+            boundaries.append((index, index + 1, line.rstrip("\n"), section_id))
 
     if inside_fence:
         # Unclosed fence — re-scan ignoring fence state so we don't silently lose sections
         boundaries = []
         for index, line in enumerate(lines):
-            if not _PLAN_HEADING_RE.match(line):
-                continue
-            step_match = _PLAN_STEP_RE.match(line)
-            section_id = f"S{step_match.group(1)}" if step_match else None
-            boundaries.append((index, index + 1, line.rstrip("\n"), section_id))
+            is_boundary, section_id = _match_section_boundary(line)
+            if is_boundary:
+                boundaries.append((index, index + 1, line.rstrip("\n"), section_id))
 
     if not boundaries:
         return [PlanSection(heading="", body=plan_text, id=None, start_line=1, end_line=len(lines))]
@@ -178,8 +188,14 @@ def renumber_steps(sections: list[PlanSection]) -> list[PlanSection]:
         if section.id is None:
             renumbered.append(section)
             continue
-        new_heading = re.sub(r"^##\s+Step\s+\d+:", f"## Step {step_number}:", section.heading, count=1)
-        new_body = re.sub(r"^##\s+Step\s+\d+:", f"## Step {step_number}:", section.body, count=1, flags=re.MULTILINE)
+        # Detect heading level (## or ###) and preserve it
+        step_prefix_match = re.match(r"^(#{2,3})\s+Step\s+\d+:", section.heading)
+        if not step_prefix_match:
+            renumbered.append(section)
+            continue
+        hashes = step_prefix_match.group(1)
+        new_heading = re.sub(rf"^{hashes}\s+Step\s+\d+:", f"{hashes} Step {step_number}:", section.heading, count=1)
+        new_body = re.sub(rf"^{hashes}\s+Step\s+\d+:", f"{hashes} Step {step_number}:", section.body, count=1, flags=re.MULTILINE)
         renumbered.append(
             PlanSection(
                 heading=new_heading,
@@ -202,7 +218,8 @@ def validate_plan_structure(plan_text: str) -> list[str]:
     if not re.search(r"(?mi)^##\s+Overview\s*$", stripped):
         issues.append("Plan should include a `## Overview` section.")
 
-    step_matches = list(re.finditer(r"(?im)^##\s+Step\s+\d+:\s+.+$", stripped))
+    # Accept both flat (## Step N:) and hierarchical (### Step N: under ## Phase)
+    step_matches = list(re.finditer(r"(?im)^#{2,3}\s+Step\s+\d+:\s+.+$", stripped))
     if not step_matches:
         issues.append(PLAN_STRUCTURE_REQUIRED_STEP_ISSUE)
         return issues
@@ -217,7 +234,7 @@ def validate_plan_structure(plan_text: str) -> list[str]:
     missing_file_refs = False
     for index, match in enumerate(step_matches):
         start = match.end()
-        next_heading = re.search(r"(?im)^##\s+.+$", stripped[start:])
+        next_heading = re.search(r"(?im)^#{2,3}\s+.+$", stripped[start:])
         end = start + next_heading.start() if next_heading else len(stripped)
         section = stripped[match.start():end]
         if not re.search(r"(?m)^\d+\.\s+", stripped[start:end]):
@@ -226,9 +243,9 @@ def validate_plan_structure(plan_text: str) -> list[str]:
             missing_file_refs = True
 
     if missing_substeps:
-        issues.append("Each `## Step N:` section should include at least one numbered substep.")
+        issues.append("Each step section should include at least one numbered substep.")
     if missing_file_refs:
-        issues.append("Each `## Step N:` section should reference at least one file in backticks.")
+        issues.append("Each step section should reference at least one file in backticks.")
     return issues
 
 

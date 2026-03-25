@@ -384,7 +384,7 @@ No numbered substeps here.
 1. Run unit tests first.
 """
     issues = validate_plan_structure(plan)
-    assert "Each `## Step N:` section should include at least one numbered substep." in issues
+    assert "Each step section should include at least one numbered substep." in issues
 
 
 def test_validate_plan_structure_warns_when_ordering_sections_missing() -> None:
@@ -466,6 +466,81 @@ code without closing fence
     step_ids = [s.id for s in sections if s.id is not None]
     assert "S1" in step_ids
     assert "S2" in step_ids
+
+
+def test_validate_plan_structure_accepts_phase_format() -> None:
+    plan = """# Implementation Plan: Complex Feature
+
+## Overview
+Multi-phase integration.
+
+## Phase 1: Foundation
+
+### Step 1: Install dependencies (`package.json`)
+**Scope:** Small
+1. **Install** the required packages (`package.json:1`).
+
+### Step 2: Create migration (`supabase/migrations/`)
+**Scope:** Small
+1. **Create** the database table (`supabase/migrations/001.sql:1`).
+
+## Phase 2: Core Integration
+
+### Step 3: Port the component (`src/components/Editor.tsx`)
+**Scope:** Medium
+1. **Copy** and adapt the component (`src/components/Editor.tsx:1`).
+
+## Execution Order
+1. Foundation before integration.
+
+## Validation Order
+1. Run tests after each phase.
+"""
+    assert validate_plan_structure(plan) == []
+
+
+def test_parse_plan_sections_phase_format() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summary.
+
+## Main Phase
+
+### Step 1: First step (`a.py`)
+1. **Do** the thing (`a.py:1`).
+
+### Step 2: Second step (`b.py`)
+1. **Do** the other thing (`b.py:1`).
+"""
+    sections = parse_plan_sections(plan)
+    step_ids = [s.id for s in sections if s.id is not None]
+    assert step_ids == ["S1", "S2"]
+    # Phase header has no id
+    phase_sections = [s for s in sections if "Main Phase" in s.heading]
+    assert len(phase_sections) == 1
+    assert phase_sections[0].id is None
+
+
+def test_renumber_steps_phase_format() -> None:
+    plan = """# Implementation Plan: Example
+
+## Overview
+Summary.
+
+## Main Phase
+
+### Step 1: First step (`a.py`)
+1. **Do** the first part (`a.py:1`).
+
+### Step 5: Skipped numbering (`c.py`)
+1. **Do** the third part (`c.py:1`).
+"""
+    sections = parse_plan_sections(plan)
+    renumbered = renumber_steps(sections)
+    step_sections = [s for s in renumbered if s.id is not None]
+    assert [s.id for s in step_sections] == ["S1", "S2"]
+    assert "### Step 2: Skipped numbering (`c.py`)" in step_sections[1].body
 
 
 def test_render_final_md_none_meta_commentary() -> None:
