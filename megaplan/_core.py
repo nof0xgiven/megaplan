@@ -111,11 +111,21 @@ def render_final_md(finalize_data: dict[str, Any], *, phase: str = "finalize") -
         elif show_execution_gaps and status != "pending":
             lines.append("  Executor notes: [MISSING]")
             gap_counts["Executor notes missing"] = gap_counts.get("Executor notes missing", 0) + 1
+        files_changed = task.get("files_changed", [])
+        if files_changed:
+            lines.append("  Files changed:")
+            for path in files_changed:
+                lines.append(f"    - {path}")
         if show_execution_gaps and status == "pending":
             gap_counts["Tasks without executor updates"] = gap_counts.get("Tasks without executor updates", 0) + 1
         reviewer_verdict = task.get("reviewer_verdict", "")
         if reviewer_verdict.strip():
             lines.append(f"  Reviewer verdict: {reviewer_verdict}")
+            evidence_files = task.get("evidence_files", [])
+            if evidence_files:
+                lines.append("  Evidence files:")
+                for path in evidence_files:
+                    lines.append(f"    - {path}")
         elif show_review_gaps:
             lines.append("  Reviewer verdict: [PENDING]")
             gap_counts["Reviewer verdicts pending"] = gap_counts.get("Reviewer verdicts pending", 0) + 1
@@ -134,6 +144,12 @@ def render_final_md(finalize_data: dict[str, Any], *, phase: str = "finalize") -
     if sense_checks:
         for sense_check in sense_checks:
             lines.append(f"- **{sense_check['id']}** ({sense_check['task_id']}): {sense_check['question']}")
+            executor_note = sense_check.get("executor_note", "")
+            if executor_note.strip():
+                lines.append(f"  Executor note: {executor_note}")
+            elif show_execution_gaps:
+                lines.append("  Executor note: [MISSING]")
+                gap_counts["Sense-check acknowledgments missing"] = gap_counts.get("Sense-check acknowledgments missing", 0) + 1
             verdict = sense_check.get("verdict", "")
             if verdict.strip():
                 lines.append(f"  Verdict: {verdict}")

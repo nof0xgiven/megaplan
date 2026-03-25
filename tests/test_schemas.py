@@ -136,25 +136,36 @@ def test_finalize_schema_tracks_structured_execution_fields() -> None:
         "depends_on",
         "status",
         "executor_notes",
+        "files_changed",
+        "commands_run",
+        "evidence_files",
         "reviewer_verdict",
     }
     assert task_schema["properties"]["status"]["enum"] == ["pending", "done", "skipped"]
+    assert "executor_note" in finalize["properties"]["sense_checks"]["items"]["properties"]
 
 
 def test_execution_schema_requires_task_updates() -> None:
     execution = SCHEMAS["execution.json"]
     assert "task_updates" in execution["properties"]
     assert "task_updates" in execution["required"]
+    assert "sense_check_acknowledgments" in execution["properties"]
+    assert "sense_check_acknowledgments" in execution["required"]
     item_schema = execution["properties"]["task_updates"]["items"]
     assert item_schema["properties"]["status"]["enum"] == ["done", "skipped"]
+    assert "files_changed" in item_schema["properties"]
+    assert "commands_run" in item_schema["properties"]
 
 
 def test_review_schema_requires_task_and_sense_check_verdicts() -> None:
     review = SCHEMAS["review.json"]
+    assert "review_verdict" in review["properties"]
     assert "task_verdicts" in review["properties"]
     assert "sense_check_verdicts" in review["properties"]
+    assert "review_verdict" in review["required"]
     assert "task_verdicts" in review["required"]
     assert "sense_check_verdicts" in review["required"]
+    assert "evidence_files" in review["properties"]["task_verdicts"]["items"]["properties"]
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +196,10 @@ def test_strict_schema_new_tracking_objects_are_strict() -> None:
         "depends_on",
         "status",
         "executor_notes",
+        "files_changed",
+        "commands_run",
+        "evidence_files",
         "reviewer_verdict",
     }
     assert sense_check_schema["additionalProperties"] is False
-    assert set(sense_check_schema["required"]) == {"id", "task_id", "question", "verdict"}
+    assert set(sense_check_schema["required"]) == {"id", "task_id", "question", "executor_note", "verdict"}

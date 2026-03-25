@@ -133,7 +133,18 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
             "files_changed": [],
             "commands_run": [],
             "deviations": [],
-            "task_updates": [{"task_id": "T1", "status": "done", "executor_notes": "Implemented."}],
+            "task_updates": [
+                {
+                    "task_id": "T1",
+                    "status": "done",
+                    "executor_notes": "Implemented.",
+                    "files_changed": ["megaplan/prompts.py"],
+                    "commands_run": ["pytest tests/test_prompts.py"],
+                }
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Confirmed prompt coverage."}
+            ],
         },
     )
     atomic_write_json(
@@ -146,11 +157,22 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
                     "depends_on": [],
                     "status": "done",
                     "executor_notes": "Implemented.",
+                    "files_changed": ["megaplan/prompts.py"],
+                    "commands_run": ["pytest tests/test_prompts.py"],
+                    "evidence_files": [],
                     "reviewer_verdict": "",
                 }
             ],
             "watch_items": ["Check assumptions."],
-            "sense_checks": [{"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""}],
+            "sense_checks": [
+                {
+                    "id": "SC1",
+                    "task_id": "T1",
+                    "question": "Did it work?",
+                    "executor_note": "Confirmed prompt coverage.",
+                    "verdict": "",
+                }
+            ],
             "meta_commentary": "Stay focused.",
         },
     )
@@ -295,6 +317,8 @@ def test_execute_prompt_auto_approve_note(tmp_path: Path) -> None:
     prompt = create_claude_prompt("execute", state, plan_dir)
     assert "auto-approve" in prompt
     assert "task_updates" in prompt
+    assert "sense_check_acknowledgments" in prompt
+    assert '"files_changed": ["megaplan/handlers.py"' in prompt
 
 
 def test_execute_prompt_user_approved_note(tmp_path: Path) -> None:
@@ -330,12 +354,51 @@ def test_review_prompts_request_verdict_arrays(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
     claude_prompt = create_claude_prompt("review", state, plan_dir)
     codex_prompt = create_codex_prompt("review", state, plan_dir)
+    assert "review_verdict" in claude_prompt
     assert "task_verdicts" in claude_prompt
     assert "sense_check_verdicts" in claude_prompt
+    assert "evidence_files" in claude_prompt
+    assert "execution_audit.json" in claude_prompt
+    assert "needs_rework" in claude_prompt
+    assert "review_verdict" in codex_prompt
     assert "task_verdicts" in codex_prompt
     assert "sense_check_verdicts" in codex_prompt
+    assert "evidence_files" in codex_prompt
+    assert "execution_audit.json" in codex_prompt
+    assert "needs_rework" in codex_prompt
     assert "final.md" not in claude_prompt
     assert "final.md" not in codex_prompt
+
+
+def test_execute_prompt_includes_previous_review_when_present(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    atomic_write_json(
+        plan_dir / "review.json",
+        {
+            "review_verdict": "needs_rework",
+            "criteria": [],
+            "issues": ["Need another execute pass."],
+            "summary": "Rework needed.",
+            "task_verdicts": [
+                {
+                    "task_id": "T1",
+                    "reviewer_verdict": "Incomplete implementation.",
+                    "evidence_files": ["megaplan/prompts.py"],
+                }
+            ],
+            "sense_check_verdicts": [{"sense_check_id": "SC1", "verdict": "Needs follow-up."}],
+        },
+    )
+    prompt = create_claude_prompt("execute", state, plan_dir)
+    assert "Previous review findings to address" in prompt
+    assert "Need another execute pass." in prompt
+
+
+def test_review_prompt_gracefully_handles_missing_audit(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    prompt = create_claude_prompt("review", state, plan_dir)
+    assert "not present" in prompt
+    assert "Skip that artifact gracefully" in prompt
 
 
 def test_plan_prompt_includes_notes_when_present(tmp_path: Path) -> None:

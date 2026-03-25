@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -36,6 +37,45 @@ _PLAN_HEADING_RE = re.compile(r"^##\s+.+$")
 _PLAN_PHASE_HEADING_RE = re.compile(r"^###\s+.+$")
 _PLAN_STEP_RE = re.compile(r"^##\s+Step\s+(\d+):\s+.+$")
 _PLAN_PHASE_STEP_RE = re.compile(r"^###\s+Step\s+(\d+):\s+.+$")
+_PATH_TOKEN_RE = re.compile(r"`([^`\n]+)`|(?<!\w)([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)(?!\w)")
+_FILE_SUFFIXES = (
+    ".cfg",
+    ".cs",
+    ".css",
+    ".go",
+    ".html",
+    ".ini",
+    ".java",
+    ".js",
+    ".json",
+    ".jsx",
+    ".lock",
+    ".md",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".yaml",
+    ".yml",
+)
+_GENERIC_ACKS = {
+    "ack",
+    "checked",
+    "confirmed",
+    "done",
+    "good",
+    "looks good",
+    "n/a",
+    "na",
+    "ok",
+    "verified",
+    "yes",
+}
 
 
 @dataclass(frozen=True)
@@ -45,6 +85,147 @@ class PlanSection:
     id: str | None
     start_line: int
     end_line: int
+
+
+def _normalize_repo_path(path: str) -> str:
+    return Path(path.strip()).as_posix()
+
+
+def _parse_git_status_paths(stdout: str) -> set[str]:
+    paths: set[str] = set()
+    for raw_line in stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        path_text = raw_line[3:].strip() if len(raw_line) >= 4 else raw_line.strip()
+        if " -> " in path_text:
+            path_text = path_text.split(" -> ", 1)[1]
+        cleaned = path_text.strip().strip('"')
+        if cleaned:
+            paths.add(_normalize_repo_path(cleaned))
+    return paths
+
+
+def _extract_note_paths(text: str) -> set[str]:
+    paths: set[str] = set()
+    for match in _PATH_TOKEN_RE.finditer(text):
+        token = match.group(1) or match.group(2) or ""
+        cleaned = token.strip().strip(".,:;()[]{}<>\"'")
+        if not cleaned or cleaned.startswith(("http://", "https://")):
+            continue
+        if "/" not in cleaned and not cleaned.endswith(_FILE_SUFFIXES):
+            continue
+        if " " in cleaned:
+            continue
+        paths.add(_normalize_repo_path(cleaned))
+    return paths
+
+
+def _is_perfunctory_ack(note: str) -> bool:
+    normalized = normalize_text(note)
+    return len(note.strip()) < 10 or normalized in _GENERIC_ACKS
+
+
+def validate_execution_evidence(finalize_data: dict[str, Any], project_dir: Path) -> dict[str, Any]:
+    findings: list[str] = []
+    files_claimed = sorted(
+        {
+            _normalize_repo_path(path)
+            for task in finalize_data.get("tasks", [])
+            for path in task.get("files_changed", [])
+            if isinstance(path, str) and path.strip()
+        }
+    )
+
+    if not (project_dir / ".git").exists():
+        return {
+            "findings": findings,
+            "files_in_diff": [],
+            "files_claimed": files_claimed,
+            "skipped": True,
+            "reason": "Project directory is not a git repository.",
+        }
+
+    try:
+        process = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=str(project_dir),
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        return {
+            "findings": findings,
+            "files_in_diff": [],
+            "files_claimed": files_claimed,
+            "skipped": True,
+            "reason": "git not found on PATH.",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "findings": findings,
+            "files_in_diff": [],
+            "files_claimed": files_claimed,
+            "skipped": True,
+            "reason": "git status timed out.",
+        }
+
+    if process.returncode != 0:
+        return {
+            "findings": findings,
+            "files_in_diff": [],
+            "files_claimed": files_claimed,
+            "skipped": True,
+            "reason": f"git status failed: {process.stderr.strip() or process.stdout.strip()}",
+        }
+
+    files_in_diff = sorted(_parse_git_status_paths(process.stdout))
+    claimed_set = set(files_claimed)
+    diff_set = set(files_in_diff)
+
+    phantom_claims = sorted(claimed_set - diff_set)
+    if phantom_claims:
+        findings.append(
+            "Executor claimed changed files not present in git status: "
+            + ", ".join(phantom_claims)
+        )
+
+    unclaimed_changes = sorted(diff_set - claimed_set)
+    if unclaimed_changes:
+        findings.append(
+            "Git status shows changed files not claimed by any task: "
+            + ", ".join(unclaimed_changes)
+        )
+
+    for task in finalize_data.get("tasks", []):
+        task_id = task.get("id", "?")
+        note = task.get("executor_notes", "")
+        if not isinstance(note, str) or not note.strip():
+            continue
+        for note_path in sorted(_extract_note_paths(note)):
+            if not (project_dir / note_path).exists():
+                findings.append(
+                    f"Task {task_id} executor_notes references missing artifact '{note_path}'."
+                )
+
+    for sense_check in finalize_data.get("sense_checks", []):
+        sense_check_id = sense_check.get("id", "?")
+        note = sense_check.get("executor_note", "")
+        if not isinstance(note, str) or not note.strip():
+            findings.append(f"Sense check {sense_check_id} is missing an executor acknowledgment.")
+            continue
+        if _is_perfunctory_ack(note):
+            findings.append(
+                f"Sense check {sense_check_id} acknowledgment is perfunctory: {note.strip()!r}."
+            )
+
+    return {
+        "findings": findings,
+        "files_in_diff": files_in_diff,
+        "files_claimed": files_claimed,
+        "skipped": False,
+        "reason": "",
+    }
 
 
 def flag_weight(flag: FlagRecord) -> float:

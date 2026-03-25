@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from megaplan.evaluation import (
     PLAN_STRUCTURE_REQUIRED_STEP_ISSUE,
@@ -16,6 +19,7 @@ from megaplan.evaluation import (
     parse_plan_sections,
     reassemble_plan,
     renumber_steps,
+    validate_execution_evidence,
     validate_plan_structure,
 )
 
@@ -553,6 +557,120 @@ def test_render_final_md_none_meta_commentary() -> None:
     }
     result = render_final_md(data)
     assert "None." in result  # Should not crash
+
+
+def test_validate_execution_evidence_flags_diff_mismatches_and_weak_notes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    (project_dir / ".git").mkdir(parents=True)
+    (project_dir / "src").mkdir()
+    (project_dir / "docs").mkdir()
+    (project_dir / "src" / "existing.py").write_text("print('ok')\n", encoding="utf-8")
+    (project_dir / "docs" / "new_name.py").write_text("x = 1\n", encoding="utf-8")
+
+    finalize_data = {
+        "tasks": [
+            {
+                "id": "T1",
+                "files_changed": ["src/existing.py", "docs/new_name.py", "ghost.py"],
+                "executor_notes": "Updated src/existing.py and noted missing/report.txt for follow-up.",
+            }
+        ],
+        "sense_checks": [
+            {"id": "SC1", "executor_note": "ok"},
+        ],
+    }
+
+    monkeypatch.setattr(
+        "megaplan.evaluation.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=["git", "status", "--short"],
+            returncode=0,
+            stdout=" M src/existing.py\n?? untracked.md\nR  old_name.py -> docs/new_name.py\nD  deleted.txt\n",
+            stderr="",
+        ),
+    )
+
+    result = validate_execution_evidence(finalize_data, project_dir)
+
+    assert result["skipped"] is False
+    assert result["files_in_diff"] == ["deleted.txt", "docs/new_name.py", "src/existing.py", "untracked.md"]
+    assert result["files_claimed"] == ["docs/new_name.py", "ghost.py", "src/existing.py"]
+    assert any("ghost.py" in finding for finding in result["findings"])
+    assert any("deleted.txt" in finding and "untracked.md" in finding for finding in result["findings"])
+    assert any("missing/report.txt" in finding for finding in result["findings"])
+    assert any("SC1" in finding and "perfunctory" in finding for finding in result["findings"])
+
+
+def test_validate_execution_evidence_skips_without_git_repo(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    result = validate_execution_evidence({"tasks": [], "sense_checks": []}, project_dir)
+
+    assert result["skipped"] is True
+    assert result["reason"] == "Project directory is not a git repository."
+
+
+def test_validate_execution_evidence_skips_when_git_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    (project_dir / ".git").mkdir(parents=True)
+
+    def _raise(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError
+
+    monkeypatch.setattr("megaplan.evaluation.subprocess.run", _raise)
+
+    result = validate_execution_evidence({"tasks": [], "sense_checks": []}, project_dir)
+
+    assert result["skipped"] is True
+    assert result["reason"] == "git not found on PATH."
+
+
+def test_validate_execution_evidence_skips_on_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    (project_dir / ".git").mkdir(parents=True)
+
+    def _raise(*args: object, **kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(cmd=["git", "status", "--short"], timeout=30)
+
+    monkeypatch.setattr("megaplan.evaluation.subprocess.run", _raise)
+
+    result = validate_execution_evidence({"tasks": [], "sense_checks": []}, project_dir)
+
+    assert result["skipped"] is True
+    assert result["reason"] == "git status timed out."
+
+
+def test_validate_execution_evidence_skips_on_nonzero_git_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    (project_dir / ".git").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "megaplan.evaluation.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=["git", "status", "--short"],
+            returncode=128,
+            stdout="",
+            stderr="fatal: not a git repository",
+        ),
+    )
+
+    result = validate_execution_evidence({"tasks": [], "sense_checks": []}, project_dir)
+
+    assert result["skipped"] is True
+    assert result["reason"] == "git status failed: fatal: not a git repository"
 
 
 # ---------------------------------------------------------------------------

@@ -342,6 +342,9 @@ def _mock_finalize(state: PlanState, plan_dir: Path) -> WorkerResult:
                 "depends_on": [],
                 "status": "pending",
                 "executor_notes": "",
+                "files_changed": [],
+                "commands_run": [],
+                "evidence_files": [],
                 "reviewer_verdict": "",
             },
             {
@@ -350,6 +353,9 @@ def _mock_finalize(state: PlanState, plan_dir: Path) -> WorkerResult:
                 "depends_on": ["T1"],
                 "status": "pending",
                 "executor_notes": "",
+                "files_changed": [],
+                "commands_run": [],
+                "evidence_files": [],
                 "reviewer_verdict": "",
             },
         ],
@@ -359,12 +365,14 @@ def _mock_finalize(state: PlanState, plan_dir: Path) -> WorkerResult:
                 "id": "SC1",
                 "task_id": "T1",
                 "question": "Verify implementation matches the stated idea.",
+                "executor_note": "",
                 "verdict": "",
             },
             {
                 "id": "SC2",
                 "task_id": "T2",
                 "question": "Verify success criteria were actually checked.",
+                "executor_note": "",
                 "verdict": "",
             },
         ],
@@ -382,8 +390,30 @@ def _mock_execute(state: PlanState, plan_dir: Path) -> WorkerResult:
         "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
         "deviations": [],
         "task_updates": [
-            {"task_id": "T1", "status": "done", "executor_notes": "Implemented via mock worker output."},
-            {"task_id": "T2", "status": "done", "executor_notes": "Verified success criteria via mock worker output."},
+            {
+                "task_id": "T1",
+                "status": "done",
+                "executor_notes": "Implemented via mock worker output and wrote IMPLEMENTED_BY_MEGAPLAN.txt.",
+                "files_changed": [str(target.relative_to(Path(state["config"]["project_dir"])))],
+                "commands_run": ["mock-write IMPLEMENTED_BY_MEGAPLAN.txt"],
+            },
+            {
+                "task_id": "T2",
+                "status": "done",
+                "executor_notes": "Verified success criteria via mock worker output and command checks.",
+                "files_changed": [],
+                "commands_run": ["mock-verify success criteria"],
+            },
+        ],
+        "sense_check_acknowledgments": [
+            {
+                "sense_check_id": "SC1",
+                "executor_note": "Confirmed the implementation artifact was written for the main task.",
+            },
+            {
+                "sense_check_id": "SC2",
+                "executor_note": "Confirmed the verification-only task is backed by command evidence.",
+            },
         ],
     }
     return _mock_result(payload, trace_output='{"event":"mock-execute"}\n')
@@ -396,12 +426,21 @@ def _mock_review(state: PlanState, plan_dir: Path) -> WorkerResult:
         for criterion in meta.get("success_criteria", [])
     ]
     payload = {
+        "review_verdict": "approved",
         "criteria": criteria,
         "issues": [],
         "summary": "Mock review passed.",
         "task_verdicts": [
-            {"task_id": "T1", "reviewer_verdict": "Pass - mock verified with complete coverage."},
-            {"task_id": "T2", "reviewer_verdict": "Pass - mock verified with complete coverage."},
+            {
+                "task_id": "T1",
+                "reviewer_verdict": "Pass - mock verified with file-backed implementation evidence.",
+                "evidence_files": [str((Path(state["config"]["project_dir"]) / "IMPLEMENTED_BY_MEGAPLAN.txt").relative_to(Path(state["config"]["project_dir"])))],
+            },
+            {
+                "task_id": "T2",
+                "reviewer_verdict": "Pass - verification task was reviewed via command evidence and executor notes rather than a changed file.",
+                "evidence_files": [],
+            },
         ],
         "sense_check_verdicts": [
             {"sense_check_id": "SC1", "verdict": "Confirmed."},

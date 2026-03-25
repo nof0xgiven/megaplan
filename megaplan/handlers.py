@@ -59,6 +59,7 @@ from megaplan.evaluation import (
     reassemble_plan,
     renumber_steps,
     run_gate_checks,
+    validate_execution_evidence,
     validate_plan_structure,
 )
 from megaplan._core import find_command, infer_next_steps, require_state
@@ -186,12 +187,14 @@ def _validate_merge_inputs(
     required_fields: tuple[str, ...],
     enum_fields: dict[str, set[str]] | None = None,
     nonempty_fields: set[str] | None = None,
+    array_fields: tuple[str, ...] = (),
     deviations: list[str] | None = None,
     label: str,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     enum_fields = enum_fields or {}
     nonempty_fields = nonempty_fields or set()
-    valid_entries: list[dict[str, str]] = []
+    array_field_set = set(array_fields)
+    valid_entries: list[dict[str, Any]] = []
     if not isinstance(entries, list):
         return valid_entries
     for index, entry in enumerate(entries):
@@ -203,10 +206,16 @@ def _validate_merge_inputs(
             if deviations is not None:
                 deviations.append(f"Skipped malformed {label}[{index}]: missing required keys.")
             continue
-        normalized: dict[str, str] = {}
+        normalized: dict[str, Any] = {}
         malformed = False
         for field in required_fields:
             value = entry[field]
+            if field in array_field_set:
+                if not isinstance(value, list):
+                    malformed = True
+                    break
+                normalized[field] = list(value)
+                continue
             if not isinstance(value, str):
                 malformed = True
                 break
@@ -228,7 +237,7 @@ def _validate_merge_inputs(
     return valid_entries
 
 def _merge_validated_entries(
-    entries: list[dict[str, str]],
+    entries: list[dict[str, Any]],
     *,
     targets_by_id: dict[str, dict[str, Any]],
     id_field: str,
@@ -250,6 +259,11 @@ def _merge_validated_entries(
             target[field] = entry[field]
         seen.add(entry_id)
     return len(seen)
+
+
+def _is_substantive_reviewer_verdict(text: str) -> bool:
+    stripped = text.strip()
+    return len(stripped) > 20 and len(stripped.split()) >= 4
 
 
 def normalize_flag_record(raw_flag: dict[str, Any], fallback_id: str) -> FlagRecord:
@@ -1110,11 +1124,13 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
     atomic_write_json(plan_dir / "execution.json", worker.payload)
     deviations = list(worker.payload.get("deviations", []))
     finalize_data = read_json(plan_dir / "finalize.json")
+    project_dir = Path(state["config"]["project_dir"])
     task_updates = _validate_merge_inputs(
         worker.payload.get("task_updates"),
-        required_fields=("task_id", "status", "executor_notes"),
+        required_fields=("task_id", "status", "executor_notes", "files_changed", "commands_run"),
         enum_fields={"status": {"done", "skipped"}},
         nonempty_fields={"executor_notes"},
+        array_fields=("files_changed", "commands_run"),
         deviations=deviations,
         label="task_updates",
     )
@@ -1124,19 +1140,83 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         task_updates,
         targets_by_id=tasks_by_id,
         id_field="task_id",
-        merge_fields=("status", "executor_notes"),
+        merge_fields=("status", "executor_notes", "files_changed", "commands_run"),
         issues=deviations,
         label="task_update",
     )
     untracked_tasks = total_tasks - merged_count
     if untracked_tasks > 0:
         deviations.append(f"{untracked_tasks}/{total_tasks} tasks have no executor update — tracking is incomplete.")
+    sense_check_acknowledgments = _validate_merge_inputs(
+        worker.payload.get("sense_check_acknowledgments"),
+        required_fields=("sense_check_id", "executor_note"),
+        nonempty_fields={"executor_note"},
+        deviations=deviations,
+        label="sense_check_acknowledgments",
+    )
+    sense_checks_by_id = {
+        sense_check["id"]: sense_check
+        for sense_check in finalize_data.get("sense_checks", [])
+    }
+    total_checks = len(sense_checks_by_id)
+    acknowledged_count = _merge_validated_entries(
+        sense_check_acknowledgments,
+        targets_by_id=sense_checks_by_id,
+        id_field="sense_check_id",
+        merge_fields=("executor_note",),
+        issues=deviations,
+        label="sense_check_acknowledgment",
+    )
+    unacked_checks = total_checks - acknowledged_count
+    if unacked_checks > 0:
+        deviations.append(
+            f"{unacked_checks}/{total_checks} sense checks have no executor acknowledgment — tracking is incomplete."
+        )
+
+    missing_task_evidence: list[str] = []
+    advisory_task_evidence: list[str] = []
+    for task in finalize_data.get("tasks", []):
+        if task.get("status") != "done":
+            continue
+        has_files = bool(task.get("files_changed"))
+        has_commands = bool(task.get("commands_run"))
+        if not has_files and not has_commands:
+            missing_task_evidence.append(task["id"])
+        elif not has_files and has_commands:
+            advisory_task_evidence.append(task["id"])
+    if missing_task_evidence:
+        deviations.append(
+            "Done tasks missing both files_changed and commands_run: "
+            + ", ".join(missing_task_evidence)
+        )
+    if advisory_task_evidence:
+        deviations.append(
+            "Advisory: done tasks rely on commands_run without files_changed (FLAG-006 softening): "
+            + ", ".join(advisory_task_evidence)
+        )
+
+    execution_audit = validate_execution_evidence(finalize_data, project_dir)
+    if execution_audit["skipped"]:
+        deviations.append(f"Advisory audit skip: {execution_audit['reason']}")
+    for finding in execution_audit["findings"]:
+        deviations.append(f"Advisory audit finding: {finding}")
+    atomic_write_json(plan_dir / "execution_audit.json", execution_audit)
     atomic_write_json(plan_dir / "finalize.json", finalize_data)
     atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="execute"))
     finalize_hash = sha256_file(plan_dir / "finalize.json")
     if worker.trace_output is not None:
         atomic_write_text(plan_dir / "execution_trace.jsonl", worker.trace_output)
-    blocked = untracked_tasks > 0
+    blocking_reasons: list[str] = []
+    if untracked_tasks > 0:
+        blocking_reasons.append(f"{untracked_tasks}/{total_tasks} tasks have no executor update")
+    if unacked_checks > 0:
+        blocking_reasons.append(f"{unacked_checks}/{total_checks} sense checks have no executor acknowledgment")
+    if missing_task_evidence:
+        blocking_reasons.append(
+            "done tasks missing both files_changed and commands_run: "
+            + ", ".join(missing_task_evidence)
+        )
+    blocked = bool(blocking_reasons)
     if not blocked:
         state["current_state"] = STATE_EXECUTED
     apply_session_update(state, "execute", agent, worker.session_id, mode=mode, refreshed=refreshed)
@@ -1163,14 +1243,16 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
         ),
     )
     save_state(plan_dir, state)
-    artifacts = ["execution.json", "finalize.json", "final.md"]
+    artifacts = ["execution.json", "execution_audit.json", "finalize.json", "final.md"]
     if worker.trace_output is not None:
         artifacts.append("execution_trace.jsonl")
-    tracking_note = f" ({merged_count}/{total_tasks} tasks tracked)" if total_tasks > 0 else ""
-    blocked_message = (
-        f"Blocked: {untracked_tasks}/{total_tasks} tasks have no executor update. "
-        "Re-run execute to complete tracking."
-    )
+    tracking_bits: list[str] = []
+    if total_tasks > 0:
+        tracking_bits.append(f"{merged_count}/{total_tasks} tasks tracked")
+    if total_checks > 0:
+        tracking_bits.append(f"{acknowledged_count}/{total_checks} sense checks acknowledged")
+    tracking_note = f" ({', '.join(tracking_bits)})" if tracking_bits else ""
+    blocked_message = "Blocked: " + "; ".join(blocking_reasons) + ". Re-run execute to complete tracking."
     response: StepResponse = {
         "success": not blocked,
         "step": "execute",
@@ -1199,10 +1281,15 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
     atomic_write_json(plan_dir / "review.json", worker.payload)
     issues = list(worker.payload.get("issues", []))
     finalize_data = read_json(plan_dir / "finalize.json")
+    review_verdict = worker.payload.get("review_verdict")
+    if review_verdict not in {"approved", "needs_rework"}:
+        issues.append("Invalid review_verdict; expected 'approved' or 'needs_rework'.")
+        review_verdict = "needs_rework"
     task_verdicts = _validate_merge_inputs(
         worker.payload.get("task_verdicts"),
-        required_fields=("task_id", "reviewer_verdict"),
+        required_fields=("task_id", "reviewer_verdict", "evidence_files"),
         nonempty_fields={"reviewer_verdict"},
+        array_fields=("evidence_files",),
         deviations=issues,
         label="task_verdicts",
     )
@@ -1219,7 +1306,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         task_verdicts,
         targets_by_id=tasks_by_id,
         id_field="task_id",
-        merge_fields=("reviewer_verdict",),
+        merge_fields=("reviewer_verdict", "evidence_files"),
         issues=issues,
         label="task_verdict",
     )
@@ -1237,14 +1324,47 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
     )
     if total_checks > 0 and check_count < total_checks:
         issues.append(f"Incomplete review: {check_count}/{total_checks} sense checks received a verdict.")
+
+    missing_reviewer_evidence: list[str] = []
+    advisory_reviewer_evidence: list[str] = []
+    for task in finalize_data.get("tasks", []):
+        if task.get("status") != "done":
+            continue
+        reviewer_verdict = task.get("reviewer_verdict", "")
+        if not reviewer_verdict.strip():
+            continue
+        if task.get("evidence_files"):
+            continue
+        if _is_substantive_reviewer_verdict(reviewer_verdict):
+            advisory_reviewer_evidence.append(task["id"])
+        else:
+            missing_reviewer_evidence.append(task["id"])
+    if missing_reviewer_evidence:
+        issues.append(
+            "Done tasks missing reviewer evidence_files without a substantive reviewer_verdict: "
+            + ", ".join(missing_reviewer_evidence)
+        )
+    if advisory_reviewer_evidence:
+        issues.append(
+            "Advisory: done tasks rely on substantive reviewer_verdict without evidence_files (FLAG-006 softening): "
+            + ", ".join(advisory_reviewer_evidence)
+        )
+
     atomic_write_json(plan_dir / "finalize.json", finalize_data)
     atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="review"))
     finalize_hash = sha256_file(plan_dir / "finalize.json")
     passed = sum(1 for criterion in worker.payload.get("criteria", []) if criterion.get("pass"))
     total = len(worker.payload.get("criteria", []))
-    blocked = verdict_count < total_tasks or check_count < total_checks
-    if not blocked:
+    blocked = (
+        verdict_count < total_tasks
+        or check_count < total_checks
+        or bool(missing_reviewer_evidence)
+    )
+    rework_requested = not blocked and review_verdict == "needs_rework"
+    if not blocked and not rework_requested:
         state["current_state"] = STATE_DONE
+    elif rework_requested:
+        state["current_state"] = STATE_FINALIZED
     apply_session_update(state, "review", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
@@ -1252,7 +1372,7 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
             "review",
             duration_ms=worker.duration_ms,
             cost_usd=worker.cost_usd,
-            result="blocked" if blocked else "success",
+            result="blocked" if blocked else "needs_rework" if rework_requested else "success",
             worker=worker,
             agent=agent,
             mode=mode,
@@ -1267,13 +1387,26 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
         f"({verdict_count}/{total_tasks} task verdicts, {check_count}/{total_checks} sense checks). "
         "Re-run review to complete."
     )
+    if missing_reviewer_evidence:
+        blocked_message = (
+            "Blocked: done tasks are missing reviewer evidence_files without a substantive reviewer_verdict ("
+            + ", ".join(missing_reviewer_evidence)
+            + "). Re-run review to complete."
+        )
+    reroute_message = "Review requested another execute pass. Re-run execute using the review findings as context."
     response: StepResponse = {
-        "success": not blocked,
+        "success": not blocked and not rework_requested,
         "step": "review",
-        "summary": blocked_message if blocked else f"Review complete: {passed}/{total} success criteria passed.",
+        "summary": (
+            blocked_message
+            if blocked
+            else reroute_message
+            if rework_requested
+            else f"Review complete: {passed}/{total} success criteria passed."
+        ),
         "artifacts": ["review.json", "finalize.json", "final.md"],
-        "next_step": "review" if blocked else None,
-        "state": STATE_EXECUTED if blocked else STATE_DONE,
+        "next_step": "review" if blocked else "execute" if rework_requested else None,
+        "state": STATE_EXECUTED if blocked else STATE_FINALIZED if rework_requested else STATE_DONE,
         "issues": issues,
     }
     attach_agent_fallback(response, args)

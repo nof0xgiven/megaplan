@@ -374,6 +374,16 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     robustness = configured_robustness(state)
     gate = read_json(plan_dir / "gate.json")
+    review_path = plan_dir / "review.json"
+    if review_path.exists():
+        prior_review_block = textwrap.dedent(
+            f"""
+            Previous review findings to address on this execution pass (`review.json`):
+            {json_dump(read_json(review_path)).strip()}
+            """
+        ).strip()
+    else:
+        prior_review_block = "No prior `review.json` exists. Treat this as the first execution pass."
     nudge_lines: list[str] = []
     sense_checks = finalize_data.get("sense_checks", [])
     if sense_checks:
@@ -413,6 +423,8 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         Gate summary:
         {json_dump(gate).strip()}
 
+        {prior_review_block}
+
         {approval_note}
         Robustness level: {robustness}.
 
@@ -422,8 +434,40 @@ def _execute_prompt(state: PlanState, plan_dir: Path) -> str:
         - Report deviations explicitly.
         - Output concrete files changed and commands run.
         - Use the tasks in `finalize.json` as the execution boundary. Do not create or rewrite tracking artifacts directly.
-        - Return `task_updates` with one object per completed or skipped task: `{{"task_id": "...", "status": "done|skipped", "executor_notes": "..."}}`.
+        - Return `task_updates` with one object per completed or skipped task.
+        - Return `sense_check_acknowledgments` with one object per sense check.
         - Keep `executor_notes` specific enough that a reviewer can map each update to the actual code and commands you ran.
+        - Follow this JSON shape exactly:
+        ```json
+        {{
+          "output": "Implemented the approved plan and captured execution evidence.",
+          "files_changed": ["megaplan/handlers.py", "megaplan/evaluation.py"],
+          "commands_run": ["pytest tests/test_megaplan.py -k evidence"],
+          "deviations": [],
+          "task_updates": [
+            {{
+              "task_id": "T6",
+              "status": "done",
+              "executor_notes": "Updated handle_execute to merge per-task evidence, merge sense-check acknowledgments, and enforce the FLAG-006 softening path.",
+              "files_changed": ["megaplan/handlers.py"],
+              "commands_run": ["pytest tests/test_megaplan.py -k execute"]
+            }},
+            {{
+              "task_id": "T11",
+              "status": "skipped",
+              "executor_notes": "Skipped because upstream work is not ready yet; no repo changes were made for this task.",
+              "files_changed": [],
+              "commands_run": []
+            }}
+          ],
+          "sense_check_acknowledgments": [
+            {{
+              "sense_check_id": "SC6",
+              "executor_note": "Confirmed execute only blocks when both files_changed and commands_run are empty for a done task."
+            }}
+          ]
+        }}
+        ```
 
         {execution_nudges}
         """
@@ -438,6 +482,16 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
     gate = read_json(plan_dir / "gate.json")
     finalize_data = read_json(plan_dir / "finalize.json")
     diff_summary = collect_git_diff_summary(project_dir)
+    audit_path = plan_dir / "execution_audit.json"
+    if audit_path.exists():
+        audit_block = textwrap.dedent(
+            f"""
+            Execution audit (`execution_audit.json`):
+            {json_dump(read_json(audit_path)).strip()}
+            """
+        ).strip()
+    else:
+        audit_block = "Execution audit (`execution_audit.json`): not present. Skip that artifact gracefully and rely on `finalize.json`, `execution.json`, and the git diff."
     return textwrap.dedent(
         f"""
         Review the execution critically against user intent and observable success criteria.
@@ -462,17 +516,47 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
         Execution summary:
         {json_dump(execution).strip()}
 
+        {audit_block}
+
         Git diff summary:
         {diff_summary}
 
         Requirements:
         - Judge against the success criteria, not plan elegance.
         - Be critical and call out real misses.
-        - If there are failures, describe them as issues.
-        - Review `tasks` using the populated `executor_notes` plus the git diff. Flag vague, copy-pasted, or contradictory notes as issues.
-        - Review every `sense_check` explicitly.
-        - Return `task_verdicts` with one object per task: `{{"task_id": "...", "reviewer_verdict": "..."}}`.
-        - Return `sense_check_verdicts` with one object per sense check: `{{"sense_check_id": "...", "verdict": "..."}}`.
+        - Trust executor evidence by default. Dig deeper only where the git diff, `execution_audit.json`, or vague notes make the claim ambiguous.
+        - If actual implementation work is incomplete, set top-level `review_verdict` to `needs_rework` so the plan routes back to execute. Use `approved` only when the work itself is acceptable.
+        - Review each task by cross-referencing the executor's per-task `files_changed` and `commands_run` against the git diff and any audit findings.
+        - Review every sense check explicitly. Confirm concise executor acknowledgments when they are specific; dig deeper only when they are perfunctory or contradicted by the code.
+        - Follow this JSON shape exactly:
+        ```json
+        {{
+          "review_verdict": "approved",
+          "criteria": [
+            {{
+              "name": "Execution evidence is auditable.",
+              "pass": true,
+              "evidence": "Per-task evidence in finalize.json matches the git diff and execution_audit.json reported no phantom claims."
+            }}
+          ],
+          "issues": [],
+          "summary": "Approved. Executor evidence lines up with the diff; only routine advisory findings remain.",
+          "task_verdicts": [
+            {{
+              "task_id": "T6",
+              "reviewer_verdict": "Pass. Claimed handler changes and command evidence match the repo state.",
+              "evidence_files": ["megaplan/handlers.py", "megaplan/evaluation.py"]
+            }}
+          ],
+          "sense_check_verdicts": [
+            {{
+              "sense_check_id": "SC6",
+              "verdict": "Confirmed. The execute blocker only fires when both evidence arrays are empty."
+            }}
+          ]
+        }}
+        ```
+        - When the work needs another execute pass, keep the same shape and change only `review_verdict` to `needs_rework`; make `issues`, `summary`, and task verdicts specific enough for the executor to act on directly.
         """
     ).strip()
 
@@ -484,6 +568,16 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
     execution = read_json(plan_dir / "execution.json")
     finalize_data = read_json(plan_dir / "finalize.json")
     diff_summary = collect_git_diff_summary(project_dir)
+    audit_path = plan_dir / "execution_audit.json"
+    if audit_path.exists():
+        audit_block = textwrap.dedent(
+            f"""
+            Execution audit (`execution_audit.json`):
+            {json_dump(read_json(audit_path)).strip()}
+            """
+        ).strip()
+    else:
+        audit_block = "Execution audit (`execution_audit.json`): not present. Skip that artifact gracefully and rely on `finalize.json`, `execution.json`, and the git diff."
     return textwrap.dedent(
         f"""
         Review the implementation against the success criteria.
@@ -505,17 +599,47 @@ def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
         Execution summary:
         {json_dump(execution).strip()}
 
+        {audit_block}
+
         Git diff summary:
         {diff_summary}
 
         Requirements:
         - Be critical.
         - Verify each success criterion explicitly.
-        - Call out any concrete gaps or regressions in issues.
-        - Review `tasks` using the populated `executor_notes` plus the git diff. Flag vague, copy-pasted, or contradictory notes as issues.
-        - Review every `sense_check` explicitly.
-        - Return `task_verdicts` with one object per task: `{{"task_id": "...", "reviewer_verdict": "..."}}`.
-        - Return `sense_check_verdicts` with one object per sense check: `{{"sense_check_id": "...", "verdict": "..."}}`.
+        - Trust executor evidence by default. Only re-verify from scratch where the diff, the audit, or the notes leave a real ambiguity.
+        - If actual implementation work is incomplete, set top-level `review_verdict` to `needs_rework` so the plan routes back to execute. Use `approved` only when the work itself checks out.
+        - Cross-reference each task's `files_changed` and `commands_run` against the git diff and any audit findings.
+        - Review every `sense_check` explicitly and treat perfunctory acknowledgments as a reason to dig deeper.
+        - Follow this JSON shape exactly:
+        ```json
+        {{
+          "review_verdict": "approved",
+          "criteria": [
+            {{
+              "name": "Review cross-check completed",
+              "pass": true,
+              "evidence": "Executor evidence in finalize.json matches the diff and the audit file."
+            }}
+          ],
+          "issues": [],
+          "summary": "Approved. The executor evidence is consistent and the remaining findings are advisory only.",
+          "task_verdicts": [
+            {{
+              "task_id": "T3",
+              "reviewer_verdict": "Pass. Review prompt changes match the diff and reference the audit fallback correctly.",
+              "evidence_files": ["megaplan/prompts.py"]
+            }}
+          ],
+          "sense_check_verdicts": [
+            {{
+              "sense_check_id": "SC3",
+              "verdict": "Confirmed. Both review prompts load execution_audit.json with a graceful fallback."
+            }}
+          ]
+        }}
+        ```
+        - When the work needs another execute pass, keep the same shape and change only `review_verdict` to `needs_rework`; put the actionable gaps in `issues`, `summary`, and per-task verdicts.
         """
     ).strip()
 

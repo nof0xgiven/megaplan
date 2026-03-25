@@ -1401,21 +1401,50 @@ def test_render_final_md_pending_partially_done_and_reviewed_states() -> None:
                 "depends_on": [],
                 "status": "pending",
                 "executor_notes": "",
+                "files_changed": [],
+                "commands_run": [],
+                "evidence_files": [],
                 "reviewer_verdict": "",
             }
         ],
         "watch_items": ["Watch this."],
-        "sense_checks": [{"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""}],
+        "sense_checks": [
+            {"id": "SC1", "task_id": "T1", "question": "Did it work?", "executor_note": "", "verdict": ""}
+        ],
         "meta_commentary": "Pending state.",
     }
     partial = {
         **pending,
-        "tasks": [{**pending["tasks"][0], "status": "done", "executor_notes": "Implemented."}],
+        "tasks": [
+            {
+                **pending["tasks"][0],
+                "status": "done",
+                "executor_notes": "Implemented.",
+                "files_changed": ["megaplan/handlers.py"],
+            }
+        ],
+        "sense_checks": [
+            {
+                **pending["sense_checks"][0],
+                "executor_note": "Confirmed execute evidence coverage.",
+            }
+        ],
     }
     reviewed = {
         **partial,
-        "tasks": [{**partial["tasks"][0], "reviewer_verdict": "Pass"}],
-        "sense_checks": [{"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": "Confirmed."}],
+        "tasks": [
+            {
+                **partial["tasks"][0],
+                "reviewer_verdict": "Pass",
+                "evidence_files": ["megaplan/handlers.py"],
+            }
+        ],
+        "sense_checks": [
+            {
+                **partial["sense_checks"][0],
+                "verdict": "Confirmed.",
+            }
+        ],
     }
 
     pending_md = render_final_md(pending)
@@ -1429,7 +1458,10 @@ def test_render_final_md_pending_partially_done_and_reviewed_states() -> None:
     assert "- [ ] **T1:** Do work" in pending_md
     assert "- [x] **T1:** Do work" in partial_md
     assert "Executor notes: Implemented." in partial_md
+    assert "Files changed:" in partial_md
+    assert "Executor note: Confirmed execute evidence coverage." in partial_md
     assert "Reviewer verdict: Pass" in reviewed_md
+    assert "Evidence files:" in reviewed_md
     assert "Verdict: Confirmed." in reviewed_md
 
 
@@ -1444,6 +1476,9 @@ def test_render_final_md_phase_marks_gaps_only_when_due() -> None:
                 "depends_on": [],
                 "status": "pending",
                 "executor_notes": "",
+                "files_changed": [],
+                "commands_run": [],
+                "evidence_files": [],
                 "reviewer_verdict": "",
             },
             {
@@ -1452,13 +1487,16 @@ def test_render_final_md_phase_marks_gaps_only_when_due() -> None:
                 "depends_on": ["T1"],
                 "status": "done",
                 "executor_notes": "",
+                "files_changed": [],
+                "commands_run": [],
+                "evidence_files": [],
                 "reviewer_verdict": "",
             },
         ],
         "watch_items": [],
         "sense_checks": [
-            {"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""},
-            {"id": "SC2", "task_id": "T2", "question": "Was it reviewed?", "verdict": ""},
+            {"id": "SC1", "task_id": "T1", "question": "Did it work?", "executor_note": "", "verdict": ""},
+            {"id": "SC2", "task_id": "T2", "question": "Was it reviewed?", "executor_note": "", "verdict": ""},
         ],
         "meta_commentary": "Status overview.",
     }
@@ -1474,6 +1512,7 @@ def test_render_final_md_phase_marks_gaps_only_when_due() -> None:
     assert "Reviewer verdict: [PENDING]" not in execute_md
     assert "Tasks without executor updates: 1" in execute_md
     assert "Executor notes missing: 1" in execute_md
+    assert "Sense-check acknowledgments missing: 2" in execute_md
     assert "Reviewer verdict: [PENDING]" in review_md
     assert "Verdict: [PENDING]" in review_md
     assert "Reviewer verdicts pending: 2" in review_md
@@ -1483,13 +1522,20 @@ def test_render_final_md_phase_marks_gaps_only_when_due() -> None:
 def test_validate_merge_inputs_filters_malformed_entries() -> None:
     valid = megaplan.handlers._validate_merge_inputs(
         [
-            {"task_id": "T1", "status": "done", "executor_notes": "Implemented."},
+            {
+                "task_id": "T1",
+                "status": "done",
+                "executor_notes": "Implemented.",
+                "files_changed": ["megaplan/handlers.py"],
+                "commands_run": ["pytest tests/test_megaplan.py"],
+            },
             {"task_id": "T2", "status": 1, "executor_notes": "Bad type"},
             {"task_id": "T3", "executor_notes": "Missing status"},
             "bad-entry",
         ],
-        required_fields=("task_id", "status", "executor_notes"),
+        required_fields=("task_id", "status", "executor_notes", "files_changed", "commands_run"),
         enum_fields={"status": {"done", "skipped"}},
+        array_fields=("files_changed", "commands_run"),
         label="task_updates",
     )
     empty = megaplan.handlers._validate_merge_inputs(
@@ -1498,7 +1544,15 @@ def test_validate_merge_inputs_filters_malformed_entries() -> None:
         label="task_verdicts",
     )
 
-    assert valid == [{"task_id": "T1", "status": "done", "executor_notes": "Implemented."}]
+    assert valid == [
+        {
+            "task_id": "T1",
+            "status": "done",
+            "executor_notes": "Implemented.",
+            "files_changed": ["megaplan/handlers.py"],
+            "commands_run": ["pytest tests/test_megaplan.py"],
+        }
+    ]
     assert empty == []
 
 
@@ -1521,6 +1575,47 @@ def test_validate_merge_inputs_rejects_empty_required_content() -> None:
     assert deviations == [
         "Skipped task_updates[0]: 'executor_notes' must not be empty.",
         "Skipped task_updates[1]: 'executor_notes' must not be empty.",
+    ]
+
+
+def test_validate_merge_inputs_accepts_array_fields() -> None:
+    deviations: list[str] = []
+    valid = megaplan.handlers._validate_merge_inputs(
+        [
+            {
+                "task_id": "T1",
+                "status": "done",
+                "executor_notes": "Implemented.",
+                "files_changed": ["megaplan/handlers.py"],
+                "commands_run": ["pytest tests/test_megaplan.py"],
+            },
+            {
+                "task_id": "T2",
+                "status": "done",
+                "executor_notes": "Bad arrays.",
+                "files_changed": "megaplan/handlers.py",
+                "commands_run": [],
+            },
+        ],
+        required_fields=("task_id", "status", "executor_notes", "files_changed", "commands_run"),
+        enum_fields={"status": {"done", "skipped"}},
+        nonempty_fields={"executor_notes"},
+        array_fields=("files_changed", "commands_run"),
+        deviations=deviations,
+        label="task_updates",
+    )
+
+    assert valid == [
+        {
+            "task_id": "T1",
+            "status": "done",
+            "executor_notes": "Implemented.",
+            "files_changed": ["megaplan/handlers.py"],
+            "commands_run": ["pytest tests/test_megaplan.py"],
+        }
+    ]
+    assert deviations == [
+        "Skipped malformed task_updates[1]: invalid field types or enum values.",
     ]
 
 
@@ -1602,6 +1697,7 @@ def test_execute_happy_path_tracks_all_tasks(plan_fixture: PlanFixture) -> None:
     assert response["success"] is True
     assert response["warnings"] == []
     assert "2/2 tasks tracked" in response["summary"]
+    assert "2/2 sense checks acknowledged" in response["summary"]
 
 
 def test_review_flags_incomplete_verdicts(plan_fixture: PlanFixture) -> None:
@@ -1678,8 +1774,23 @@ def test_execute_deduplicates_task_updates_and_blocks_incomplete_coverage(
             "commands_run": ["pytest -k partial"],
             "deviations": [],
             "task_updates": [
-                {"task_id": "T1", "status": "done", "executor_notes": "Initial pass."},
-                {"task_id": "T1", "status": "done", "executor_notes": "Final pass."},
+                {
+                    "task_id": "T1",
+                    "status": "done",
+                    "executor_notes": "Initial pass.",
+                    "files_changed": ["src/example.py"],
+                    "commands_run": ["pytest -k partial"],
+                },
+                {
+                    "task_id": "T1",
+                    "status": "done",
+                    "executor_notes": "Final pass.",
+                    "files_changed": ["src/example.py"],
+                    "commands_run": ["pytest -k partial"],
+                },
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Confirmed."},
             ],
         },
         raw_output="partial execute",
@@ -1705,12 +1816,16 @@ def test_execute_deduplicates_task_updates_and_blocks_incomplete_coverage(
     assert response["success"] is False
     assert response["state"] == megaplan.STATE_FINALIZED
     assert response["next_step"] == "execute"
-    assert response["summary"] == "Blocked: 1/2 tasks have no executor update. Re-run execute to complete tracking."
+    assert response["summary"] == (
+        "Blocked: 1/2 tasks have no executor update; 1/2 sense checks have no executor acknowledgment. "
+        "Re-run execute to complete tracking."
+    )
     assert "Duplicate task_update for 'T1' — last entry wins." in response["deviations"]
     assert finalize_data["tasks"][0]["executor_notes"] == "Final pass."
     assert finalize_data["tasks"][1]["status"] == "pending"
     assert execute_entry["result"] == "blocked"
     assert (plan_fixture.plan_dir / "execution.json").exists()
+    assert (plan_fixture.plan_dir / "execution_audit.json").exists()
     assert "## Coverage Gaps" in final_md
     assert "Tasks without executor updates: 1" in final_md
 
@@ -1734,12 +1849,21 @@ def test_review_blocks_incomplete_coverage_and_allows_rerun(
 
     first_review = WorkerResult(
         payload={
+            "review_verdict": "approved",
             "criteria": [{"name": "criterion", "pass": True, "evidence": "checked"}],
             "issues": [],
             "summary": "Partial review.",
             "task_verdicts": [
-                {"task_id": "T1", "reviewer_verdict": "Pass - partial."},
-                {"task_id": "T1", "reviewer_verdict": "Pass - final."},
+                {
+                    "task_id": "T1",
+                    "reviewer_verdict": "Pass - partial.",
+                    "evidence_files": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+                },
+                {
+                    "task_id": "T1",
+                    "reviewer_verdict": "Pass - final.",
+                    "evidence_files": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+                },
             ],
             "sense_check_verdicts": [
                 {"sense_check_id": "SC1", "verdict": "Confirmed."},
@@ -1752,12 +1876,21 @@ def test_review_blocks_incomplete_coverage_and_allows_rerun(
     )
     second_review = WorkerResult(
         payload={
+            "review_verdict": "approved",
             "criteria": [{"name": "criterion", "pass": True, "evidence": "checked again"}],
             "issues": [],
             "summary": "Complete review.",
             "task_verdicts": [
-                {"task_id": "T1", "reviewer_verdict": "Pass - rerun."},
-                {"task_id": "T2", "reviewer_verdict": "Pass - rerun."},
+                {
+                    "task_id": "T1",
+                    "reviewer_verdict": "Pass - rerun.",
+                    "evidence_files": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+                },
+                {
+                    "task_id": "T2",
+                    "reviewer_verdict": "Pass - rerun with command evidence that is substantive enough for FLAG-006 softening.",
+                    "evidence_files": [],
+                },
             ],
             "sense_check_verdicts": [
                 {"sense_check_id": "SC1", "verdict": "Confirmed on rerun."},
@@ -1807,8 +1940,261 @@ def test_review_blocks_incomplete_coverage_and_allows_rerun(
     assert completed["next_step"] is None
     assert final_state["current_state"] == megaplan.STATE_DONE
     assert final_data["tasks"][0]["reviewer_verdict"] == "Pass - rerun."
-    assert final_data["tasks"][1]["reviewer_verdict"] == "Pass - rerun."
+    assert (
+        final_data["tasks"][1]["reviewer_verdict"]
+        == "Pass - rerun with command evidence that is substantive enough for FLAG-006 softening."
+    )
     assert all(check["verdict"] == "Confirmed on rerun." for check in final_data["sense_checks"])
+
+
+def test_execute_blocks_done_task_without_any_per_task_evidence(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    worker = WorkerResult(
+        payload={
+            "output": "Executed with incomplete evidence.",
+            "files_changed": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+            "commands_run": ["mock-run"],
+            "deviations": [],
+            "task_updates": [
+                {
+                    "task_id": "T1",
+                    "status": "done",
+                    "executor_notes": "Implemented the main artifact.",
+                    "files_changed": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+                    "commands_run": ["mock-run"],
+                },
+                {
+                    "task_id": "T2",
+                    "status": "done",
+                    "executor_notes": "Verified the work but forgot to capture evidence.",
+                    "files_changed": [],
+                    "commands_run": [],
+                },
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Confirmed the implementation artifact exists."},
+                {"sense_check_id": "SC2", "executor_note": "Confirmed the verification task was reviewed."},
+            ],
+        },
+        raw_output="execute missing evidence",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="execute-missing-evidence",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "codex", "persistent", False),
+    )
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+
+    assert response["success"] is False
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert response["next_step"] == "execute"
+    assert "missing both files_changed and commands_run" in response["summary"]
+
+
+def test_execute_softens_done_task_with_commands_only(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    worker = WorkerResult(
+        payload={
+            "output": "Executed with command-only verification evidence.",
+            "files_changed": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+            "commands_run": ["mock-run", "mock-verify"],
+            "deviations": [],
+            "task_updates": [
+                {
+                    "task_id": "T1",
+                    "status": "done",
+                    "executor_notes": "Implemented the main artifact.",
+                    "files_changed": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+                    "commands_run": ["mock-run"],
+                },
+                {
+                    "task_id": "T2",
+                    "status": "done",
+                    "executor_notes": "Verified the work using command output only.",
+                    "files_changed": [],
+                    "commands_run": ["mock-verify"],
+                },
+            ],
+            "sense_check_acknowledgments": [
+                {"sense_check_id": "SC1", "executor_note": "Confirmed the implementation artifact exists."},
+                {"sense_check_id": "SC2", "executor_note": "Confirmed the verification task is backed by command output."},
+            ],
+        },
+        raw_output="execute softened evidence",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="execute-softened-evidence",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "codex", "persistent", False),
+    )
+
+    response = megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+    finalize_data = read_json(plan_fixture.plan_dir / "finalize.json")
+
+    assert response["success"] is True
+    assert response["state"] == megaplan.STATE_EXECUTED
+    assert any("FLAG-006 softening" in deviation for deviation in response["deviations"])
+    assert finalize_data["tasks"][1]["files_changed"] == []
+    assert finalize_data["tasks"][1]["commands_run"] == ["mock-verify"]
+
+
+def test_review_blocks_empty_evidence_files_without_substantive_verdict(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+
+    worker = WorkerResult(
+        payload={
+            "review_verdict": "approved",
+            "criteria": [{"name": "criterion", "pass": True, "evidence": "checked"}],
+            "issues": [],
+            "summary": "Review missing evidence files.",
+            "task_verdicts": [
+                {
+                    "task_id": "T1",
+                    "reviewer_verdict": "Pass - file backed.",
+                    "evidence_files": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+                },
+                {
+                    "task_id": "T2",
+                    "reviewer_verdict": "Pass.",
+                    "evidence_files": [],
+                },
+            ],
+            "sense_check_verdicts": [
+                {"sense_check_id": "SC1", "verdict": "Confirmed."},
+                {"sense_check_id": "SC2", "verdict": "Confirmed."},
+            ],
+        },
+        raw_output="review missing evidence files",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="review-missing-evidence-files",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "codex", "persistent", False),
+    )
+
+    response = megaplan.handle_review(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    assert response["success"] is False
+    assert response["state"] == megaplan.STATE_EXECUTED
+    assert response["next_step"] == "review"
+    assert "missing reviewer evidence_files" in response["summary"]
+
+
+def test_review_softens_substantive_verdict_without_evidence_files_and_can_kick_back(
+    plan_fixture: PlanFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+
+    worker = WorkerResult(
+        payload={
+            "review_verdict": "needs_rework",
+            "criteria": [{"name": "criterion", "pass": False, "evidence": "Task T1 still needs follow-up edits."}],
+            "issues": ["T1 implementation is incomplete and needs another execute pass."],
+            "summary": "Needs rework: one task is still incomplete.",
+            "task_verdicts": [
+                {
+                    "task_id": "T1",
+                    "reviewer_verdict": "Needs more work. The main implementation is not complete yet.",
+                    "evidence_files": ["IMPLEMENTED_BY_MEGAPLAN.txt"],
+                },
+                {
+                    "task_id": "T2",
+                    "reviewer_verdict": "Verification work is acceptable and was checked through command evidence captured in the executor notes.",
+                    "evidence_files": [],
+                },
+            ],
+            "sense_check_verdicts": [
+                {"sense_check_id": "SC1", "verdict": "Needs another execute pass."},
+                {"sense_check_id": "SC2", "verdict": "Confirmed for the verification task."},
+            ],
+        },
+        raw_output="review needs rework",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="review-needs-rework",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "codex", "persistent", False),
+    )
+
+    response = megaplan.handle_review(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    state = load_state(plan_fixture.plan_dir)
+    stored_review = read_json(plan_fixture.plan_dir / "review.json")
+
+    assert response["success"] is False
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert response["next_step"] == "execute"
+    assert response["summary"] == "Review requested another execute pass. Re-run execute using the review findings as context."
+    assert any("FLAG-006 softening" in issue for issue in response["issues"])
+    assert state["current_state"] == megaplan.STATE_FINALIZED
+    assert state["history"][-1]["result"] == "needs_rework"
+    assert stored_review["review_verdict"] == "needs_rework"
 
 
 def test_codex_uses_same_prompt_builders_for_shared_steps(plan_fixture: PlanFixture) -> None:

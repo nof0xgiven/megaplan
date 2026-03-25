@@ -62,11 +62,22 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
                         "depends_on": [],
                         "status": "pending",
                         "executor_notes": "",
+                        "files_changed": [],
+                        "commands_run": [],
+                        "evidence_files": [],
                         "reviewer_verdict": "",
                     }
                 ],
                 "watch_items": [],
-                "sense_checks": [{"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""}],
+                "sense_checks": [
+                    {
+                        "id": "SC1",
+                        "task_id": "T1",
+                        "question": "Did it work?",
+                        "executor_note": "",
+                        "verdict": "",
+                    }
+                ],
                 "meta_commentary": "ok",
             },
         ),
@@ -77,16 +88,34 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
                 "files_changed": [],
                 "commands_run": [],
                 "deviations": [],
-                "task_updates": [{"task_id": "T1", "status": "done", "executor_notes": "Implemented."}],
+                "task_updates": [
+                    {
+                        "task_id": "T1",
+                        "status": "done",
+                        "executor_notes": "Implemented.",
+                        "files_changed": ["megaplan/workers.py"],
+                        "commands_run": ["pytest tests/test_workers.py"],
+                    }
+                ],
+                "sense_check_acknowledgments": [
+                    {"sense_check_id": "SC1", "executor_note": "Confirmed."}
+                ],
             },
         ),
         (
             "review",
             {
+                "review_verdict": "approved",
                 "criteria": [],
                 "issues": [],
                 "summary": "ok",
-                "task_verdicts": [{"task_id": "T1", "reviewer_verdict": "Pass"}],
+                "task_verdicts": [
+                    {
+                        "task_id": "T1",
+                        "reviewer_verdict": "Pass",
+                        "evidence_files": ["megaplan/workers.py"],
+                    }
+                ],
                 "sense_check_verdicts": [{"sense_check_id": "SC1", "verdict": "Confirmed"}],
             },
         ),
@@ -210,7 +239,18 @@ def _mock_state(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, dict]:
                 "files_changed": [],
                 "commands_run": [],
                 "deviations": [],
-                "task_updates": [{"task_id": "T1", "status": "done", "executor_notes": "Implemented."}],
+                "task_updates": [
+                    {
+                        "task_id": "T1",
+                        "status": "done",
+                        "executor_notes": "Implemented.",
+                        "files_changed": ["megaplan/workers.py"],
+                        "commands_run": ["pytest tests/test_workers.py"],
+                    }
+                ],
+                "sense_check_acknowledgments": [
+                    {"sense_check_id": "SC1", "executor_note": "Confirmed."}
+                ],
             }
         ),
         encoding="utf-8",
@@ -225,6 +265,9 @@ def _mock_state(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, dict]:
                         "depends_on": [],
                         "status": "pending",
                         "executor_notes": "",
+                        "files_changed": [],
+                        "commands_run": [],
+                        "evidence_files": [],
                         "reviewer_verdict": "",
                     },
                     {
@@ -233,13 +276,16 @@ def _mock_state(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, dict]:
                         "depends_on": ["T1"],
                         "status": "pending",
                         "executor_notes": "",
+                        "files_changed": [],
+                        "commands_run": [],
+                        "evidence_files": [],
                         "reviewer_verdict": "",
                     },
                 ],
                 "watch_items": ["Watch repository assumptions."],
                 "sense_checks": [
-                    {"id": "SC1", "task_id": "T1", "question": "Did it work?", "verdict": ""},
-                    {"id": "SC2", "task_id": "T2", "question": "Was it verified?", "verdict": ""},
+                    {"id": "SC1", "task_id": "T1", "question": "Did it work?", "executor_note": "", "verdict": ""},
+                    {"id": "SC2", "task_id": "T2", "question": "Was it verified?", "executor_note": "", "verdict": ""},
                 ],
                 "meta_commentary": "Mock finalize output.",
             }
@@ -312,6 +358,7 @@ def test_mock_execute_returns_valid_payload(tmp_path: Path) -> None:
     assert "commands_run" in result.payload
     assert "deviations" in result.payload
     assert "task_updates" in result.payload
+    assert "sense_check_acknowledgments" in result.payload
     assert result.payload["task_updates"][0]["task_id"] == "T1"
 
 
@@ -319,6 +366,7 @@ def test_mock_review_returns_valid_payload(tmp_path: Path) -> None:
     from megaplan.workers import mock_worker_output
     plan_dir, state = _mock_state(tmp_path)
     result = mock_worker_output("review", state, plan_dir)
+    assert result.payload["review_verdict"] == "approved"
     assert "criteria" in result.payload
     assert "issues" in result.payload
     assert "summary" in result.payload
@@ -451,7 +499,10 @@ def test_validate_payload_critique_requires_flags() -> None:
 
 def test_validate_payload_execute_requires_output() -> None:
     with pytest.raises(CliError, match="output"):
-        validate_payload("execute", {"files_changed": [], "commands_run": [], "deviations": []})
+        validate_payload(
+            "execute",
+            {"files_changed": [], "commands_run": [], "deviations": [], "sense_check_acknowledgments": []},
+        )
 
 
 def test_validate_payload_review_requires_criteria() -> None:
