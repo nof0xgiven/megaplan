@@ -713,6 +713,20 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
     ]
     robustness = configured_robustness(state)
     debt_block = _gate_debt_block(plan_dir, root)
+    # Load critique checks for gate visibility
+    critique_checks_block = ""
+    critique_path = current_iteration_artifact(plan_dir, "critique", state["iteration"])
+    if Path(critique_path).exists():
+        critique_data = read_json(critique_path)
+        checks = critique_data.get("checks", [])
+        if checks:
+            check_summary = []
+            for check in checks:
+                findings = check.get("findings", [])
+                flagged_count = sum(1 for f in findings if f.get("flagged"))
+                status = f"{flagged_count} flagged" if flagged_count else "clear"
+                check_summary.append(f"- {check.get('id', '?')}: {status}")
+            critique_checks_block = "Critique checks completed:\n        " + "\n        ".join(check_summary)
     return textwrap.dedent(
         f"""
         You are the gatekeeper for the megaplan workflow. Make the continuation decision directly.
@@ -730,6 +744,8 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
 
         Gate signals:
         {json_dump(gate_signals).strip()}
+
+        {critique_checks_block}
 
         Unresolved significant flags:
         {json_dump(open_flags).strip()}
