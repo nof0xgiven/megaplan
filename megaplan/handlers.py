@@ -257,25 +257,24 @@ def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, ite
         if disputed_id in by_id:
             by_id[disputed_id]["status"] = "disputed"
 
-    # Convert flagged checks into standard flags
-    check_category_map = {
-        "callers": "correctness",
-        "all_locations": "correctness",
-        "conventions": "correctness",
-        "issue_hints": "correctness",
-        "scope": "completeness",
-    }
+    # Convert flagged findings from structured checks into standard flags
+    from megaplan.checks import build_check_category_map, get_check_by_id
+
+    check_category_map = build_check_category_map()
     for check in critique.get("checks", []):
-        if check.get("flagged"):
-            check_id = check.get("id", "")
-            synthetic_flag = {
-                "id": check_id,
-                "concern": f"{check.get('question', '')}: {check.get('finding', '')}",
-                "category": check_category_map.get(check_id, "correctness"),
-                "severity_hint": "likely-significant",
-                "evidence": check.get("finding", ""),
-            }
-            critique.setdefault("flags", []).append(synthetic_flag)
+        check_id = check.get("id", "")
+        for finding in check.get("findings", []):
+            if finding.get("flagged"):
+                check_def = get_check_by_id(check_id)
+                severity = check_def.get("default_severity", "uncertain") if check_def else "uncertain"
+                synthetic_flag = {
+                    "id": check_id,
+                    "concern": f"{check.get('question', '')}: {finding.get('detail', '')}",
+                    "category": check_category_map.get(check_id, "correctness"),
+                    "severity_hint": severity,
+                    "evidence": finding.get("detail", ""),
+                }
+                critique.setdefault("flags", []).append(synthetic_flag)
 
     for raw_flag in critique.get("flags", []):
         proposed_id = raw_flag.get("id")

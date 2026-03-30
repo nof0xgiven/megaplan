@@ -6,6 +6,7 @@ import textwrap
 from pathlib import Path
 from typing import Callable
 
+from megaplan.checks import CRITIQUE_CHECKS, build_empty_template, get_check_by_id
 from megaplan.types import (
     CliError,
     PlanState,
@@ -590,6 +591,40 @@ def _render_prep_block(plan_dir: Path) -> tuple[str, str]:
     return prep_block, prep_instruction
 
 
+def _render_critique_checks() -> str:
+    """Render check questions and guidance from CRITIQUE_CHECKS."""
+    lines = []
+    for i, check in enumerate(CRITIQUE_CHECKS, 1):
+        lines.append(
+            f"{i}. id=\"{check['id']}\" — \"{check['question']}\"\n"
+            f"           {check.get('guidance', check.get('instruction', ''))}"
+        )
+    return "\n\n        ".join(lines)
+
+
+def _render_critique_template(plan_dir: Path, state: PlanState) -> str:
+    """Render the JSON template the model fills in, with prior findings if iteration 2+."""
+    iteration = state.get("iteration", 1)
+    if iteration > 1:
+        # Load prior critique to show what was found before
+        prior_path = plan_dir / f"critique_v{iteration - 1}.json"
+        if prior_path.exists():
+            prior = read_json(prior_path)
+            prior_checks = prior.get("checks", [])
+            if prior_checks:
+                return textwrap.dedent(f"""
+                    This is critique iteration {iteration}. Each check shows your prior findings and how they were addressed.
+                    Verify addressed flags were fixed. Re-flag if inadequate. Check for new issues.
+
+                    Fill in fresh findings for each check:
+                    {json_dump(build_empty_template()).strip()}
+                """).strip()
+    return textwrap.dedent(f"""
+        Fill in this template with your findings:
+        {json_dump(build_empty_template()).strip()}
+    """).strip()
+
+
 def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     project_dir = Path(state["config"]["project_dir"])
     prep_block, prep_instruction = _render_prep_block(plan_dir)
@@ -639,26 +674,13 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
 
         {debt_block}
 
-        You MUST fill in ALL 5 checks below. For each, state what you found. Set flagged=true only for concrete issues. "No issue found" is valid.
+        Fill in ALL {len(CRITIQUE_CHECKS)} checks below. For each, add at least one finding with "detail" (what you found) and "flagged" (true if it's a problem). {{"detail": "No issue found", "flagged": false}} is valid. You can add multiple findings per check.
 
-        The 5 required checks:
+        {_render_critique_checks()}
 
-        1. id="callers" — "Does the plan change a function with multiple callers? Would the change break any?"
-           Search for callers of the function being modified. If called from different code paths, it may need a NEW method instead.
+        After filling in checks, add any additional concerns to the `flags` array (e.g., security, performance, dependencies). Use the standard format (id, concern, category, severity_hint, evidence). This array can be empty.
 
-        2. id="all_locations" — "Does the plan touch ALL locations where this bug/pattern exists?"
-           Grep the codebase for the parameter/pattern being fixed. Don't trust the plan's file list — verify.
-
-        3. id="conventions" — "Does the plan's approach match the codebase's conventions?"
-           Read 2-3 similar functions in the same file. Check optional params, error handling, return patterns. Flag deviations.
-
-        4. id="issue_hints" — "Does the plan follow what the issue/hints suggest?"
-           If the task suggests a specific approach and the plan deviates, flag it.
-
-        5. id="scope" — "Is the scope appropriate?"
-           Not too narrow (under-fix) or too broad (scope creep). If scope is limited to avoid breaking tests, flag.
-
-        After filling in checks, add any additional concerns that don't fit the 5 checks to the `flags` array (e.g., security issues, performance, dependencies). Use the standard format (id, concern, category, severity_hint, evidence). This array can be empty.
+        {_render_critique_template(plan_dir, state)}
 
         Additional guidelines:
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}

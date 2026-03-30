@@ -130,10 +130,19 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                     "properties": {
                         "id": {"type": "string"},
                         "question": {"type": "string"},
-                        "finding": {"type": "string"},
-                        "flagged": {"type": "boolean"},
+                        "findings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "detail": {"type": "string"},
+                                    "flagged": {"type": "boolean"},
+                                },
+                                "required": ["detail", "flagged"],
+                            },
+                        },
                     },
-                    "required": ["id", "question", "finding", "flagged"],
+                    "required": ["id", "question", "findings"],
                 },
             },
             "flags": {
