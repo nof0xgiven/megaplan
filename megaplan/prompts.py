@@ -606,18 +606,43 @@ def _render_critique_template(plan_dir: Path, state: PlanState) -> str:
     """Render the JSON template the model fills in, with prior findings if iteration 2+."""
     iteration = state.get("iteration", 1)
     if iteration > 1:
-        # Load prior critique to show what was found before
         prior_path = plan_dir / f"critique_v{iteration - 1}.json"
         if prior_path.exists():
             prior = read_json(prior_path)
             prior_checks = prior.get("checks", [])
             if prior_checks:
+                # Build template showing what was found last time
+                registry = load_flag_registry(plan_dir)
+                flag_status = {f["id"]: f.get("status", "open") for f in registry.get("flags", [])}
+                enriched = []
+                for check in prior_checks:
+                    cid = check.get("id", "")
+                    entry = {
+                        "id": cid,
+                        "question": check.get("question", ""),
+                        "prior_findings": [
+                            {
+                                "detail": f.get("detail", ""),
+                                "flagged": f.get("flagged", False),
+                                "status": flag_status.get(cid, "open") if f.get("flagged") else "n/a",
+                            }
+                            for f in check.get("findings", [])
+                        ],
+                        "findings": [],
+                    }
+                    enriched.append(entry)
+                # Add any new checks not in prior
+                prior_ids = {c.get("id") for c in prior_checks}
+                for check_def in CRITIQUE_CHECKS:
+                    if check_def["id"] not in prior_ids:
+                        enriched.append({"id": check_def["id"], "question": check_def["question"], "findings": []})
                 return textwrap.dedent(f"""
-                    This is critique iteration {iteration}. Each check shows your prior findings and how they were addressed.
-                    Verify addressed flags were fixed. Re-flag if inadequate. Check for new issues.
+                    This is critique iteration {iteration}. Prior findings are shown with their status.
+                    - Verify addressed flags were actually fixed
+                    - Re-flag if the fix is inadequate
+                    - Check for new issues introduced by the revision
 
-                    Fill in fresh findings for each check:
-                    {json_dump(build_empty_template()).strip()}
+                    {json_dump(enriched).strip()}
                 """).strip()
     return textwrap.dedent(f"""
         Fill in this template with your findings:
