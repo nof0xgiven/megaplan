@@ -279,7 +279,8 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         4. Challenge the obvious path: if the task or hints point to a specific location, verify it's actually the right place. Trace the call chain — where does data flow? Where does it go wrong? The obvious file may be a symptom, not the root cause.
         5. If the task describes a bug or incorrect behavior, seriously consider whether it is a symptom of a larger issue. Before proposing a fix, trace the root cause. Ask: why does this happen? Could the same root cause produce other failures? Is the fix a patch on one case, or does it need to address an underlying gap? If the codebase has related functionality that is also incomplete or broken, note it — a narrow fix may not be enough.
         6. If you find that a suggested fix already exists in the code, say so explicitly — this means the root cause is elsewhere.
-        7. Distill into a brief that adds value beyond the raw task description.
+        7. Once you identify the function, parameter, or pattern that needs fixing, grep for ALL other usages of it in the codebase. If the same parameter is passed in 3 places, all 3 may need the fix. List every call site in relevant_code — do not stop at the first one.
+        8. Distill into a brief that adds value beyond the raw task description.
 
         Brief fields:
         - skip: true if no investigation needed, false if brief has useful content.
