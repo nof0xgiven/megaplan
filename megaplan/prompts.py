@@ -280,7 +280,9 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         5. If the task describes a bug or incorrect behavior, seriously consider whether it is a symptom of a larger issue. Before proposing a fix, trace the root cause. Ask: why does this happen? Could the same root cause produce other failures? Is the fix a patch on one case, or does it need to address an underlying gap? If the codebase has related functionality that is also incomplete or broken, note it — a narrow fix may not be enough.
         6. If you find that a suggested fix already exists in the code, say so explicitly — this means the root cause is elsewhere.
         7. Once you identify the function, parameter, or pattern that needs fixing, grep for ALL other usages of it in the codebase. If the same parameter is passed in 3 places, all 3 may need the fix. List every call site in relevant_code — do not stop at the first one.
-        8. Distill into a brief that adds value beyond the raw task description.
+        8. If the code has a `NotImplementedError`, `raise`, `TODO`, or explicit skip for certain inputs, and the bug involves those inputs, the fix likely needs to implement the missing functionality — not just patch around it. Flag this in the brief so the plan knows a larger change is needed.
+        9. Look for existing helper functions, utilities, or patterns in the codebase that handle similar cases. If there is existing machinery (e.g., a merge function, a validation helper, a base class method), the fix should use it rather than reinventing.
+        10. Distill into a brief that adds value beyond the raw task description.
 
         Brief fields:
         - skip: true if no investigation needed, false if brief has useful content.
