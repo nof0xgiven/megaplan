@@ -658,7 +658,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         5. id="scope" — "Is the scope appropriate?"
            Not too narrow (under-fix) or too broad (scope creep). If scope is limited to avoid breaking tests, flag.
 
-        After filling in checks, add any ADDITIONAL issues to the `flags` array using the standard format (id, concern, category, severity_hint, evidence).
+        After filling in checks, add any additional concerns that don't fit the 5 checks to the `flags` array (e.g., security issues, performance, dependencies). Use the standard format (id, concern, category, severity_hint, evidence). This array can be empty.
 
         Additional guidelines:
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
