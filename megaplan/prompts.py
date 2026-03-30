@@ -272,7 +272,7 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         - There are hints or references that need investigation
 
         If skipping, leave everything else empty. The original task description will be used directly.
-        If not skipping, fill in the brief. Be efficient — aim for 5-10 tool calls, not 20+. Read the most relevant files, not every related file:
+        If not skipping, fill in the brief:
         1. Search the codebase (Glob, Grep, Read) for relevant files and functions.
         2. If tests exist for the affected code, read them — they reveal what the fix must actually do, which may differ from what the task description suggests.
         3. Extract evidence from the task description — hints, references, error messages.
