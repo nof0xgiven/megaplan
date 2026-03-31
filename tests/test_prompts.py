@@ -75,7 +75,7 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, PlanState]:
             "version": iteration,
             "timestamp": "2026-03-20T00:00:00Z",
             "hash": "sha256:test",
-            "success_criteria": ["criterion"],
+            "success_criteria": [{"criterion": "criterion", "priority": "must"}],
             "questions": ["question"],
             "assumptions": ["assumption"],
         },
@@ -308,7 +308,11 @@ def test_render_prep_block_formats_existing_brief(tmp_path: Path) -> None:
     assert "FAIL_TO_PASS::prep-phase" in block
     assert "Do not break standard robustness routing." in block
     assert "Render the brief before the raw task context in downstream prompts." in block
-    assert instruction == "The engineering brief above was produced by analyzing the codebase. Use it as primary context."
+    assert instruction == (
+        "The engineering brief above was produced by analyzing the codebase. "
+        "Use it as a strong starting point, but the suggested approach is a hypothesis — "
+        "verify it's the best fix, not just a valid one."
+    )
 
 
 def test_light_plan_prompt_uses_normal_plan_prompt(tmp_path: Path) -> None:
@@ -327,6 +331,30 @@ def test_plan_prompt_uses_existing_clarification_context(tmp_path: Path) -> None
     prompt = create_claude_prompt("plan", state, plan_dir)
     assert "Existing clarification context" in prompt
     assert "Keep it simple" in prompt
+
+
+def test_plan_prompt_includes_research_context_when_present(tmp_path: Path) -> None:
+    plan_dir, state = _scaffold(tmp_path)
+    atomic_write_json(
+        plan_dir / "research.json",
+        {
+            "considerations": [
+                {
+                    "point": "Use the documented path",
+                    "severity": "important",
+                    "detail": "The current docs require the new workflow branch to load research.json.",
+                    "source": "docs",
+                }
+            ],
+            "summary": "Found one documentation concern.",
+        },
+    )
+
+    prompt = create_claude_prompt("plan", state, plan_dir)
+
+    assert "A researcher recommended you consider these points" in prompt
+    assert "Use the documented path" in prompt
+    assert "current documentation searches" in prompt
 
 
 def test_revise_prompt_reads_gate_summary(tmp_path: Path) -> None:
@@ -429,7 +457,7 @@ def test_critique_prompt_includes_structure_guidance_and_warnings(tmp_path: Path
             "version": 1,
             "timestamp": "2026-03-20T00:00:00Z",
             "hash": "sha256:test",
-            "success_criteria": ["criterion"],
+            "success_criteria": [{"criterion": "criterion", "priority": "must"}],
             "questions": ["question"],
             "assumptions": ["assumption"],
             "structure_warnings": ["Plan should include a `## Overview` section."],
@@ -554,6 +582,10 @@ def test_finalize_prompt_requests_structured_tracking_fields(tmp_path: Path) -> 
     assert "sense_checks" in prompt
     assert "executor_notes" in prompt
     assert "reviewer_verdict" in prompt
+    assert "validation" in prompt
+    assert "plan_steps_covered" in prompt
+    assert "orphan_tasks" in prompt
+    assert "coverage_complete" in prompt
     assert "final_plan" not in prompt
     assert "_notes:_" not in prompt
     assert "_verdict:_" not in prompt
@@ -569,12 +601,14 @@ def test_review_prompts_request_verdict_arrays(tmp_path: Path) -> None:
     assert "evidence_files" in claude_prompt
     assert "execution_audit.json" in claude_prompt
     assert "needs_rework" in claude_prompt
+    assert "rework_items" in claude_prompt
     assert "review_verdict" in codex_prompt
     assert "task_verdicts" in codex_prompt
     assert "sense_check_verdicts" in codex_prompt
     assert "evidence_files" in codex_prompt
     assert "execution_audit.json" in codex_prompt
     assert "needs_rework" in codex_prompt
+    assert "rework_items" in codex_prompt
     assert "final.md" not in claude_prompt
     assert "final.md" not in codex_prompt
 

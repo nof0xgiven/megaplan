@@ -109,7 +109,7 @@ def _scaffold(tmp_path: Path, *, iteration: int = 1, flags: list[dict[str, objec
             "version": iteration,
             "timestamp": "2026-03-20T00:00:00Z",
             "hash": "sha256:test",
-            "success_criteria": ["criterion"],
+            "success_criteria": [{"criterion": "criterion", "priority": "must"}],
             "questions": [],
             "assumptions": [],
         },

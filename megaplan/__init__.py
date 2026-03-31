@@ -32,6 +32,8 @@ from megaplan.handlers import (
     handle_execute,
     handle_review,
     handle_step,
+)
+from megaplan.flags import (
     normalize_flag_record,
     update_flags_after_critique,
     update_flags_after_revise,

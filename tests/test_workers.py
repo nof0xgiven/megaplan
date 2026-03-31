@@ -52,10 +52,11 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
 @pytest.mark.parametrize(
     ("step", "payload"),
     [
-        ("plan", {"plan": "x", "questions": [], "success_criteria": [], "assumptions": []}),
+        ("plan", {"plan": "x", "questions": [], "success_criteria": [{"criterion": "test", "priority": "must"}], "assumptions": []}),
         (
             "prep",
             {
+                "skip": False,
                 "task_summary": "Prepare context before planning.",
                 "key_evidence": [],
                 "relevant_code": [],
@@ -115,6 +116,12 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
                     }
                 ],
                 "meta_commentary": "ok",
+                "validation": {
+                    "plan_steps_covered": [{"plan_step_summary": "Do work", "finalize_task_ids": ["T1"]}],
+                    "orphan_tasks": [],
+                    "completeness_notes": "All covered.",
+                    "coverage_complete": True,
+                },
             },
         ),
         (
@@ -144,6 +151,7 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
                 "review_verdict": "approved",
                 "criteria": [],
                 "issues": [],
+                "rework_items": [],
                 "summary": "ok",
                 "task_verdicts": [
                     {
@@ -261,7 +269,7 @@ def _mock_state(tmp_path: Path, *, iteration: int = 1) -> tuple[Path, dict]:
     }
     (plan_dir / f"plan_v{iteration}.md").write_text("# Plan\nDo it.\n", encoding="utf-8")
     (plan_dir / f"plan_v{iteration}.meta.json").write_text(
-        json.dumps({"version": iteration, "timestamp": "2026-03-20T00:00:00Z", "hash": "sha256:test", "success_criteria": ["criterion"], "questions": [], "assumptions": []}),
+        json.dumps({"version": iteration, "timestamp": "2026-03-20T00:00:00Z", "hash": "sha256:test", "success_criteria": [{"criterion": "criterion", "priority": "must"}], "questions": [], "assumptions": []}),
         encoding="utf-8",
     )
     (plan_dir / "faults.json").write_text(json.dumps({"flags": []}), encoding="utf-8")
@@ -426,10 +434,16 @@ def test_mock_finalize_returns_valid_payload(tmp_path: Path) -> None:
     assert "watch_items" in result.payload
     assert "sense_checks" in result.payload
     assert "meta_commentary" in result.payload
+    assert "validation" in result.payload
     assert isinstance(result.payload["tasks"], list)
     assert isinstance(result.payload["watch_items"], list)
     assert result.payload["tasks"][0]["status"] == "pending"
     assert result.payload["sense_checks"][0]["task_id"] == "T1"
+    validation = result.payload["validation"]
+    assert "plan_steps_covered" in validation
+    assert "orphan_tasks" in validation
+    assert "coverage_complete" in validation
+    assert isinstance(validation["plan_steps_covered"], list)
 
 
 def test_mock_execute_returns_valid_payload(tmp_path: Path) -> None:
@@ -452,9 +466,11 @@ def test_mock_review_returns_valid_payload(tmp_path: Path) -> None:
     assert result.payload["review_verdict"] == "approved"
     assert "criteria" in result.payload
     assert "issues" in result.payload
+    assert "rework_items" in result.payload
     assert "summary" in result.payload
     assert "task_verdicts" in result.payload
     assert "sense_check_verdicts" in result.payload
+    assert result.payload["rework_items"] == []
 
 
 def test_mock_unsupported_step_raises(tmp_path: Path) -> None:
@@ -607,7 +623,7 @@ def test_run_claude_step_parses_structured_output(tmp_path: Path) -> None:
     plan_payload = {
         "plan": "# Plan\nDo it.",
         "questions": [],
-        "success_criteria": ["criterion"],
+        "success_criteria": [{"criterion": "criterion", "priority": "must"}],
         "assumptions": [],
     }
     claude_output = json.dumps({
@@ -641,7 +657,7 @@ def test_run_claude_step_uses_prompt_override_without_builder(tmp_path: Path) ->
         command=["claude"],
         cwd=tmp_path,
         returncode=0,
-        stdout=json.dumps({"structured_output": {"plan": "x", "questions": [], "success_criteria": [], "assumptions": []}}),
+        stdout=json.dumps({"structured_output": {"plan": "x", "questions": [], "success_criteria": [{"criterion": "test", "priority": "must"}], "assumptions": []}}),
         stderr="",
         duration_ms=10,
     )
@@ -716,7 +732,7 @@ def test_run_codex_step_uses_prompt_override_without_builder(tmp_path: Path) -> 
 
     def fake_run_command(*args: object, **kwargs: object) -> CommandResult:
         output_path.write_text(
-            json.dumps({"plan": "# Plan", "questions": [], "success_criteria": [], "assumptions": []}),
+            json.dumps({"plan": "# Plan", "questions": [], "success_criteria": [{"criterion": "test", "priority": "must"}], "assumptions": []}),
             encoding="utf-8",
         )
         return CommandResult(
@@ -771,7 +787,7 @@ def test_run_codex_step_parses_output_file(tmp_path: Path) -> None:
     plan_payload = {
         "plan": "# Plan\nDo it.",
         "questions": [],
-        "success_criteria": ["criterion"],
+        "success_criteria": [{"criterion": "criterion", "priority": "must"}],
         "assumptions": [],
     }
 

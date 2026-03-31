@@ -120,6 +120,8 @@ def test_finalize_schema_tracks_structured_execution_fields() -> None:
     finalize = SCHEMAS["finalize.json"]
     assert "tasks" in finalize["properties"]
     assert "sense_checks" in finalize["properties"]
+    assert "validation" in finalize["properties"]
+    assert "validation" in finalize["required"]
     assert "final_plan" not in finalize["properties"]
     assert "task_count" not in finalize["properties"]
     task_schema = finalize["properties"]["tasks"]["items"]
@@ -136,6 +138,16 @@ def test_finalize_schema_tracks_structured_execution_fields() -> None:
     }
     assert task_schema["properties"]["status"]["enum"] == ["pending", "done", "skipped"]
     assert "executor_note" in finalize["properties"]["sense_checks"]["items"]["properties"]
+    # Validation sub-schema
+    validation_schema = finalize["properties"]["validation"]
+    assert "plan_steps_covered" in validation_schema["properties"]
+    assert "orphan_tasks" in validation_schema["properties"]
+    assert "completeness_notes" in validation_schema["properties"]
+    assert "coverage_complete" in validation_schema["properties"]
+    step_item = validation_schema["properties"]["plan_steps_covered"]["items"]
+    assert "plan_step_summary" in step_item["properties"]
+    assert "finalize_task_ids" in step_item["properties"]
+    assert step_item["properties"]["finalize_task_ids"]["type"] == "array"
 
 
 def test_execution_schema_requires_task_updates() -> None:
@@ -155,10 +167,20 @@ def test_review_schema_requires_task_and_sense_check_verdicts() -> None:
     assert "review_verdict" in review["properties"]
     assert "task_verdicts" in review["properties"]
     assert "sense_check_verdicts" in review["properties"]
+    assert "rework_items" in review["properties"]
     assert "review_verdict" in review["required"]
     assert "task_verdicts" in review["required"]
     assert "sense_check_verdicts" in review["required"]
+    assert "rework_items" in review["required"]
     assert "evidence_files" in review["properties"]["task_verdicts"]["items"]["properties"]
+    # Rework items sub-schema
+    rework_item = review["properties"]["rework_items"]["items"]
+    assert "task_id" in rework_item["properties"]
+    assert "issue" in rework_item["properties"]
+    assert "expected" in rework_item["properties"]
+    assert "actual" in rework_item["properties"]
+    assert "evidence_file" in rework_item["properties"]
+    assert set(rework_item["required"]) == {"task_id", "issue", "expected", "actual"}
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +211,7 @@ def test_plan_schema_has_core_fields_only() -> None:
 def test_prep_schema_exists_and_has_expected_structure() -> None:
     schema = strict_schema(SCHEMAS["prep.json"])
     assert set(schema["required"]) == {
+        "skip",
         "task_summary",
         "key_evidence",
         "relevant_code",

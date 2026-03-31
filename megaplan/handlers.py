@@ -1,28 +1,24 @@
 from __future__ import annotations
 
 import argparse
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 import megaplan.workers as worker_module
+from megaplan.checks import validate_critique_checks
 from megaplan.execution import (
-    _capture_git_status_snapshot,
     _check_done_task_evidence,
-    _resolve_execute_approval_mode,
     handle_execute_auto_loop as dispatch_execute_auto_loop,
     handle_execute_one_batch as dispatch_execute_one_batch,
 )
-from megaplan.merge import _merge_validated_entries, _validate_and_merge_batch, _validate_merge_inputs
+from megaplan.flags import update_flags_after_critique, update_flags_after_revise
+from megaplan.merge import _validate_and_merge_batch, _validate_merge_inputs
+from megaplan.step_edit import handle_step, next_plan_artifact_name
 from megaplan.types import (
     FLAG_BLOCKING_STATUSES,
     ROBUSTNESS_LEVELS,
     CliError,
-    FlagRecord,
-    FlagRegistry,
-    GateCheckResult,
-    HistoryEntry,
     PlanState,
     STATE_ABORTED,
     STATE_CRITIQUED,
@@ -38,23 +34,24 @@ from megaplan.types import (
 )
 from megaplan._core import (
     add_or_increment_debt,
+    append_history,
+    apply_session_update,
     atomic_write_json,
     atomic_write_text,
     configured_robustness,
-    current_iteration_raw_artifact,
     ensure_runtime_layout,
     extract_subsystem_tag,
-    latest_plan_meta_path,
     latest_plan_path,
     load_debt_registry,
     load_flag_registry,
     load_plan,
+    make_history_entry,
     now_utc,
     plans_root,
     read_json,
+    record_step_failure,
     render_final_md,
     save_debt_registry,
-    save_flag_registry,
     save_state,
     scope_creep_flags,
     sha256_file,
@@ -67,134 +64,21 @@ from megaplan._core import (
 )
 from megaplan.evaluation import (
     PLAN_STRUCTURE_REQUIRED_STEP_ISSUE,
-    PlanSection,
     build_gate_artifact,
     build_gate_signals,
     build_orchestrator_guidance,
     compute_plan_delta_percent,
     compute_recurring_critiques,
     is_rubber_stamp,
-    parse_plan_sections,
-    reassemble_plan,
-    renumber_steps,
     run_gate_checks,
-    validate_execution_evidence,
     validate_plan_structure,
 )
 from megaplan._core import find_command, infer_next_steps, require_state
-from megaplan.workers import WorkerResult, update_session_state, validate_payload
+from megaplan.workers import WorkerResult, validate_payload
 
 
 def _append_to_meta(state: PlanState, field: str, value: Any) -> None:
     state["meta"].setdefault(field, []).append(value)
-
-
-def apply_session_update(
-    state: PlanState,
-    step: str,
-    agent: str,
-    session_id: str | None,
-    *,
-    mode: str,
-    refreshed: bool,
-) -> None:
-    result = update_session_state(
-        step,
-        agent,
-        session_id,
-        mode=mode,
-        refreshed=refreshed,
-        existing_sessions=state["sessions"],
-    )
-    if result is not None:
-        key, entry = result
-        state["sessions"][key] = entry
-
-
-def append_history(state: PlanState, entry: HistoryEntry) -> None:
-    state["history"].append(entry)
-    state["meta"].setdefault("total_cost_usd", 0.0)
-    state["meta"]["total_cost_usd"] = round(
-        float(state["meta"]["total_cost_usd"]) + float(entry.get("cost_usd", 0.0)),
-        6,
-    )
-
-
-def next_flag_number(flags: list[FlagRecord]) -> int:
-    highest = 0
-    for flag in flags:
-        match = re.fullmatch(r"FLAG-(\d+)", flag["id"])
-        if match:
-            highest = max(highest, int(match.group(1)))
-    return highest + 1
-
-
-def make_flag_id(number: int) -> str:
-    return f"FLAG-{number:03d}"
-
-
-def resolve_severity(hint: str) -> str:
-    if hint == "likely-significant":
-        return "significant"
-    if hint == "likely-minor":
-        return "minor"
-    if hint == "uncertain":
-        return "minor"  # Don't auto-escalate uncertainty to blocking
-    return "significant"
-
-
-def make_history_entry(
-    step: str,
-    *,
-    duration_ms: int,
-    cost_usd: float,
-    result: str,
-    worker: WorkerResult | None = None,
-    agent: str | None = None,
-    mode: str | None = None,
-    output_file: str | None = None,
-    artifact_hash: str | None = None,
-    finalize_hash: str | None = None,
-    raw_output_file: str | None = None,
-    message: str | None = None,
-    flags_count: int | None = None,
-    flags_addressed: list[str] | None = None,
-    recommendation: str | None = None,
-    approval_mode: str | None = None,
-    environment: dict[str, bool] | None = None,
-) -> HistoryEntry:
-    entry: HistoryEntry = {
-        "step": step,
-        "timestamp": now_utc(),
-        "duration_ms": duration_ms,
-        "cost_usd": cost_usd,
-        "result": result,
-    }
-    if worker is not None and agent is not None and mode is not None:
-        entry["session_mode"] = mode
-        entry["session_id"] = worker.session_id
-        entry["agent"] = agent
-    if output_file is not None:
-        entry["output_file"] = output_file
-    if artifact_hash is not None:
-        entry["artifact_hash"] = artifact_hash
-    if finalize_hash is not None:
-        entry["finalize_hash"] = finalize_hash
-    if raw_output_file is not None:
-        entry["raw_output_file"] = raw_output_file
-    if message is not None:
-        entry["message"] = message
-    if flags_count is not None:
-        entry["flags_count"] = flags_count
-    if flags_addressed is not None:
-        entry["flags_addressed"] = flags_addressed
-    if recommendation is not None:
-        entry["recommendation"] = recommendation
-    if approval_mode is not None:
-        entry["approval_mode"] = approval_mode
-    if environment is not None:
-        entry["environment"] = environment
-    return entry
 
 
 def attach_agent_fallback(response: StepResponse, args: argparse.Namespace) -> None:
@@ -226,355 +110,315 @@ def _is_substantive_reviewer_verdict(text: str) -> bool:
     return not is_rubber_stamp(text, strict=True)
 
 
-def normalize_flag_record(raw_flag: dict[str, Any], fallback_id: str) -> FlagRecord:
-    category = raw_flag.get("category", "other")
-    if category not in {"correctness", "security", "completeness", "performance", "maintainability", "other"}:
-        category = "other"
-    severity_hint = raw_flag.get("severity_hint") or "uncertain"
-    if severity_hint not in {"likely-significant", "likely-minor", "uncertain"}:
-        severity_hint = "uncertain"
-    raw_id = raw_flag.get("id")
-    return {
-        "id": fallback_id if raw_id in {None, "", "FLAG-000"} else raw_id,
-        "concern": raw_flag.get("concern", "").strip(),
-        "category": category,
-        "severity_hint": severity_hint,
-        "evidence": raw_flag.get("evidence", "").strip(),
-    }
+_AUTO_NEXT_STEP = object()
 
 
-def update_flags_after_critique(plan_dir: Path, critique: dict[str, Any], *, iteration: int) -> FlagRegistry:
-    registry = load_flag_registry(plan_dir)
-    flags = registry.setdefault("flags", [])
-    by_id: dict[str, FlagRecord] = {flag["id"]: flag for flag in flags}
-    next_number = next_flag_number(flags)
-
-    for verified_id in critique.get("verified_flag_ids", []):
-        if verified_id in by_id:
-            by_id[verified_id]["status"] = "verified"
-            by_id[verified_id]["verified"] = True
-            by_id[verified_id]["verified_in"] = f"critique_v{iteration}.json"
-
-    for disputed_id in critique.get("disputed_flag_ids", []):
-        if disputed_id in by_id:
-            by_id[disputed_id]["status"] = "disputed"
-
-    # Convert flagged findings from structured checks into standard flags
-    from megaplan.checks import build_check_category_map, get_check_by_id
-
-    check_category_map = build_check_category_map()
-    for check in critique.get("checks", []):
-        check_id = check.get("id", "")
-        flagged_findings = [f for f in check.get("findings", []) if f.get("flagged")]
-        for i, finding in enumerate(flagged_findings):
-            check_def = get_check_by_id(check_id)
-            severity = check_def.get("default_severity", "uncertain") if check_def else "uncertain"
-            # Unique ID per finding to avoid overwrites when same check flags multiple issues
-            flag_id = check_id if len(flagged_findings) == 1 else f"{check_id}-{i + 1}"
-            synthetic_flag = {
-                "id": flag_id,
-                "concern": f"{check.get('question', '')}: {finding.get('detail', '')}",
-                "category": check_category_map.get(check_id, "correctness"),
-                "severity_hint": severity,
-                "evidence": finding.get("detail", ""),
-            }
-            critique.setdefault("flags", []).append(synthetic_flag)
-
-    for raw_flag in critique.get("flags", []):
-        proposed_id = raw_flag.get("id")
-        if not proposed_id or proposed_id in {"", "FLAG-000"}:
-            proposed_id = make_flag_id(next_number)
-            next_number += 1
-        normalized = normalize_flag_record(raw_flag, proposed_id)
-        if normalized["id"] in by_id:
-            existing = by_id[normalized["id"]]
-            existing.update(normalized)
-            existing["status"] = "open"
-            existing["severity"] = resolve_severity(normalized.get("severity_hint", "uncertain"))
-            existing["raised_in"] = f"critique_v{iteration}.json"
-        else:
-            severity = resolve_severity(normalized.get("severity_hint", "uncertain"))
-            created: FlagRecord = {
-                **normalized,
-                "raised_in": f"critique_v{iteration}.json",
-                "status": "open",
-                "severity": severity,
-                "verified": False,
-            }
-            flags.append(created)
-            by_id[created["id"]] = created
-
-    save_flag_registry(plan_dir, registry)
-    return registry
-
-
-def update_flags_after_revise(plan_dir: Path, flags_addressed: list[str], *, plan_file: str, summary: str) -> FlagRegistry:
-    registry = load_flag_registry(plan_dir)
-    for flag in registry["flags"]:
-        if flag["id"] in flags_addressed:
-            flag["status"] = "addressed"
-            flag["addressed_in"] = plan_file
-            flag["evidence"] = summary
-    save_flag_registry(plan_dir, registry)
-    return registry
-
-
-def next_plan_artifact_name(plan_dir: Path, version: int) -> str:
-    base = f"plan_v{version}"
-    candidate = f"{base}.md"
-    if not (plan_dir / candidate).exists():
-        return candidate
-    suffix_ord = ord("a")
-    while True:
-        candidate = f"{base}{chr(suffix_ord)}.md"
-        if not (plan_dir / candidate).exists():
-            return candidate
-        suffix_ord += 1
-
-
-_STEP_EDIT_ALLOWED_STATES = {STATE_PLANNED, STATE_CRITIQUED, STATE_GATED, STATE_FINALIZED}
-_STEP_ID_RE = re.compile(r"^S(\d+)$", re.IGNORECASE)
-
-
-def _normalize_step_id(raw_step_id: str, *, label: str) -> str:
-    match = _STEP_ID_RE.fullmatch(raw_step_id.strip())
-    if match is None:
-        raise CliError("invalid_args", f"{label} must use the form S<number>; got '{raw_step_id}'")
-    return f"S{int(match.group(1))}"
-
-
-def _step_section_index(sections: list[PlanSection], step_id: str) -> int:
-    for index, section in enumerate(sections):
-        if section.id == step_id:
-            return index
-    raise CliError("missing_step", f"Plan does not contain step '{step_id}'")
-
-
-def _last_step_section_index(sections: list[PlanSection]) -> int | None:
-    last_index: int | None = None
-    for index, section in enumerate(sections):
-        if section.id is not None:
-            last_index = index
-    return last_index
-
-
-def _default_step_insert_index(sections: list[PlanSection]) -> int:
-    last_step_index = _last_step_section_index(sections)
-    if last_step_index is not None:
-        return last_step_index + 1
-    for index, section in enumerate(sections):
-        if section.heading in {"## Execution Order", "## Validation Order"}:
-            return index
-    return len(sections)
-
-
-def _make_step_scaffold(description: str, *, heading_level: str = "##") -> PlanSection:
-    clean_description = description.strip()
-    if not clean_description:
-        raise CliError("invalid_args", "step add requires a non-empty description")
-    body = (
-        f"{heading_level} Step 0: {clean_description}\n"
-        "**Scope:** Small\n"
-        "1. **TODO** Fill in implementation details (`path/to/file`).\n\n"
-    )
-    return PlanSection(heading=f"{heading_level} Step 0: {clean_description}", body=body, id="S0", start_line=0, end_line=0)
-
-
-def _detect_step_heading_level(sections: list[PlanSection]) -> str:
-    """Detect whether existing steps use ## or ### headings."""
-    for section in sections:
-        if section.id is not None and section.heading.startswith("### "):
-            return "###"
-    return "##"
-
-
-def _commit_step_edit(
-    plan_dir: Path,
+def _run_worker(
+    step: str,
     state: PlanState,
-    sections: list[PlanSection],
+    plan_dir: Path,
+    args: argparse.Namespace,
     *,
-    action: str,
-    action_summary: str,
-) -> tuple[str, str, list[str]]:
-    plan_text = reassemble_plan(sections)
-    structure_warnings = validate_plan_structure(plan_text)
-    if PLAN_STRUCTURE_REQUIRED_STEP_ISSUE in structure_warnings:
-        raise CliError(
-            "structure_error",
-            f"Step edit failed structural validation: {PLAN_STRUCTURE_REQUIRED_STEP_ISSUE}",
-            valid_next=infer_next_steps(state),
-        )
-
-    previous_meta_path = latest_plan_meta_path(plan_dir, state)
-    previous_meta = read_json(previous_meta_path) if previous_meta_path.exists() else {}
-    plan_filename = next_plan_artifact_name(plan_dir, state["iteration"])
-    meta_filename = plan_filename.replace(".md", ".meta.json")
-    meta = {
-        "version": state["iteration"],
-        "timestamp": now_utc(),
-        "hash": sha256_text(plan_text),
-        "questions": previous_meta.get("questions", []),
-        "success_criteria": previous_meta.get("success_criteria", []),
-        "assumptions": previous_meta.get("assumptions", []),
-        "structure_warnings": structure_warnings,
-        "step_edit": {
-            "action": action,
-            "action_summary": action_summary,
-        },
-    }
-    atomic_write_text(plan_dir / plan_filename, plan_text)
-    atomic_write_json(plan_dir / meta_filename, meta)
-    state["current_state"] = STATE_PLANNED
-    state["meta"].pop("user_approved_gate", None)
-    state["last_gate"] = {}
-    state["plan_versions"].append(
-        {"version": state["iteration"], "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]}
-    )
-    append_history(
-        state,
-        make_history_entry(
-            "step",
-            duration_ms=0,
-            cost_usd=0.0,
-            result="success",
-            output_file=plan_filename,
-            artifact_hash=meta["hash"],
-            message=action_summary,
-        ),
-    )
-    save_state(plan_dir, state)
-    return plan_filename, meta_filename, structure_warnings
+    root: Path,
+    iteration: int | None = None,
+) -> tuple[WorkerResult, str, str, bool]:
+    failure_iteration = state["iteration"] if iteration is None else iteration
+    try:
+        return worker_module.run_step_with_worker(step, state, plan_dir, args, root=root)
+    except CliError as error:
+        record_step_failure(plan_dir, state, step=step, iteration=failure_iteration, error=error)
+        raise
 
 
-def _step_add(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
-    sections = parse_plan_sections(latest_plan_path(plan_dir, state).read_text(encoding="utf-8"))
-    new_section = _make_step_scaffold(args.description, heading_level=_detect_step_heading_level(sections))
-    if args.after:
-        after_step_id = _normalize_step_id(args.after, label="--after")
-        insert_index = _step_section_index(sections, after_step_id) + 1
-        action_summary = f"Inserted new step after {after_step_id}: {args.description.strip()}"
-    else:
-        insert_index = _default_step_insert_index(sections)
-        action_summary = f"Inserted new step at the end of the current step list: {args.description.strip()}"
-    updated_sections = sections[:insert_index] + [new_section] + sections[insert_index:]
-    renumbered_sections = renumber_steps(updated_sections)
-    plan_filename, meta_filename, structure_warnings = _commit_step_edit(
-        plan_dir,
-        state,
-        renumbered_sections,
-        action="add",
-        action_summary=action_summary,
-    )
-    next_steps = workflow_next(state)
-    return {
-        "success": True,
-        "step": "step",
-        "summary": f"{action_summary}. Wrote {plan_filename} and reset the plan to planned state.",
-        "artifacts": [plan_filename, meta_filename],
-        "next_step": next_steps[0] if next_steps else None,
-        "state": STATE_PLANNED,
-        "warnings": structure_warnings,
-    }
-
-
-def _step_remove(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
-    step_id = _normalize_step_id(args.step_id, label="step_id")
-    sections = parse_plan_sections(latest_plan_path(plan_dir, state).read_text(encoding="utf-8"))
-    step_indexes = [index for index, section in enumerate(sections) if section.id is not None]
-    if len(step_indexes) <= 1:
-        raise CliError("invalid_step_edit", "Cannot remove the last remaining step from a plan")
-    remove_index = _step_section_index(sections, step_id)
-    updated_sections = sections[:remove_index] + sections[remove_index + 1 :]
-    renumbered_sections = renumber_steps(updated_sections)
-    action_summary = f"Removed {step_id} and renumbered remaining steps"
-    plan_filename, meta_filename, structure_warnings = _commit_step_edit(
-        plan_dir,
-        state,
-        renumbered_sections,
-        action="remove",
-        action_summary=action_summary,
-    )
-    next_steps = workflow_next(state)
-    return {
-        "success": True,
-        "step": "step",
-        "summary": f"{action_summary}. Wrote {plan_filename} and reset the plan to planned state.",
-        "artifacts": [plan_filename, meta_filename],
-        "next_step": next_steps[0] if next_steps else None,
-        "state": STATE_PLANNED,
-        "warnings": structure_warnings,
-    }
-
-
-def _step_move(plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
-    step_id = _normalize_step_id(args.step_id, label="step_id")
-    after_step_id = _normalize_step_id(args.after, label="--after")
-    if step_id == after_step_id:
-        raise CliError("invalid_step_edit", f"Cannot move {step_id} after itself")
-
-    sections = parse_plan_sections(latest_plan_path(plan_dir, state).read_text(encoding="utf-8"))
-    move_index = _step_section_index(sections, step_id)
-    moving_section = sections[move_index]
-    remaining_sections = sections[:move_index] + sections[move_index + 1 :]
-    insert_index = _step_section_index(remaining_sections, after_step_id) + 1
-    updated_sections = remaining_sections[:insert_index] + [moving_section] + remaining_sections[insert_index:]
-    renumbered_sections = renumber_steps(updated_sections)
-    action_summary = f"Moved {step_id} after {after_step_id} and renumbered the plan"
-    plan_filename, meta_filename, structure_warnings = _commit_step_edit(
-        plan_dir,
-        state,
-        renumbered_sections,
-        action="move",
-        action_summary=action_summary,
-    )
-    next_steps = workflow_next(state)
-    return {
-        "success": True,
-        "step": "step",
-        "summary": f"{action_summary}. Wrote {plan_filename} and reset the plan to planned state.",
-        "artifacts": [plan_filename, meta_filename],
-        "next_step": next_steps[0] if next_steps else None,
-        "state": STATE_PLANNED,
-        "warnings": structure_warnings,
-    }
-
-
-_STEP_ACTIONS: dict[str, Callable[[Path, PlanState, argparse.Namespace], StepResponse]] = {
-    "add": _step_add,
-    "remove": _step_remove,
-    "move": _step_move,
-}
-
-
-def store_raw_worker_output(plan_dir: Path, step: str, iteration: int, content: str) -> str:
-    filename = current_iteration_raw_artifact(plan_dir, step, iteration).name
-    atomic_write_text(plan_dir / filename, content)
-    return filename
-
-
-def record_step_failure(
+def _finish_step(
     plan_dir: Path,
     state: PlanState,
+    args: argparse.Namespace,
     *,
     step: str,
-    iteration: int,
-    error: CliError,
-    duration_ms: int = 0,
-) -> None:
-    raw_output = str(error.extra.get("raw_output") or error.message)
-    raw_name = store_raw_worker_output(plan_dir, step, iteration, raw_output)
+    worker: WorkerResult,
+    agent: str,
+    mode: str,
+    refreshed: bool,
+    summary: str,
+    artifacts: list[str],
+    output_file: str,
+    artifact_hash: str,
+    result: str = "success",
+    success: bool = True,
+    next_step: object | str | None = _AUTO_NEXT_STEP,
+    response_fields: dict[str, Any] | None = None,
+    history_fields: dict[str, Any] | None = None,
+) -> StepResponse:
+    apply_session_update(state, step, agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
             step,
-            duration_ms=duration_ms,
-            cost_usd=0.0,
-            result="error",
-            raw_output_file=raw_name,
-            message=error.message,
+            duration_ms=worker.duration_ms,
+            cost_usd=worker.cost_usd,
+            result=result,
+            worker=worker,
+            agent=agent,
+            mode=mode,
+            output_file=output_file,
+            artifact_hash=artifact_hash,
+            **(history_fields or {}),
         ),
     )
     save_state(plan_dir, state)
+    resolved_next = next_step
+    if resolved_next is _AUTO_NEXT_STEP:
+        next_steps = workflow_next(state)
+        resolved_next = next_steps[0] if next_steps else None
+    response: StepResponse = {
+        "success": success,
+        "step": step,
+        "summary": summary,
+        "artifacts": artifacts,
+        "next_step": resolved_next,
+        "state": state["current_state"],
+    }
+    if response_fields:
+        response.update(response_fields)
+    attach_agent_fallback(response, args)
+    return response
+
+
+def _raise_step_validation_error(
+    *,
+    plan_dir: Path,
+    state: PlanState,
+    step: str,
+    iteration: int,
+    worker: WorkerResult,
+    code: str,
+    message: str,
+) -> None:
+    error = CliError(code, message, valid_next=infer_next_steps(state), extra={"raw_output": worker.raw_output})
+    record_step_failure(plan_dir, state, step=step, iteration=iteration, error=error, duration_ms=worker.duration_ms)
+    raise error
+
+
+def _write_json_artifact(plan_dir: Path, filename: str, payload: dict[str, Any]) -> str:
+    atomic_write_json(plan_dir / filename, payload)
+    return sha256_file(plan_dir / filename)
+
+
+def _write_plan_version(
+    *,
+    plan_dir: Path,
+    state: PlanState,
+    step: str,
+    version: int,
+    worker: WorkerResult,
+    plan_text: str,
+    meta_fields: dict[str, Any],
+    plan_filename: str | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    resolved_plan_filename = plan_filename or next_plan_artifact_name(plan_dir, version)
+    meta_filename = (
+        f"plan_v{version}.meta.json"
+        if resolved_plan_filename == f"plan_v{version}.md"
+        else resolved_plan_filename.replace(".md", ".meta.json")
+    )
+    structure_warnings = _validate_generated_plan_or_raise(
+        plan_dir=plan_dir,
+        state=state,
+        step=step,
+        iteration=version,
+        worker=worker,
+        plan_text=plan_text,
+    )
+    atomic_write_text(plan_dir / resolved_plan_filename, plan_text)
+    meta = {
+        "version": version,
+        "timestamp": now_utc(),
+        "hash": sha256_text(plan_text),
+        **meta_fields,
+        "structure_warnings": structure_warnings,
+    }
+    atomic_write_json(plan_dir / meta_filename, meta)
+    return resolved_plan_filename, meta_filename, meta
+
+
+def _write_finalize_artifacts(plan_dir: Path, payload: dict[str, Any], state: PlanState) -> str:
+    _ensure_verification_task(payload, state)
+    _reconcile_validation_after_mutation(payload)
+    atomic_write_json(plan_dir / "finalize.json", payload)
+    atomic_write_json(plan_dir / "finalize_snapshot.json", payload)
+    atomic_write_text(plan_dir / "final.md", render_final_md(payload))
+    return sha256_file(plan_dir / "finalize.json")
+
+
+def _reconcile_validation_after_mutation(payload: dict[str, Any]) -> None:
+    """Ensure validation block is consistent with the (possibly mutated) task list.
+
+    After _ensure_verification_task() may have appended a task, update the
+    validation block so orphan_tasks includes any handler-injected tasks.
+    """
+    validation = payload.get("validation")
+    if not validation or not isinstance(validation, dict):
+        return
+    task_ids = {t["id"] for t in payload.get("tasks", []) if isinstance(t, dict)}
+    covered_ids: set[str] = set()
+    for entry in validation.get("plan_steps_covered", []):
+        if isinstance(entry, dict):
+            for tid in entry.get("finalize_task_ids", []):
+                covered_ids.add(tid)
+    orphan_ids = set(validation.get("orphan_tasks", []))
+    for tid in task_ids:
+        if tid not in covered_ids and tid not in orphan_ids:
+            orphan_ids.add(tid)
+    validation["orphan_tasks"] = sorted(orphan_ids)
+
+
+def _validate_finalize_payload(plan_dir: Path, state: PlanState, worker: WorkerResult) -> None:
+    payload = worker.payload
+
+    def _reject(message: str) -> None:
+        _raise_step_validation_error(
+            plan_dir=plan_dir, state=state, step="finalize",
+            iteration=state["iteration"], worker=worker,
+            code="invalid_finalize", message=message,
+        )
+
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        _reject("Finalize output must include a non-empty `tasks` list.")
+    if not isinstance(payload.get("sense_checks"), list):
+        _reject("Finalize output must include a `sense_checks` list.")
+    if not isinstance(payload.get("watch_items"), list):
+        _reject("Finalize output must include a `watch_items` list.")
+    for index, task in enumerate(tasks, start=1):
+        tid = task.get("id", index) if isinstance(task, dict) else index
+        if not isinstance(task, dict):
+            _reject(f"Finalize task {index} must be an object.")
+        if not isinstance(task.get("id"), str) or not task["id"].strip():
+            _reject(f"Finalize task {index} is missing a non-empty `id`.")
+        if not isinstance(task.get("description"), str) or not task["description"].strip():
+            _reject(f"Finalize task {tid} is missing a non-empty `description`.")
+        if task.get("status") != "pending":
+            _reject(f"Finalize task {tid} must start with status `pending`.")
+
+
+def _build_gate_signals_artifact(
+    plan_dir: Path,
+    state: PlanState,
+    *,
+    iteration: int,
+    root: Path,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    gate_signals = build_gate_signals(plan_dir, state, root=root)
+    gate_checks = run_gate_checks(plan_dir, state, command_lookup=find_command)
+    signals_artifact = {
+        "robustness": gate_signals["robustness"],
+        "signals": gate_signals["signals"],
+        "warnings": gate_signals.get("warnings", []),
+        "criteria_check": gate_checks["criteria_check"],
+        "preflight_results": gate_checks["preflight_results"],
+        "unresolved_flags": gate_checks["unresolved_flags"],
+    }
+    signals_filename = f"gate_signals_v{iteration}.json"
+    atomic_write_json(plan_dir / signals_filename, signals_artifact)
+    return gate_signals, signals_filename, signals_artifact
+
+
+def _record_gate_debt_entries(
+    root: Path,
+    state: PlanState,
+    gate_summary: dict[str, Any],
+    worker_payload: dict[str, Any],
+) -> int:
+    if gate_summary["recommendation"] != "PROCEED":
+        return 0
+
+    raw_tradeoffs = worker_payload.get("accepted_tradeoffs", [])
+    accepted_tradeoffs = [
+        item
+        for item in raw_tradeoffs
+        if isinstance(item, dict)
+        and isinstance(item.get("flag_id"), str)
+        and isinstance(item.get("concern"), str)
+    ] if isinstance(raw_tradeoffs, list) else []
+    debt_registry = load_debt_registry(root)
+    debt_entries_added = 0
+    if accepted_tradeoffs:
+        for tradeoff in accepted_tradeoffs:
+            subsystem_value = tradeoff.get("subsystem")
+            subsystem = (
+                subsystem_value
+                if isinstance(subsystem_value, str) and subsystem_value.strip()
+                else extract_subsystem_tag(tradeoff["concern"])
+            )
+            add_or_increment_debt(
+                debt_registry,
+                subsystem=subsystem,
+                concern=tradeoff["concern"],
+                flag_ids=[tradeoff["flag_id"]],
+                plan_id=state["name"],
+            )
+            debt_entries_added += 1
+    else:
+        for flag in gate_summary["unresolved_flags"]:
+            if not isinstance(flag, dict):
+                continue
+            flag_id = flag.get("id")
+            concern = flag.get("concern")
+            if not isinstance(flag_id, str) or not isinstance(concern, str):
+                continue
+            add_or_increment_debt(
+                debt_registry,
+                subsystem=extract_subsystem_tag(concern),
+                concern=concern,
+                flag_ids=[flag_id],
+                plan_id=state["name"],
+            )
+            debt_entries_added += 1
+    if debt_entries_added:
+        save_debt_registry(root, debt_registry)
+    return debt_entries_added
+
+
+def _resolve_revise_transition(state: PlanState) -> tuple[bool, Any]:
+    has_gate = workflow_includes_step(configured_robustness(state), "gate")
+    if has_gate and state["last_gate"].get("recommendation") != "ITERATE":
+        raise CliError("invalid_transition", "Revise requires a gate recommendation of ITERATE", valid_next=infer_next_steps(state))
+    revise_transition = workflow_transition(state, "revise")
+    if revise_transition is None:
+        raise CliError("invalid_transition", "Revise is not available from the current workflow state", valid_next=infer_next_steps(state))
+    return has_gate, revise_transition
+
+
+def _next_progress_step(state: PlanState) -> str | None:
+    next_steps = workflow_next(state)
+    return next((step for step in next_steps if step not in {"plan", "step"}), next_steps[0] if next_steps else None)
+
+
+def _remaining_significant_flags(plan_dir: Path) -> list[dict[str, str]]:
+    return [
+        {"id": flag["id"], "concern": flag["concern"], "category": flag["category"]}
+        for flag in load_flag_registry(plan_dir)["flags"]
+        if flag["status"] in FLAG_BLOCKING_STATUSES and flag.get("severity") == "significant"
+    ]
+
+
+def _gate_response_fields(state: PlanState, gate_summary: dict[str, Any], debt_entries_added: int) -> dict[str, Any]:
+    return {
+        "auto_approve": bool(state["config"].get("auto_approve", False)),
+        "robustness": configured_robustness(state),
+        "recommendation": gate_summary["recommendation"],
+        "rationale": gate_summary["rationale"],
+        "signals_assessment": gate_summary["signals_assessment"],
+        "warnings": gate_summary["warnings"],
+        "passed": gate_summary["passed"],
+        "criteria_check": gate_summary["criteria_check"],
+        "preflight_results": gate_summary["preflight_results"],
+        "unresolved_flags": gate_summary["unresolved_flags"],
+        "orchestrator_guidance": gate_summary["orchestrator_guidance"],
+        "signals": gate_summary["signals"],
+        "debt_entries_added": debt_entries_added,
+    }
 
 
 def _validate_generated_plan_or_raise(
@@ -638,15 +482,6 @@ def _apply_gate_outcome(state: PlanState, gate_summary: dict[str, Any], *, robus
     result = "unknown_recommendation"
     summary = f"Gate returned unknown recommendation '{gate_summary['recommendation']}'; treating as escalation."
     return result, "override add-note", summary
-
-
-def handle_step(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "step", _STEP_EDIT_ALLOWED_STATES)
-    handler = _STEP_ACTIONS.get(args.step_action)
-    if handler is None:
-        raise CliError("invalid_args", f"Unknown step action: {args.step_action}")
-    return handler(plan_dir, state, args)
 
 
 def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
@@ -721,170 +556,88 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
 
 def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "plan", {STATE_INITIALIZED, STATE_PREPPED, STATE_PLANNED})
-    rerun = state["current_state"] == STATE_PLANNED
+    require_state(state, "plan", {STATE_INITIALIZED, STATE_PREPPED, STATE_PLANNED, STATE_RESEARCHED})
+    rerun = state["current_state"] in {STATE_PLANNED, STATE_RESEARCHED}
     version = state["iteration"] if rerun else state["iteration"] + 1
-    try:
-        worker, agent, mode, refreshed = worker_module.run_step_with_worker("plan", state, plan_dir, args, root=root)
-    except CliError as error:
-        record_step_failure(plan_dir, state, step="plan", iteration=version, error=error)
-        raise
+    worker, agent, mode, refreshed = _run_worker("plan", state, plan_dir, args, root=root, iteration=version)
     payload = worker.payload
-    plan_filename = next_plan_artifact_name(plan_dir, version)
-    meta_filename = f"plan_v{version}.meta.json"
-    if plan_filename != f"plan_v{version}.md":
-        meta_filename = plan_filename.replace(".md", ".meta.json")
-    plan_text = payload["plan"].rstrip() + "\n"
-    structure_warnings = _validate_generated_plan_or_raise(
+    plan_filename, meta_filename, meta = _write_plan_version(
         plan_dir=plan_dir,
         state=state,
         step="plan",
-        iteration=version,
+        version=version,
         worker=worker,
-        plan_text=plan_text,
+        plan_text=payload["plan"].rstrip() + "\n",
+        meta_fields={
+            "questions": payload["questions"],
+            "success_criteria": payload["success_criteria"],
+            "assumptions": payload["assumptions"],
+        },
     )
-    atomic_write_text(plan_dir / plan_filename, plan_text)
-    meta = {
-        "version": version,
-        "timestamp": now_utc(),
-        "hash": sha256_text(plan_text),
-        "questions": payload["questions"],
-        "success_criteria": payload["success_criteria"],
-        "assumptions": payload["assumptions"],
-        "structure_warnings": structure_warnings,
-    }
-    atomic_write_json(plan_dir / meta_filename, meta)
-    state["iteration"] = version
-    state["current_state"] = STATE_PLANNED
+    state["iteration"], state["current_state"] = version, STATE_PLANNED
     state["meta"].pop("user_approved_gate", None)
     state["last_gate"] = {}
-    state["plan_versions"].append(
-        {"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]}
+    state["plan_versions"].append({
+        "version": version, "file": plan_filename,
+        "hash": meta["hash"], "timestamp": meta["timestamp"],
+    })
+    verb = "Refined" if rerun else "Generated"
+    return _finish_step(
+        plan_dir, state, args,
+        step="plan",
+        worker=worker, agent=agent, mode=mode, refreshed=refreshed,
+        summary=f"{verb} plan v{version} with {len(payload['questions'])} questions and {len(payload['success_criteria'])} success criteria.",
+        artifacts=[plan_filename, meta_filename],
+        output_file=plan_filename,
+        artifact_hash=meta["hash"],
+        response_fields={
+            "iteration": version,
+            "questions": payload["questions"],
+            "assumptions": payload["assumptions"],
+            "success_criteria": payload["success_criteria"],
+        },
     )
-    apply_session_update(state, "plan", agent, worker.session_id, mode=mode, refreshed=refreshed)
-    append_history(
-        state,
-        make_history_entry(
-            "plan",
-            duration_ms=worker.duration_ms,
-            cost_usd=worker.cost_usd,
-            result="success",
-            worker=worker,
-            agent=agent,
-            mode=mode,
-            output_file=plan_filename,
-            artifact_hash=meta["hash"],
-        ),
-    )
-    save_state(plan_dir, state)
-    next_steps = workflow_next(state)
-    response: StepResponse = {
-        "success": True,
-        "step": "plan",
-        "iteration": version,
-        "summary": (
-            f"{'Refined' if rerun else 'Generated'} plan v{version} with "
-            f"{len(payload['questions'])} questions and {len(payload['success_criteria'])} success criteria."
-        ),
-        "artifacts": [plan_filename, meta_filename],
-        "next_step": next_steps[0] if next_steps else None,
-        "state": STATE_PLANNED,
-        "questions": payload["questions"],
-        "assumptions": payload["assumptions"],
-        "success_criteria": payload["success_criteria"],
-    }
-    attach_agent_fallback(response, args)
-    return response
 
 
 def handle_research(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "research", {STATE_PLANNED})
-    iteration = state["iteration"]
-    try:
-        worker, agent, mode, refreshed = worker_module.run_step_with_worker("research", state, plan_dir, args, root=root)
-    except CliError as error:
-        record_step_failure(plan_dir, state, step="research", iteration=iteration, error=error)
-        raise
+    worker, agent, mode, refreshed = _run_worker("research", state, plan_dir, args, root=root)
     research_filename = "research.json"
-    atomic_write_json(plan_dir / research_filename, worker.payload)
+    artifact_hash = _write_json_artifact(plan_dir, research_filename, worker.payload)
+    considerations = worker.payload.get("considerations", [])
     state["current_state"] = STATE_RESEARCHED
-    apply_session_update(state, "research", agent, worker.session_id, mode=mode, refreshed=refreshed)
-    append_history(
-        state,
-        make_history_entry(
-            "research",
-            duration_ms=worker.duration_ms,
-            cost_usd=worker.cost_usd,
-            result="success",
-            worker=worker,
-            agent=agent,
-            mode=mode,
-            output_file=research_filename,
-            artifact_hash=sha256_file(plan_dir / research_filename),
-        ),
+    return _finish_step(
+        plan_dir, state, args,
+        step="research",
+        worker=worker, agent=agent, mode=mode, refreshed=refreshed,
+        summary=f"Research complete: logged {len(considerations)} documentation consideration(s).",
+        artifacts=[research_filename],
+        output_file=research_filename,
+        artifact_hash=artifact_hash,
+        response_fields={"iteration": state["iteration"]},
     )
-    save_state(plan_dir, state)
-    next_steps = workflow_next(state)
-    apis_count = len(worker.payload.get("apis_found", []))
-    response: StepResponse = {
-        "success": True,
-        "step": "research",
-        "iteration": iteration,
-        "summary": f"Research complete: found {apis_count} framework-specific API(s) to verify.",
-        "artifacts": [research_filename],
-        "next_step": next_steps[0] if next_steps else None,
-        "state": STATE_RESEARCHED,
-    }
-    attach_agent_fallback(response, args)
-    return response
 
 
 def handle_prep(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "prep", {STATE_INITIALIZED})
-    iteration = state["iteration"]
-    try:
-        worker, agent, mode, refreshed = worker_module.run_step_with_worker("prep", state, plan_dir, args, root=root)
-    except CliError as error:
-        record_step_failure(plan_dir, state, step="prep", iteration=iteration, error=error)
-        raise
+    worker, agent, mode, refreshed = _run_worker("prep", state, plan_dir, args, root=root)
     prep_filename = "prep.json"
-    atomic_write_json(plan_dir / prep_filename, worker.payload)
+    artifact_hash = _write_json_artifact(plan_dir, prep_filename, worker.payload)
+    code_refs = len(worker.payload.get("relevant_code", []))
+    test_refs = len(worker.payload.get("test_expectations", []))
     state["current_state"] = STATE_PREPPED
-    apply_session_update(state, "prep", agent, worker.session_id, mode=mode, refreshed=refreshed)
-    append_history(
-        state,
-        make_history_entry(
-            "prep",
-            duration_ms=worker.duration_ms,
-            cost_usd=worker.cost_usd,
-            result="success",
-            worker=worker,
-            agent=agent,
-            mode=mode,
-            output_file=prep_filename,
-            artifact_hash=sha256_file(plan_dir / prep_filename),
-        ),
+    return _finish_step(
+        plan_dir, state, args,
+        step="prep",
+        worker=worker, agent=agent, mode=mode, refreshed=refreshed,
+        summary=f"Prep complete: captured {code_refs} relevant code reference(s) and {test_refs} test expectation(s).",
+        artifacts=[prep_filename],
+        output_file=prep_filename,
+        artifact_hash=artifact_hash,
+        response_fields={"iteration": state["iteration"]},
     )
-    save_state(plan_dir, state)
-    next_steps = workflow_next(state)
-    relevant_code_count = len(worker.payload.get("relevant_code", []))
-    test_expectation_count = len(worker.payload.get("test_expectations", []))
-    response: StepResponse = {
-        "success": True,
-        "step": "prep",
-        "iteration": iteration,
-        "summary": (
-            f"Prep complete: captured {relevant_code_count} relevant code reference(s) "
-            f"and {test_expectation_count} test expectation(s)."
-        ),
-        "artifacts": [prep_filename],
-        "next_step": next_steps[0] if next_steps else None,
-        "state": STATE_PREPPED,
-    }
-    attach_agent_fallback(response, args)
-    return response
 
 
 def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
@@ -892,46 +645,21 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     require_state(state, "critique", {STATE_PLANNED, STATE_RESEARCHED})
     iteration = state["iteration"]
     state["last_gate"] = {}
-    try:
-        worker, agent, mode, refreshed = worker_module.run_step_with_worker("critique", state, plan_dir, args, root=root)
-    except CliError as error:
-        record_step_failure(plan_dir, state, step="critique", iteration=iteration, error=error)
-        raise
+    worker, agent, mode, refreshed = _run_worker("critique", state, plan_dir, args, root=root)
+    invalid_checks = validate_critique_checks(worker.payload)
+    if invalid_checks:
+        _raise_step_validation_error(plan_dir=plan_dir, state=state, step="critique", iteration=iteration, worker=worker, code="invalid_critique", message="Critique output failed check validation: " + ", ".join(invalid_checks))
     critique_filename = f"critique_v{iteration}.json"
     atomic_write_json(plan_dir / critique_filename, worker.payload)
     registry = update_flags_after_critique(plan_dir, worker.payload, iteration=iteration)
-    significant = len(
-        [
-            flag
-            for flag in registry["flags"]
-            if flag.get("severity") == "significant" and flag["status"] in FLAG_BLOCKING_STATUSES
-        ]
-    )
+    significant = len([flag for flag in registry["flags"] if flag.get("severity") == "significant" and flag["status"] in FLAG_BLOCKING_STATUSES])
     _append_to_meta(state, "significant_counts", significant)
     recurring = compute_recurring_critiques(plan_dir, iteration)
     _append_to_meta(state, "recurring_critiques", recurring)
     state["current_state"] = STATE_CRITIQUED
-    apply_session_update(state, "critique", agent, worker.session_id, mode=mode, refreshed=refreshed)
-    append_history(
-        state,
-        make_history_entry(
-            "critique",
-            duration_ms=worker.duration_ms,
-            cost_usd=worker.cost_usd,
-            result="success",
-            worker=worker,
-            agent=agent,
-            mode=mode,
-            output_file=critique_filename,
-            artifact_hash=sha256_file(plan_dir / critique_filename),
-            flags_count=len(worker.payload.get("flags", [])),
-        ),
-    )
     robustness = configured_robustness(state)
     skip_gate = not workflow_includes_step(robustness, "gate")
     if skip_gate:
-        # Light robustness: skip gate, go straight to revise.
-        # Write a minimal gate.json so the revise prompt can reference it.
         minimal_gate: dict[str, Any] = {
             "recommendation": "ITERATE",
             "rationale": "Light robustness: single revision pass to incorporate critique feedback.",
@@ -941,176 +669,95 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
         }
         atomic_write_json(plan_dir / "gate.json", minimal_gate)
         state["last_gate"] = {"recommendation": "ITERATE"}
-    save_state(plan_dir, state)
-    next_steps = workflow_next(state)
     scope_flags_list = scope_creep_flags(registry, statuses=FLAG_BLOCKING_STATUSES)
     open_flags_detail = [
-        {
-            "id": flag["id"],
-            "concern": flag["concern"],
-            "category": flag["category"],
-            "severity": flag.get("severity", "unknown"),
-        }
+        {"id": flag["id"], "concern": flag["concern"], "category": flag["category"], "severity": flag.get("severity", "unknown")}
         for flag in registry["flags"]
         if flag["status"] == "open"
     ]
-    response: StepResponse = {
-        "success": True,
-        "step": "critique",
+    response_fields: dict[str, Any] = {
         "iteration": iteration,
-        "summary": f"Recorded {len(worker.payload.get('flags', []))} critique flags.",
         "checks": worker.payload.get("checks", []),
-        "artifacts": [critique_filename, "faults.json"],
-        "next_step": next_steps[0] if next_steps else None,
-        "state": STATE_CRITIQUED,
         "verified_flags": worker.payload.get("verified_flag_ids", []),
         "open_flags": open_flags_detail,
         "scope_creep_flags": [flag["id"] for flag in scope_flags_list],
     }
     if scope_flags_list:
-        response["warnings"] = [
-            "Scope creep detected in the plan. Surface this drift to the user while continuing the loop."
-        ]
-    attach_agent_fallback(response, args)
-    return response
+        response_fields["warnings"] = ["Scope creep detected in the plan. Surface this drift to the user while continuing the loop."]
+    return _finish_step(
+        plan_dir, state, args,
+        step="critique",
+        worker=worker, agent=agent, mode=mode, refreshed=refreshed,
+        summary=f"Recorded {len(worker.payload.get('flags', []))} critique flags.",
+        artifacts=[critique_filename, "faults.json"],
+        output_file=critique_filename,
+        artifact_hash=sha256_file(plan_dir / critique_filename),
+        response_fields=response_fields,
+        history_fields={"flags_count": len(worker.payload.get("flags", []))},
+    )
 
 
 def handle_revise(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "revise", {STATE_CRITIQUED})
-    robustness = configured_robustness(state)
-    has_gate = workflow_includes_step(robustness, "gate")
-    if has_gate and state["last_gate"].get("recommendation") != "ITERATE":
-        raise CliError(
-            "invalid_transition",
-            "Revise requires a gate recommendation of ITERATE",
-            valid_next=infer_next_steps(state),
-        )
-    revise_transition = workflow_transition(state, "revise")
-    if revise_transition is None:
-        raise CliError(
-            "invalid_transition",
-            "Revise is not available from the current workflow state",
-            valid_next=infer_next_steps(state),
-        )
+    has_gate, revise_transition = _resolve_revise_transition(state)
     previous_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    try:
-        worker, agent, mode, refreshed = worker_module.run_step_with_worker("revise", state, plan_dir, args, root=root)
-    except CliError as error:
-        record_step_failure(plan_dir, state, step="revise", iteration=state["iteration"] + 1, error=error)
-        raise
+    worker, agent, mode, refreshed = _run_worker("revise", state, plan_dir, args, root=root, iteration=state["iteration"] + 1)
     payload = worker.payload
     validate_payload("revise", payload)
     version = state["iteration"] + 1
-    plan_filename = f"plan_v{version}.md"
-    meta_filename = f"plan_v{version}.meta.json"
     plan_text = payload["plan"].rstrip() + "\n"
-    structure_warnings = _validate_generated_plan_or_raise(
-        plan_dir=plan_dir,
-        state=state,
-        step="revise",
-        iteration=version,
-        worker=worker,
-        plan_text=plan_text,
-    )
-    atomic_write_text(plan_dir / plan_filename, plan_text)
     delta = compute_plan_delta_percent(previous_plan, plan_text)
-    meta = {
-        "version": version,
-        "timestamp": now_utc(),
-        "hash": sha256_text(plan_text),
-        "changes_summary": payload["changes_summary"],
-        "flags_addressed": payload["flags_addressed"],
-        "questions": payload.get("questions", []),
-        "success_criteria": payload.get("success_criteria", []),
-        "assumptions": payload.get("assumptions", []),
-        "structure_warnings": structure_warnings,
-        "delta_from_previous_percent": delta,
-    }
-    atomic_write_json(plan_dir / meta_filename, meta)
-    state["iteration"] = version
-    state["current_state"] = revise_transition.next_state
+    plan_filename, meta_filename, meta = _write_plan_version(
+        plan_dir=plan_dir, state=state, step="revise", version=version,
+        worker=worker, plan_filename=f"plan_v{version}.md", plan_text=plan_text,
+        meta_fields={
+            "changes_summary": payload["changes_summary"],
+            "flags_addressed": payload["flags_addressed"],
+            "questions": payload.get("questions", []),
+            "success_criteria": payload.get("success_criteria", []),
+            "assumptions": payload.get("assumptions", []),
+            "delta_from_previous_percent": delta,
+        },
+    )
+    state["iteration"], state["current_state"] = version, revise_transition.next_state
     state["meta"].pop("user_approved_gate", None)
     if has_gate:
         state["last_gate"] = {}
-    state["plan_versions"].append(
-        {"version": version, "file": plan_filename, "hash": meta["hash"], "timestamp": meta["timestamp"]}
-    )
+    state["plan_versions"].append({
+        "version": version, "file": plan_filename,
+        "hash": meta["hash"], "timestamp": meta["timestamp"],
+    })
     _append_to_meta(state, "plan_deltas", delta)
-    update_flags_after_revise(
-        plan_dir,
-        payload["flags_addressed"],
-        plan_file=plan_filename,
-        summary=payload["changes_summary"],
+    update_flags_after_revise(plan_dir, payload["flags_addressed"], plan_file=plan_filename, summary=payload["changes_summary"])
+    next_step = _next_progress_step(state)
+    remaining = _remaining_significant_flags(plan_dir)
+    return _finish_step(
+        plan_dir, state, args,
+        step="revise",
+        worker=worker, agent=agent, mode=mode, refreshed=refreshed,
+        summary=f"Updated plan to v{version}; addressed {len(payload['flags_addressed'])} flags.",
+        artifacts=[plan_filename, meta_filename, "faults.json"],
+        output_file=plan_filename,
+        artifact_hash=meta["hash"],
+        next_step=next_step,
+        response_fields={
+            "iteration": version,
+            "changes_summary": payload["changes_summary"],
+            "flags_addressed": payload["flags_addressed"],
+            "flags_remaining": remaining,
+            "plan_delta_percent": delta,
+        },
+        history_fields={"flags_addressed": payload["flags_addressed"]},
     )
-    apply_session_update(state, "revise", agent, worker.session_id, mode=mode, refreshed=refreshed)
-    append_history(
-        state,
-        make_history_entry(
-            "revise",
-            duration_ms=worker.duration_ms,
-            cost_usd=worker.cost_usd,
-            result="success",
-            worker=worker,
-            agent=agent,
-            mode=mode,
-            output_file=plan_filename,
-            artifact_hash=meta["hash"],
-            flags_addressed=payload["flags_addressed"],
-        ),
-    )
-    save_state(plan_dir, state)
-    next_steps = workflow_next(state)
-    # Skip self-loop (plan→planned) to find the forward step
-    next_step = next((s for s in next_steps if s != "plan" and s != "step"), next_steps[0] if next_steps else None)
-    updated_registry = load_flag_registry(plan_dir)
-    remaining = [
-        {
-            "id": flag["id"],
-            "concern": flag["concern"],
-            "category": flag["category"],
-        }
-        for flag in updated_registry["flags"]
-        if flag["status"] in FLAG_BLOCKING_STATUSES and flag.get("severity") == "significant"
-    ]
-    response: StepResponse = {
-        "success": True,
-        "step": "revise",
-        "iteration": version,
-        "summary": f"Updated plan to v{version}; addressed {len(payload['flags_addressed'])} flags.",
-        "artifacts": [plan_filename, meta_filename, "faults.json"],
-        "next_step": next_step,
-        "state": state["current_state"],
-        "changes_summary": payload["changes_summary"],
-        "flags_addressed": payload["flags_addressed"],
-        "flags_remaining": remaining,
-        "plan_delta_percent": delta,
-    }
-    attach_agent_fallback(response, args)
-    return response
 
 
 def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "gate", {STATE_CRITIQUED})
     iteration = state["iteration"]
-    gate_signals = build_gate_signals(plan_dir, state, root=root)
-    gate_checks = run_gate_checks(plan_dir, state, command_lookup=find_command)
-    signals_artifact = {
-        "robustness": gate_signals["robustness"],
-        "signals": gate_signals["signals"],
-        "warnings": gate_signals.get("warnings", []),
-        "criteria_check": gate_checks["criteria_check"],
-        "preflight_results": gate_checks["preflight_results"],
-        "unresolved_flags": gate_checks["unresolved_flags"],
-    }
-    signals_filename = f"gate_signals_v{iteration}.json"
-    atomic_write_json(plan_dir / signals_filename, signals_artifact)
-    try:
-        worker, agent, mode, refreshed = worker_module.run_step_with_worker("gate", state, plan_dir, args, root=root)
-    except CliError as error:
-        record_step_failure(plan_dir, state, step="gate", iteration=iteration, error=error)
-        raise
+    gate_signals, signals_filename, signals_artifact = _build_gate_signals_artifact(plan_dir, state, iteration=iteration, root=root)
+    worker, agent, mode, refreshed = _run_worker("gate", state, plan_dir, args, root=root)
     guidance = build_orchestrator_guidance(
         gate_payload=worker.payload,
         signals=signals_artifact["signals"],
@@ -1125,103 +772,35 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
         override_forced=False,
         orchestrator_guidance=guidance,
     )
-    atomic_write_json(plan_dir / "gate.json", gate_summary)
-    debt_entries_added = 0
-    if gate_summary["recommendation"] == "PROCEED":
-        raw_tradeoffs = worker.payload.get("accepted_tradeoffs", [])
-        accepted_tradeoffs = [
-            item
-            for item in raw_tradeoffs
-            if isinstance(item, dict)
-            and isinstance(item.get("flag_id"), str)
-            and isinstance(item.get("concern"), str)
-        ] if isinstance(raw_tradeoffs, list) else []
-        debt_registry = load_debt_registry(root)
-        if accepted_tradeoffs:
-            for tradeoff in accepted_tradeoffs:
-                subsystem_value = tradeoff.get("subsystem")
-                subsystem = (
-                    subsystem_value
-                    if isinstance(subsystem_value, str) and subsystem_value.strip()
-                    else extract_subsystem_tag(tradeoff["concern"])
-                )
-                add_or_increment_debt(
-                    debt_registry,
-                    subsystem=subsystem,
-                    concern=tradeoff["concern"],
-                    flag_ids=[tradeoff["flag_id"]],
-                    plan_id=state["name"],
-                )
-                debt_entries_added += 1
-        elif gate_summary["unresolved_flags"]:
-            for flag in gate_summary["unresolved_flags"]:
-                if not isinstance(flag, dict):
-                    continue
-                flag_id = flag.get("id")
-                concern = flag.get("concern")
-                if not isinstance(flag_id, str) or not isinstance(concern, str):
-                    continue
-                add_or_increment_debt(
-                    debt_registry,
-                    subsystem=extract_subsystem_tag(concern),
-                    concern=concern,
-                    flag_ids=[flag_id],
-                    plan_id=state["name"],
-                )
-                debt_entries_added += 1
-        if debt_entries_added:
-            save_debt_registry(root, debt_registry)
+    gate_hash = _write_json_artifact(plan_dir, "gate.json", gate_summary)
+    debt_entries_added = _record_gate_debt_entries(root, state, gate_summary, worker.payload)
     _store_last_gate(state, gate_summary)
     if len(state["meta"].get("weighted_scores", [])) < iteration:
         _append_to_meta(state, "weighted_scores", gate_signals["signals"]["weighted_score"])
-
-    artifacts = [signals_filename, "gate.json"]
     result, next_step, summary = _apply_gate_outcome(
         state,
         gate_summary,
         robustness=gate_signals["robustness"],
     )
-
-    apply_session_update(state, "gate", agent, worker.session_id, mode=mode, refreshed=refreshed)
-    append_history(
+    return _finish_step(
+        plan_dir,
         state,
-        make_history_entry(
-            "gate",
-            duration_ms=worker.duration_ms,
-            cost_usd=worker.cost_usd,
-            result=result,
-            worker=worker,
-            agent=agent,
-            mode=mode,
-            output_file="gate.json",
-            artifact_hash=sha256_file(plan_dir / "gate.json"),
-            recommendation=gate_summary["recommendation"],
-        ),
+        args,
+        step="gate",
+        worker=worker,
+        agent=agent,
+        mode=mode,
+        refreshed=refreshed,
+        summary=summary,
+        artifacts=[signals_filename, "gate.json"],
+        output_file="gate.json",
+        artifact_hash=gate_hash,
+        result=result,
+        success=gate_summary["recommendation"] != "PROCEED" or gate_summary["passed"],
+        next_step=next_step,
+        response_fields=_gate_response_fields(state, gate_summary, debt_entries_added),
+        history_fields={"recommendation": gate_summary["recommendation"]},
     )
-    save_state(plan_dir, state)
-    response: StepResponse = {
-        "success": gate_summary["recommendation"] != "PROCEED" or gate_summary["passed"],
-        "step": "gate",
-        "summary": summary,
-        "artifacts": artifacts,
-        "next_step": next_step,
-        "state": state["current_state"],
-        "auto_approve": bool(state["config"].get("auto_approve", False)),
-        "robustness": configured_robustness(state),
-        "recommendation": gate_summary["recommendation"],
-        "rationale": gate_summary["rationale"],
-        "signals_assessment": gate_summary["signals_assessment"],
-        "warnings": gate_summary["warnings"],
-        "passed": gate_summary["passed"],
-        "criteria_check": gate_summary["criteria_check"],
-        "preflight_results": gate_summary["preflight_results"],
-        "unresolved_flags": gate_summary["unresolved_flags"],
-        "orchestrator_guidance": gate_summary["orchestrator_guidance"],
-        "signals": gate_summary["signals"],
-        "debt_entries_added": debt_entries_added,
-    }
-    attach_agent_fallback(response, args)
-    return response
 
 
 def _ensure_verification_task(payload: dict, state: dict) -> None:
@@ -1291,42 +870,20 @@ def _ensure_verification_task(payload: dict, state: dict) -> None:
 def handle_finalize(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
     require_state(state, "finalize", {STATE_GATED})
-    try:
-        worker, agent, mode, refreshed = worker_module.run_step_with_worker("finalize", state, plan_dir, args, root=root)
-    except CliError as error:
-        record_step_failure(plan_dir, state, step="finalize", iteration=state["iteration"], error=error)
-        raise
-    payload = worker.payload
-    _ensure_verification_task(payload, state)
-    atomic_write_json(plan_dir / "finalize.json", payload)
-    atomic_write_text(plan_dir / "final.md", render_final_md(payload))
+    worker, agent, mode, refreshed = _run_worker("finalize", state, plan_dir, args, root=root)
+    _validate_finalize_payload(plan_dir, state, worker)
+    artifact_hash = _write_finalize_artifacts(plan_dir, worker.payload, state)
     state["current_state"] = STATE_FINALIZED
-    apply_session_update(state, "finalize", agent, worker.session_id, mode=mode, refreshed=refreshed)
-    append_history(
-        state,
-        make_history_entry(
-            "finalize",
-            duration_ms=worker.duration_ms,
-            cost_usd=worker.cost_usd,
-            result="success",
-            worker=worker,
-            agent=agent,
-            mode=mode,
-            output_file="finalize.json",
-            artifact_hash=sha256_file(plan_dir / "finalize.json"),
-        ),
+    return _finish_step(
+        plan_dir, state, args,
+        step="finalize",
+        worker=worker, agent=agent, mode=mode, refreshed=refreshed,
+        summary=f"Finalized plan with {len(worker.payload['tasks'])} tasks and {len(worker.payload['watch_items'])} watch items.",
+        artifacts=["final.md", "finalize.json"],
+        output_file="finalize.json",
+        artifact_hash=artifact_hash,
+        next_step="execute",
     )
-    save_state(plan_dir, state)
-    response: StepResponse = {
-        "success": True,
-        "step": "finalize",
-        "summary": f"Finalized plan with {len(payload['tasks'])} tasks and {len(payload['watch_items'])} watch items.",
-        "artifacts": ["final.md", "finalize.json"],
-        "next_step": "execute",
-        "state": STATE_FINALIZED,
-    }
-    attach_agent_fallback(response, args)
-    return response
 
 
 def _is_rework_reexecution(state: PlanState) -> bool:
@@ -1369,14 +926,6 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             mode=mode,
             refreshed=refreshed,
             model=model,
-            apply_session_update_fn=apply_session_update,
-            append_history_fn=append_history,
-            make_history_entry_fn=make_history_entry,
-            save_state_fn=save_state,
-            attach_agent_fallback_fn=attach_agent_fallback,
-            store_raw_worker_output_fn=store_raw_worker_output,
-            record_step_failure_fn=record_step_failure,
-            capture_git_status_snapshot_fn=_capture_git_status_snapshot,
         )
     else:
         response = dispatch_execute_auto_loop(
@@ -1389,21 +938,109 @@ def handle_execute(root: Path, args: argparse.Namespace) -> StepResponse:
             mode=mode,
             refreshed=refreshed,
             model=model,
-            apply_session_update_fn=apply_session_update,
-            append_history_fn=append_history,
-            make_history_entry_fn=make_history_entry,
-            save_state_fn=save_state,
-            attach_agent_fallback_fn=attach_agent_fallback,
-            store_raw_worker_output_fn=store_raw_worker_output,
-            record_step_failure_fn=record_step_failure,
-            capture_git_status_snapshot_fn=_capture_git_status_snapshot,
         )
     if not workflow_includes_step(configured_robustness(state), "review") and response.get("state") == STATE_EXECUTED:
         state["current_state"] = STATE_DONE
         save_state(plan_dir, state)
         response["state"] = STATE_DONE
         response["next_step"] = None
+    attach_agent_fallback(response, args)
     return response
+
+
+def _merge_review_verdicts(
+    worker_payload: dict[str, Any],
+    finalize_data: dict[str, Any],
+    issues: list[str],
+) -> tuple[int, int, int, int, list[str]]:
+    """Merge task verdicts and sense check verdicts into finalize_data.
+
+    Returns (verdict_count, total_tasks, check_count, total_checks, missing_evidence).
+    """
+    tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
+    verdict_count, total_tasks = _validate_and_merge_batch(
+        worker_payload.get("task_verdicts"),
+        required_fields=("task_id", "reviewer_verdict", "evidence_files"),
+        targets_by_id=tasks_by_id,
+        id_field="task_id",
+        merge_fields=("reviewer_verdict", "evidence_files"),
+        issues=issues,
+        validation_label="task_verdicts",
+        merge_label="task_verdict",
+        incomplete_message=lambda merged, total: f"Incomplete review: {merged}/{total} tasks received a reviewer verdict.",
+        nonempty_fields={"reviewer_verdict"},
+        array_fields=("evidence_files",),
+    )
+    sense_checks_by_id = {sc["id"]: sc for sc in finalize_data.get("sense_checks", [])}
+    check_count, total_checks = _validate_and_merge_batch(
+        worker_payload.get("sense_check_verdicts"),
+        required_fields=("sense_check_id", "verdict"),
+        targets_by_id=sense_checks_by_id,
+        id_field="sense_check_id",
+        merge_fields=("verdict",),
+        issues=issues,
+        validation_label="sense_check_verdicts",
+        merge_label="sense_check_verdict",
+        incomplete_message=lambda merged, total: f"Incomplete review: {merged}/{total} sense checks received a verdict.",
+        nonempty_fields={"verdict"},
+    )
+    missing_evidence = _check_done_task_evidence(
+        finalize_data.get("tasks", []),
+        issues=issues,
+        should_classify=lambda task: bool(task.get("reviewer_verdict", "").strip()),
+        has_evidence=lambda task: bool(task.get("evidence_files")),
+        has_advisory_evidence=lambda task: _is_substantive_reviewer_verdict(task.get("reviewer_verdict", "")),
+        missing_message="Done tasks missing reviewer evidence_files without a substantive reviewer_verdict: ",
+        advisory_message="Advisory: done tasks rely on substantive reviewer_verdict without evidence_files (FLAG-006 softening): ",
+    )
+    return verdict_count, total_tasks, check_count, total_checks, missing_evidence
+
+
+_MAX_REVIEW_REWORK_CYCLES = 3
+
+
+def _resolve_review_outcome(
+    review_verdict: str,
+    verdict_count: int,
+    total_tasks: int,
+    check_count: int,
+    total_checks: int,
+    missing_evidence: list[str],
+    state: PlanState,
+    issues: list[str],
+) -> tuple[str, str, str | None]:
+    """Determine review result, next state, and next step.
+
+    Returns (result, next_state, next_step).
+    """
+    blocked = (
+        verdict_count < total_tasks
+        or check_count < total_checks
+        or bool(missing_evidence)
+    )
+    if blocked:
+        message = _build_review_blocked_message(
+            verdict_count=verdict_count, total_tasks=total_tasks,
+            check_count=check_count, total_checks=total_checks,
+            missing_reviewer_evidence=missing_evidence,
+        )
+        return "blocked", STATE_EXECUTED, "review"
+
+    rework_requested = review_verdict == "needs_rework"
+    if rework_requested:
+        prior_rework_count = sum(
+            1 for entry in state.get("history", [])
+            if entry.get("step") == "review" and entry.get("result") == "needs_rework"
+        )
+        if prior_rework_count >= _MAX_REVIEW_REWORK_CYCLES:
+            issues.append(
+                f"Max review rework cycles ({_MAX_REVIEW_REWORK_CYCLES}) reached. "
+                "Force-proceeding to done despite unresolved review issues."
+            )
+        else:
+            return "needs_rework", STATE_FINALIZED, "execute"
+
+    return "success", STATE_DONE, None
 
 
 def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
@@ -1414,116 +1051,74 @@ def handle_review(root: Path, args: argparse.Namespace) -> StepResponse:
     except CliError as error:
         record_step_failure(plan_dir, state, step="review", iteration=state["iteration"], error=error)
         raise
+
     atomic_write_json(plan_dir / "review.json", worker.payload)
     issues = list(worker.payload.get("issues", []))
     finalize_data = read_json(plan_dir / "finalize.json")
+
+    # Validate verdict
     review_verdict = worker.payload.get("review_verdict")
     if review_verdict not in {"approved", "needs_rework"}:
         issues.append("Invalid review_verdict; expected 'approved' or 'needs_rework'.")
         review_verdict = "needs_rework"
-    tasks_by_id = {task["id"]: task for task in finalize_data.get("tasks", [])}
-    verdict_count, total_tasks = _validate_and_merge_batch(
-        worker.payload.get("task_verdicts"),
-        required_fields=("task_id", "reviewer_verdict", "evidence_files"),
-        targets_by_id=tasks_by_id,
-        id_field="task_id",
-        merge_fields=("reviewer_verdict", "evidence_files"),
-        issues=issues,
-        validation_label="task_verdicts",
-        merge_label="task_verdict",
-        incomplete_message=(
-            lambda merged_count, total: (
-                f"Incomplete review: {merged_count}/{total} tasks received a reviewer verdict."
-            )
-        ),
-        nonempty_fields={"reviewer_verdict"},
-        array_fields=("evidence_files",),
-    )
-    sense_checks_by_id = {sense_check["id"]: sense_check for sense_check in finalize_data.get("sense_checks", [])}
-    check_count, total_checks = _validate_and_merge_batch(
-        worker.payload.get("sense_check_verdicts"),
-        required_fields=("sense_check_id", "verdict"),
-        targets_by_id=sense_checks_by_id,
-        id_field="sense_check_id",
-        merge_fields=("verdict",),
-        issues=issues,
-        validation_label="sense_check_verdicts",
-        merge_label="sense_check_verdict",
-        incomplete_message=(
-            lambda merged_count, total: (
-                f"Incomplete review: {merged_count}/{total} sense checks received a verdict."
-            )
-        ),
-        nonempty_fields={"verdict"},
-    )
-    missing_reviewer_evidence = _check_done_task_evidence(
-        finalize_data.get("tasks", []),
-        issues=issues,
-        should_classify=lambda task: bool(task.get("reviewer_verdict", "").strip()),
-        has_evidence=lambda task: bool(task.get("evidence_files")),
-        has_advisory_evidence=(
-            lambda task: _is_substantive_reviewer_verdict(task.get("reviewer_verdict", ""))
-        ),
-        missing_message="Done tasks missing reviewer evidence_files without a substantive reviewer_verdict: ",
-        advisory_message=(
-            "Advisory: done tasks rely on substantive reviewer_verdict without evidence_files (FLAG-006 softening): "
-        ),
+
+    # Merge verdicts into finalize data
+    verdict_count, total_tasks, check_count, total_checks, missing_evidence = _merge_review_verdicts(
+        worker.payload, finalize_data, issues,
     )
 
+    # Save updated finalize data
     atomic_write_json(plan_dir / "finalize.json", finalize_data)
     atomic_write_text(plan_dir / "final.md", render_final_md(finalize_data, phase="review"))
     finalize_hash = sha256_file(plan_dir / "finalize.json")
-    passed = sum(1 for criterion in worker.payload.get("criteria", []) if criterion.get("pass"))
-    total = len(worker.payload.get("criteria", []))
-    blocked = (
-        verdict_count < total_tasks
-        or check_count < total_checks
-        or bool(missing_reviewer_evidence)
+
+    # Determine outcome
+    result, next_state, next_step = _resolve_review_outcome(
+        review_verdict, verdict_count, total_tasks,
+        check_count, total_checks, missing_evidence,
+        state, issues,
     )
-    rework_requested = not blocked and review_verdict == "needs_rework"
-    if not blocked and not rework_requested:
-        state["current_state"] = STATE_DONE
-    elif rework_requested:
-        state["current_state"] = STATE_FINALIZED
+    state["current_state"] = next_state
+
+    # Record history
     apply_session_update(state, "review", agent, worker.session_id, mode=mode, refreshed=refreshed)
     append_history(
         state,
         make_history_entry(
             "review",
-            duration_ms=worker.duration_ms,
-            cost_usd=worker.cost_usd,
-            result="blocked" if blocked else "needs_rework" if rework_requested else "success",
-            worker=worker,
-            agent=agent,
-            mode=mode,
+            duration_ms=worker.duration_ms, cost_usd=worker.cost_usd,
+            result=result,
+            worker=worker, agent=agent, mode=mode,
             output_file="review.json",
             artifact_hash=sha256_file(plan_dir / "review.json"),
             finalize_hash=finalize_hash,
         ),
     )
     save_state(plan_dir, state)
-    blocked_message = _build_review_blocked_message(
-        verdict_count=verdict_count,
-        total_tasks=total_tasks,
-        check_count=check_count,
-        total_checks=total_checks,
-        missing_reviewer_evidence=missing_reviewer_evidence,
-    )
-    reroute_message = "Review requested another execute pass. Re-run execute using the review findings as context."
+
+    # Build response
+    passed = sum(1 for c in worker.payload.get("criteria", []) if c.get("pass") in (True, "pass"))
+    total = len(worker.payload.get("criteria", []))
+    if result == "blocked":
+        summary = _build_review_blocked_message(
+            verdict_count=verdict_count, total_tasks=total_tasks,
+            check_count=check_count, total_checks=total_checks,
+            missing_reviewer_evidence=missing_evidence,
+        )
+    elif result == "needs_rework":
+        summary = "Review requested another execute pass. Re-run execute using the review findings as context."
+    else:
+        summary = f"Review complete: {passed}/{total} success criteria passed."
+
     response: StepResponse = {
-        "success": not blocked and not rework_requested,
+        "success": result == "success",
         "step": "review",
-        "summary": (
-            blocked_message
-            if blocked
-            else reroute_message
-            if rework_requested
-            else f"Review complete: {passed}/{total} success criteria passed."
-        ),
+        "summary": summary,
         "artifacts": ["review.json", "finalize.json", "final.md"],
-        "next_step": "review" if blocked else "execute" if rework_requested else None,
-        "state": STATE_EXECUTED if blocked else STATE_FINALIZED if rework_requested else STATE_DONE,
+        "next_step": next_step,
+        "state": next_state,
         "issues": issues,
+        "rework_items": list(worker.payload.get("rework_items", [])),
     }
     attach_agent_fallback(response, args)
     return response
@@ -1562,10 +1157,22 @@ def _override_abort(root: Path, plan_dir: Path, state: PlanState, args: argparse
 
 
 def _override_force_proceed(root: Path, plan_dir: Path, state: PlanState, args: argparse.Namespace) -> StepResponse:
+    if state["current_state"] == STATE_EXECUTED:
+        # Force-proceed from review loop: mark as done despite review issues
+        _append_to_meta(state, "overrides", {"action": "force-proceed", "timestamp": now_utc(), "reason": args.reason})
+        state["current_state"] = STATE_DONE
+        save_state(plan_dir, state)
+        return {
+            "success": True,
+            "step": "override",
+            "summary": "Force-proceeded past review into done state.",
+            "next_step": None,
+            "state": STATE_DONE,
+        }
     if state["current_state"] != STATE_CRITIQUED:
         raise CliError(
             "invalid_transition",
-            "force-proceed is only supported from critiqued state",
+            "force-proceed is only supported from critiqued or executed state",
             valid_next=infer_next_steps(state),
         )
     gate_checks = run_gate_checks(plan_dir, state, command_lookup=find_command)

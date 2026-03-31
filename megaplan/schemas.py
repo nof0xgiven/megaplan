@@ -11,7 +11,17 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "plan": {"type": "string"},
             "questions": {"type": "array", "items": {"type": "string"}},
-            "success_criteria": {"type": "array", "items": {"type": "string"}},
+            "success_criteria": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criterion": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["must", "should", "info"]},
+                    },
+                    "required": ["criterion", "priority"],
+                },
+            },
             "assumptions": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["plan", "questions", "success_criteria", "assumptions"],
@@ -77,7 +87,17 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "changes_summary": {"type": "string"},
             "flags_addressed": {"type": "array", "items": {"type": "string"}},
             "assumptions": {"type": "array", "items": {"type": "string"}},
-            "success_criteria": {"type": "array", "items": {"type": "string"}},
+            "success_criteria": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criterion": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["must", "should", "info"]},
+                    },
+                    "required": ["criterion", "priority"],
+                },
+            },
             "questions": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["plan", "changes_summary", "flags_addressed"],
@@ -244,8 +264,39 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                 },
             },
             "meta_commentary": {"type": "string"},
+            "validation": {
+                "type": "object",
+                "properties": {
+                    "plan_steps_covered": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "plan_step_summary": {"type": "string"},
+                                "finalize_task_ids": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["plan_step_summary", "finalize_task_ids"],
+                        },
+                    },
+                    "orphan_tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "completeness_notes": {"type": "string"},
+                    "coverage_complete": {"type": "boolean"},
+                },
+                "required": [
+                    "plan_steps_covered",
+                    "orphan_tasks",
+                    "completeness_notes",
+                    "coverage_complete",
+                ],
+            },
         },
-        "required": ["tasks", "watch_items", "sense_checks", "meta_commentary"],
+        "required": ["tasks", "watch_items", "sense_checks", "meta_commentary", "validation"],
     },
     "execution.json": {
         "type": "object",
@@ -316,13 +367,28 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
-                        "pass": {"type": "boolean"},
+                        "priority": {"type": "string", "enum": ["must", "should", "info"]},
+                        "pass": {"type": "string", "enum": ["pass", "fail", "waived"]},
                         "evidence": {"type": "string"},
                     },
-                    "required": ["name", "pass", "evidence"],
+                    "required": ["name", "priority", "pass", "evidence"],
                 },
             },
             "issues": {"type": "array", "items": {"type": "string"}},
+            "rework_items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "issue": {"type": "string"},
+                        "expected": {"type": "string"},
+                        "actual": {"type": "string"},
+                        "evidence_file": {"type": "string"},
+                    },
+                    "required": ["task_id", "issue", "expected", "actual"],
+                },
+            },
             "summary": {"type": "string"},
             "task_verdicts": {
                 "type": "array",
@@ -348,7 +414,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                 },
             },
         },
-        "required": ["review_verdict", "criteria", "issues", "summary", "task_verdicts", "sense_check_verdicts"],
+        "required": ["review_verdict", "criteria", "issues", "rework_items", "summary", "task_verdicts", "sense_check_verdicts"],
     },
 }
 

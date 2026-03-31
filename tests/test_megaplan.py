@@ -167,7 +167,7 @@ _LEGACY_STATE_MACHINE_CASES = [
     ({"current_state": megaplan.STATE_INITIALIZED, "last_gate": {}}, ["plan"]),
     ({"current_state": STATE_PREPPED, "last_gate": {}}, ["plan"]),
     ({"current_state": megaplan.STATE_PLANNED, "last_gate": {}}, ["critique", "plan", "step"]),
-    ({"current_state": megaplan.STATE_RESEARCHED, "last_gate": {}}, ["critique", "step"]),
+    ({"current_state": megaplan.STATE_RESEARCHED, "last_gate": {}}, ["critique", "plan", "step"]),
     ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {}}, ["gate", "step"]),
     ({"current_state": megaplan.STATE_CRITIQUED, "last_gate": {"recommendation": "ITERATE"}}, ["revise", "step"]),
     (
@@ -379,6 +379,22 @@ def test_plan_rerun_keeps_iteration_and_uses_same_iteration_subversion(plan_fixt
     critique = megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     assert critique["iteration"] == 1
     assert (plan_fixture.plan_dir / "critique_v1.json").exists()
+
+
+def test_handle_plan_accepts_researched_state_and_reuses_iteration(plan_fixture: PlanFixture) -> None:
+    make_args = plan_fixture.make_args
+
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    research = megaplan.handle_research(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    response = megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    state = load_state(plan_fixture.plan_dir)
+
+    assert research["state"] == megaplan.STATE_RESEARCHED
+    assert response["state"] == megaplan.STATE_PLANNED
+    assert response["iteration"] == 1
+    assert response["next_step"] == "critique"
+    assert state["iteration"] == 1
+    assert state["plan_versions"][-1]["file"] == "plan_v1a.md"
 
 
 def test_workflow_mock_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -599,7 +615,7 @@ def test_handle_plan_stores_nonblocking_structure_warnings(plan_fixture: PlanFix
 1. Run a focused test.
 """,
             "questions": [],
-            "success_criteria": ["warn but continue"],
+            "success_criteria": [{"criterion": "warn but continue", "priority": "must"}],
             "assumptions": [],
         },
         raw_output="warning case",
@@ -632,7 +648,7 @@ No numbered step sections here.
 1. Run a focused test.
 """,
             "questions": [],
-            "success_criteria": ["should fail"],
+            "success_criteria": [{"criterion": "should fail", "priority": "must"}],
             "assumptions": [],
         },
         raw_output="invalid plan output",
@@ -653,6 +669,175 @@ No numbered step sections here.
     error_entry = state["history"][-1]
     assert error_entry["result"] == "error"
     assert PLAN_STRUCTURE_REQUIRED_STEP_ISSUE in error_entry["message"]
+
+
+def test_handle_critique_rejects_invalid_check_payload(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    worker = WorkerResult(
+        payload=_build_mock_payload(
+            "critique",
+            load_state(plan_fixture.plan_dir),
+            plan_fixture.plan_dir,
+            checks=[],
+        ),
+        raw_output="invalid critique payload",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="critique-invalid",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "claude", "persistent", False),
+    )
+    monkeypatch.setattr(megaplan.handlers, "validate_critique_checks", lambda payload: ["correctness"])
+
+    with pytest.raises(megaplan.CliError, match="Critique output failed check validation"):
+        megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    state = load_state(plan_fixture.plan_dir)
+    assert state["history"][-1]["result"] == "error"
+    assert not (plan_fixture.plan_dir / "critique_v1.json").exists()
+
+
+def test_handle_critique_accepts_validated_checks(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(megaplan.handlers, "validate_critique_checks", lambda payload: [])
+
+    megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+    response = megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
+
+    assert response["success"] is True
+    assert (plan_fixture.plan_dir / "critique_v1.json").exists()
+
+
+def test_handle_finalize_validates_payload_shape(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+
+    valid_payload = {
+        "tasks": [
+            {
+                "id": "T1",
+                "description": "Ship the change",
+                "depends_on": [],
+                "status": "pending",
+                "executor_notes": "",
+                "files_changed": [],
+                "commands_run": [],
+                "evidence_files": [],
+                "reviewer_verdict": "",
+            }
+        ],
+        "watch_items": [],
+        "sense_checks": [
+            {
+                "id": "SC1",
+                "task_id": "T1",
+                "question": "Did it work?",
+                "executor_note": "",
+                "verdict": "",
+            }
+        ],
+        "meta_commentary": "ok",
+    }
+    worker = WorkerResult(
+        payload=valid_payload,
+        raw_output="valid finalize payload",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="finalize-valid",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (worker, "claude", "persistent", False),
+    )
+
+    response = megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    assert response["success"] is True
+    assert response["state"] == megaplan.STATE_FINALIZED
+    assert read_json(plan_fixture.plan_dir / "finalize.json")["tasks"][0]["status"] == "pending"
+
+
+def test_handle_finalize_rejects_invalid_payload(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+
+    invalid_worker = WorkerResult(
+        payload={
+            "tasks": [
+                {
+                    "id": "T1",
+                    "description": "Broken finalize task",
+                    "depends_on": [],
+                    "status": "done",
+                    "executor_notes": "",
+                    "files_changed": [],
+                    "commands_run": [],
+                    "evidence_files": [],
+                    "reviewer_verdict": "",
+                }
+            ],
+            "watch_items": [],
+            "sense_checks": [],
+        },
+        raw_output="invalid finalize payload",
+        duration_ms=1,
+        cost_usd=0.0,
+        session_id="finalize-invalid",
+    )
+    monkeypatch.setattr(
+        megaplan.workers,
+        "run_step_with_worker",
+        lambda *args, **kwargs: (invalid_worker, "claude", "persistent", False),
+    )
+
+    with pytest.raises(megaplan.CliError, match="status `pending`"):
+        megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    state = load_state(plan_fixture.plan_dir)
+    assert state["history"][-1]["result"] == "error"
+
+
+def test_finalize_snapshot_remains_pending_after_execute(plan_fixture: PlanFixture) -> None:
+    from megaplan._core import load_finalize_snapshot
+
+    make_args = plan_fixture.make_args
+    megaplan.handle_plan(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_critique(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+    megaplan.handle_override(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, override_action="force-proceed", reason="test"),
+    )
+
+    megaplan.handle_finalize(plan_fixture.root, make_args(plan=plan_fixture.plan_name))
+
+    snapshot_before_execute = load_finalize_snapshot(plan_fixture.plan_dir)
+    assert (plan_fixture.plan_dir / "finalize_snapshot.json").exists()
+    assert all(task["status"] == "pending" for task in snapshot_before_execute["tasks"])
+
+    megaplan.handle_execute(
+        plan_fixture.root,
+        make_args(plan=plan_fixture.plan_name, confirm_destructive=True, user_approved=True),
+    )
+
+    finalize_after_execute = read_json(plan_fixture.plan_dir / "finalize.json")
+    snapshot_after_execute = load_finalize_snapshot(plan_fixture.plan_dir)
+
+    assert all(task["status"] == "done" for task in finalize_after_execute["tasks"])
+    assert snapshot_after_execute == snapshot_before_execute
+    assert all(task["status"] == "pending" for task in snapshot_after_execute["tasks"])
 
 
 def test_handle_revise_requires_prior_iterate_gate(plan_fixture: PlanFixture) -> None:
@@ -964,7 +1149,7 @@ Keep the plan small.
 1. Run a focused test.
 """,
             "questions": ["q"],
-            "success_criteria": ["c"],
+            "success_criteria": [{"criterion": "c", "priority": "must"}],
             "assumptions": ["a"],
         },
         raw_output="single-step plan",
@@ -1010,7 +1195,7 @@ def test_step_preserves_meta(plan_fixture: PlanFixture) -> None:
     meta_path = plan_fixture.plan_dir / "plan_v1.meta.json"
     meta = read_json(meta_path)
     meta["questions"] = ["What should happen next?"]
-    meta["success_criteria"] = ["Ship the step editor."]
+    meta["success_criteria"] = [{"criterion": "Ship the step editor.", "priority": "must"}]
     meta["assumptions"] = ["The existing plan file is valid."]
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
@@ -1023,7 +1208,7 @@ def test_step_preserves_meta(plan_fixture: PlanFixture) -> None:
     new_meta = read_json(plan_fixture.plan_dir / plan_name.replace(".md", ".meta.json"))
 
     assert new_meta["questions"] == ["What should happen next?"]
-    assert new_meta["success_criteria"] == ["Ship the step editor."]
+    assert new_meta["success_criteria"] == [{"criterion": "Ship the step editor.", "priority": "must"}]
     assert new_meta["assumptions"] == ["The existing plan file is valid."]
 
 
@@ -1080,7 +1265,7 @@ def test_gate_retry_does_not_duplicate_weighted_scores(plan_fixture: PlanFixture
     megaplan.handle_gate(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     state = load_state(plan_fixture.plan_dir)
 
-    assert state["meta"]["weighted_scores"] == [3.5]
+    assert len(state["meta"]["weighted_scores"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1127,7 +1312,7 @@ def test_update_flags_after_critique_creates_new_flags(plan_fixture: PlanFixture
         "verified_flag_ids": [],
         "disputed_flag_ids": [],
     }
-    from megaplan.handlers import update_flags_after_critique
+    from megaplan.flags import update_flags_after_critique
     registry = update_flags_after_critique(plan_fixture.plan_dir, critique_payload, iteration=1)
     assert len(registry["flags"]) >= 1
     flag = next(f for f in registry["flags"] if f["id"] == "FLAG-001")
@@ -1137,7 +1322,7 @@ def test_update_flags_after_critique_creates_new_flags(plan_fixture: PlanFixture
 
 def test_update_flags_after_critique_verifies_flags(plan_fixture: PlanFixture) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
-    from megaplan.handlers import update_flags_after_critique
+    from megaplan.flags import update_flags_after_critique
     critique1 = {
         "flags": [{"id": "FLAG-001", "concern": "x", "category": "other", "severity_hint": "likely-significant", "evidence": "y"}],
         "verified_flag_ids": [],
@@ -1157,7 +1342,7 @@ def test_update_flags_after_critique_verifies_flags(plan_fixture: PlanFixture) -
 
 def test_update_flags_after_critique_disputes_flags(plan_fixture: PlanFixture) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
-    from megaplan.handlers import update_flags_after_critique
+    from megaplan.flags import update_flags_after_critique
     critique1 = {
         "flags": [{"id": "FLAG-001", "concern": "x", "category": "other", "severity_hint": "likely-significant", "evidence": "y"}],
         "verified_flag_ids": [],
@@ -1176,7 +1361,7 @@ def test_update_flags_after_critique_disputes_flags(plan_fixture: PlanFixture) -
 
 def test_update_flags_after_critique_reuses_existing_ids(plan_fixture: PlanFixture) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
-    from megaplan.handlers import update_flags_after_critique
+    from megaplan.flags import update_flags_after_critique
     critique1 = {
         "flags": [{"id": "FLAG-001", "concern": "x", "category": "other", "severity_hint": "likely-significant", "evidence": "y"}],
         "verified_flag_ids": [],
@@ -1197,7 +1382,7 @@ def test_update_flags_after_critique_reuses_existing_ids(plan_fixture: PlanFixtu
 
 def test_update_flags_after_critique_autonumbers_missing_ids(plan_fixture: PlanFixture) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
-    from megaplan.handlers import update_flags_after_critique
+    from megaplan.flags import update_flags_after_critique
     critique = {
         "flags": [
             {"concern": "no id given", "category": "other", "severity_hint": "likely-minor", "evidence": "test"},
@@ -1215,7 +1400,7 @@ def test_update_flags_after_critique_autonumbers_missing_ids(plan_fixture: PlanF
 
 def test_update_flags_after_critique_severity_from_hint(plan_fixture: PlanFixture) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
-    from megaplan.handlers import update_flags_after_critique
+    from megaplan.flags import update_flags_after_critique
     critique = {
         "flags": [
             {"id": "FLAG-001", "concern": "major", "category": "other", "severity_hint": "likely-significant", "evidence": "x"},
@@ -1234,7 +1419,7 @@ def test_update_flags_after_critique_severity_from_hint(plan_fixture: PlanFixtur
 
 def test_update_flags_after_revise_marks_addressed(plan_fixture: PlanFixture) -> None:
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
-    from megaplan.handlers import update_flags_after_critique, update_flags_after_revise  # noqa: F811
+    from megaplan.flags import update_flags_after_critique, update_flags_after_revise  # noqa: F811
     from megaplan._core import save_flag_registry
     save_flag_registry(plan_fixture.plan_dir, {"flags": [
         {"id": "FLAG-001", "concern": "x", "category": "other", "severity_hint": "likely-significant", "evidence": "y", "status": "open", "severity": "significant", "verified": False, "raised_in": "critique_v1.json"},
@@ -3008,7 +3193,7 @@ def test_execute_multi_batch_happy_path_aggregates_results(
         ({"batch1.py": "hash-1", "batch2.py": "hash-2"}, None),
         ({"batch1.py": "hash-1", "batch2.py": "hash-2"}, None),
     ])
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: next(snapshots))
 
     def batched_worker(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path, resolved=None, prompt_override: str | None = None):
         assert prompt_override is not None
@@ -3106,7 +3291,7 @@ def test_execute_multi_batch_timeout_preserves_prior_batches(
         ({"batch1.py": "hash-1"}, None),
         ({"batch1.py": "hash-1"}, None),
     ])
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: next(snapshots))
 
     def timed_worker(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path, resolved=None, prompt_override: str | None = None):
         assert prompt_override is not None
@@ -3243,7 +3428,7 @@ def test_execute_multi_batch_observation_allows_cross_batch_reedit_and_flags_pha
         ({"megaplan/handlers.py": "hash-2"}, None),
         ({"megaplan/handlers.py": "hash-2"}, None),
     ])
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: next(snapshots))
 
     def observation_worker(step: str, state: dict, plan_dir: Path, args: Namespace, *, root: Path, resolved=None, prompt_override: str | None = None):
         assert prompt_override is not None
@@ -3664,7 +3849,7 @@ def test_batch_1_on_two_batch_plan_stays_finalized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _setup_two_batch_plan(plan_fixture)
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: ({}, None))
     monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _batch_worker)
 
     make_args = plan_fixture.make_args
@@ -3691,7 +3876,7 @@ def test_batch_timeout_reads_execution_batch_n_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _setup_two_batch_plan(plan_fixture)
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: ({}, None))
 
     checkpoint_payload = {
         "task_updates": [
@@ -3741,7 +3926,7 @@ def test_batch_2_after_batch_1_transitions_to_executed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _setup_two_batch_plan(plan_fixture)
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: ({}, None))
     monkeypatch.setattr(megaplan.workers, "run_step_with_worker", _batch_worker)
 
     make_args = plan_fixture.make_args
@@ -3786,7 +3971,7 @@ def test_execute_quality_advisories_flow_into_batch_artifacts_aggregate_and_next
         ({"batch1.txt": "after-1", "batch2.txt": "after-2"}, None),
         ({"batch1.txt": "after-1", "batch2.txt": "after-2"}, None),
     ])
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: next(snapshots))
     monkeypatch.setattr(megaplan.execution, "load_config", lambda *_: {})
 
     seen_prompts: list[str | None] = []
@@ -3879,7 +4064,7 @@ def test_execute_quality_config_disable_suppresses_file_growth_deviation_end_to_
         ({"notes.txt": "after-1"}, None),
         ({"notes.txt": "after-1"}, None),
     ])
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: next(snapshots))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: next(snapshots))
     monkeypatch.setattr(
         megaplan.execution,
         "load_config",
@@ -3959,7 +4144,7 @@ def test_batch_1_on_single_batch_plan_transitions_to_executed(
     (plan_fixture.plan_dir / "finalize.json").write_text(
         json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8"
     )
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: ({}, None))
 
     def single_batch_worker(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
         payload = {
@@ -4003,7 +4188,7 @@ def test_light_batch_1_on_single_batch_plan_transitions_to_done(
     (plan_fixture.plan_dir / "finalize.json").write_text(
         json.dumps(finalize_data, indent=2) + "\n", encoding="utf-8"
     )
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: ({}, None))
 
     def single_batch_worker(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
         payload = {
@@ -4042,7 +4227,7 @@ def test_batch_1_incomplete_tracking_returns_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _setup_two_batch_plan(plan_fixture)
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: ({}, None))
 
     def incomplete_batch_worker(step, state, plan_dir, args, *, root=None, resolved=None, prompt_override=None):
         assert prompt_override is not None
@@ -4086,7 +4271,7 @@ def test_review_works_after_batch_by_batch_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _setup_two_batch_plan(plan_fixture)
-    monkeypatch.setattr(megaplan.handlers, "_capture_git_status_snapshot", lambda *_: ({}, None))
+    monkeypatch.setattr(megaplan.execution, "_capture_git_status_snapshot", lambda *_: ({}, None))
 
     original_run_step = megaplan.workers.run_step_with_worker
 

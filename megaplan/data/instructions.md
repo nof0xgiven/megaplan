@@ -25,11 +25,11 @@ Run the loop in this order:
 Use `next_step` and `valid_next` for CLI routing. After `gate`, follow `orchestrator_guidance` instead of manually interpreting gate signals.
 At `--robustness light`, the loop is: `plan` → `critique` → `revise` → `finalize` → `execute`. No gate, no iteration, no review. One pass of external critique, one revision to incorporate it, then execute and done.
 ## Step Rules
-- `plan`: inspect the repository first; produce the plan plus `questions`, `assumptions`, and `success_criteria`.
-- `critique`: surface concrete flags with concern, evidence, category, and severity; reuse open flag IDs; call out scope creep.
+- `plan`: inspect the repository first; produce the plan plus `questions`, `assumptions`, and `success_criteria`. Each criterion is `{"criterion": "...", "priority": "must|should|info"}`. `must` = hard gate (reviewer blocks), `should` = quality target (reviewer flags but doesn't block), `info` = human reference (reviewer skips).
+- `critique`: surface concrete flags with concern, evidence, category, and severity; reuse open flag IDs; call out scope creep. Also validate that success criteria priorities are well-calibrated — `must` criteria should be verifiable yes/no, subjective goals should be `should`.
 - `gate`: read the response, warnings, and `orchestrator_guidance`. (Skipped at light robustness.)
 - `revise`: show the delta, flags addressed, and flags remaining. At light robustness, routes to `finalize`; otherwise loops back through `critique` and `gate`.
-- `review`: judge success against the success criteria and the user's intent, not plan elegance.
+- `review`: judge success against the success criteria and the user's intent, not plan elegance. Only block on `must` criteria failures. `should` failures are flagged but don't require rework. `info` criteria are waived.
 ## Gate Principle
 The gate response tells the orchestrator what to do next. Follow `orchestrator_guidance` unless you have a concrete reason to disagree after investigating the repository or plan artifacts yourself.
 Investigate before disagreeing: read the current plan and critique artifacts, check the project code to verify whether a flagged issue is real, or use `megaplan status --plan <name>` / `megaplan audit --plan <name>`.

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from megaplan.checks import build_empty_template
 from megaplan.schemas import SCHEMAS
 from megaplan.types import (
     CliError,
@@ -287,8 +288,8 @@ def _default_mock_plan_payload(state: PlanState, plan_dir: Path) -> dict[str, An
         ).strip(),
         "questions": ["Are there existing patterns in the repo that should be preserved?"],
         "success_criteria": [
-            "A concrete implementation path exists.",
-            "Verification is defined before execution.",
+            {"criterion": "A concrete implementation path exists.", "priority": "must"},
+            {"criterion": "Verification is defined before execution.", "priority": "should"},
         ],
         "assumptions": ["The project directory is writable."],
     }
@@ -345,8 +346,16 @@ def _default_mock_loop_execute_payload(
 
 def _default_mock_critique_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     iteration = state["iteration"] or 1
+    checks = build_empty_template()
     if iteration == 1:
         return {
+            "checks": [
+                {
+                    **check,
+                    "findings": [{"detail": "Mock critique found a concrete issue.", "flagged": True}],
+                }
+                for check in checks
+            ],
             "flags": [
                 {
                     "id": "FLAG-001",
@@ -366,7 +375,32 @@ def _default_mock_critique_payload(state: PlanState, plan_dir: Path) -> dict[str
             "verified_flag_ids": [],
             "disputed_flag_ids": [],
         }
-    return {"flags": [], "verified_flag_ids": ["FLAG-001", "FLAG-002"], "disputed_flag_ids": []}
+    return {
+        "checks": [
+            {
+                **check,
+                "findings": [{"detail": "Mock critique verified the revised plan.", "flagged": False}],
+            }
+            for check in checks
+        ],
+        "flags": [],
+        "verified_flag_ids": ["FLAG-001", "FLAG-002"],
+        "disputed_flag_ids": [],
+    }
+
+
+def _default_mock_research_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
+    return {
+        "considerations": [
+            {
+                "point": "Re-check the framework-specific behavior named in the task.",
+                "severity": "important",
+                "detail": "Mock research recommends validating the plan against current docs before critique.",
+                "source": "mock-docs",
+            }
+        ],
+        "summary": "Mock research found one documentation consideration worth carrying into critique.",
+    }
 
 
 def _default_mock_revise_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
@@ -407,8 +441,8 @@ def _default_mock_revise_payload(state: PlanState, plan_dir: Path) -> dict[str, 
         "flags_addressed": ["FLAG-001", "FLAG-002"],
         "assumptions": ["The repository contains enough context for implementation."],
         "success_criteria": [
-            "The plan identifies exact touch points before editing.",
-            "A concrete verification command is defined.",
+            {"criterion": "The plan identifies exact touch points before editing.", "priority": "must"},
+            {"criterion": "A concrete verification command is defined.", "priority": "should"},
         ],
         "questions": [],
     }
@@ -477,6 +511,15 @@ def _default_mock_finalize_payload(state: PlanState, plan_dir: Path) -> dict[str
             },
         ],
         "meta_commentary": "This is a mock finalize output.",
+        "validation": {
+            "plan_steps_covered": [
+                {"plan_step_summary": f"Implement: {state['idea']}", "finalize_task_ids": ["T1"]},
+                {"plan_step_summary": "Verify success criteria", "finalize_task_ids": ["T2"]},
+            ],
+            "orphan_tasks": [],
+            "completeness_notes": "All plan steps mapped to tasks.",
+            "coverage_complete": True,
+        },
     }
 
 
@@ -552,14 +595,20 @@ def _default_mock_execute_payload(
 
 def _default_mock_review_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     meta = read_json(latest_plan_meta_path(plan_dir, state))
-    criteria = [
-        {"name": criterion, "pass": True, "evidence": "Mock execution and artifacts satisfy the criterion."}
-        for criterion in meta.get("success_criteria", [])
-    ]
+    criteria = []
+    for entry in meta.get("success_criteria", []):
+        if isinstance(entry, dict):
+            name = entry.get("criterion", str(entry))
+            priority = entry.get("priority", "must")
+        else:
+            name = str(entry)
+            priority = "must"
+        criteria.append({"name": name, "priority": priority, "pass": "pass", "evidence": "Mock execution and artifacts satisfy the criterion."})
     return {
         "review_verdict": "approved",
         "criteria": criteria,
         "issues": [],
+        "rework_items": [],
         "summary": "Mock review passed.",
         "task_verdicts": [
             {
@@ -585,6 +634,7 @@ _MockPayloadBuilder = Callable[[dict[str, Any], Path], dict[str, Any]]
 _MOCK_DEFAULTS: dict[str, _MockPayloadBuilder] = {
     "plan": _default_mock_plan_payload,
     "prep": _default_mock_prep_payload,
+    "research": _default_mock_research_payload,
     "loop_plan": _default_mock_loop_plan_payload,
     "critique": _default_mock_critique_payload,
     "revise": _default_mock_revise_payload,
@@ -618,6 +668,10 @@ def _mock_prep(state: PlanState, plan_dir: Path) -> WorkerResult:
 
 def _mock_loop_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
     return _mock_result(_build_mock_payload("loop_plan", state, plan_dir))
+
+
+def _mock_research(state: PlanState, plan_dir: Path) -> WorkerResult:
+    return _mock_result(_build_mock_payload("research", state, plan_dir))
 
 
 def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
@@ -661,6 +715,7 @@ _MockHandler = Callable[..., WorkerResult]
 _MOCK_DISPATCH: dict[str, _MockHandler] = {
     "plan": _mock_plan,
     "prep": _mock_prep,
+    "research": _mock_research,
     "loop_plan": _mock_loop_plan,
     "critique": _mock_critique,
     "revise": _mock_revise,

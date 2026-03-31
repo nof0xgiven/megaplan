@@ -93,6 +93,18 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         "category": "completeness",
         "default_severity": "uncertain",
     },
+    {
+        "id": "criteria_quality",
+        "question": "Are the success criteria well-prioritized and verifiable?",
+        "guidance": (
+            "Check that each `must` criterion has a clear yes/no answer verifiable from code, tests, or "
+            "git diff. Subjective goals, numeric guidelines, and aspirational targets should be `should`, "
+            "not `must`. Criteria requiring manual testing or human judgment should be `info`. "
+            "Flag any `must` criterion that is ambiguous, subjective, or unverifiable in the review pipeline."
+        ),
+        "category": "completeness",
+        "default_severity": "likely-significant",
+    },
 )
 
 _CHECK_BY_ID: Final[dict[str, CritiqueCheckSpec]] = {check["id"]: check for check in CRITIQUE_CHECKS}
