@@ -88,7 +88,8 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         "guidance": (
             "Flag missing tests or weak validation. If verification tests exist, trace the test's "
             "execution path through your patch — does every branch it exercises produce the expected "
-            "result? A patch can look correct but fail because it misses one code path the test covers."
+            "result? A patch can look correct but fail because it misses one code path the test covers. "
+            "If you manually verify an edge case because existing tests don't cover it, also test the cases next to it."
         ),
         "category": "completeness",
         "default_severity": "uncertain",
