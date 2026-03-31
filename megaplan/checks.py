@@ -18,6 +18,18 @@ class CritiqueCheckSpec(TypedDict):
 
 CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     {
+        "id": "approach",
+        "question": "Is this the right approach to the problem?",
+        "guidance": (
+            "Before checking details, ask three things: "
+            "(1) Right layer — should the change be in this function, a caller, a callee, or a new function? "
+            "(2) Right scale — is a minimal patch enough, or does the issue need new code/methods/restructuring? "
+            "(3) Right pattern — does the approach match how similar problems are solved in this codebase?"
+        ),
+        "category": "correctness",
+        "default_severity": "likely-significant",
+    },
+    {
         "id": "issue_hints",
         "question": "Did the work fully address the issue hints, user notes, and approved plan requirements?",
         "guidance": (
