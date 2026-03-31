@@ -44,22 +44,31 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
     ]
     robustness = configured_robustness(state)
     debt_block = _gate_debt_block(plan_dir, root)
-    # Load critique checks for gate visibility
+    # Load critique checks for gate visibility — include ALL findings so the gate
+    # can promote unflagged concerns to flags if it disagrees with the critique.
     critique_checks_block = ""
     critique_path = current_iteration_artifact(plan_dir, "critique", state["iteration"])
     if Path(critique_path).exists():
         critique_data = read_json(critique_path)
         checks = critique_data.get("checks", [])
         if checks:
-            check_summary = []
+            check_lines = []
             for check in checks:
                 findings = check.get("findings", [])
-                flagged_count = sum(1 for f in findings if f.get("flagged"))
+                flagged = [f for f in findings if f.get("flagged")]
+                unflagged = [f for f in findings if not f.get("flagged")]
+                flagged_count = len(flagged)
                 status = f"{flagged_count} flagged" if flagged_count else "clear"
-                check_summary.append(f"- {check.get('id', '?')}: {status}")
+                check_lines.append(f"- {check.get('id', '?')}: {status}")
+                # Show unflagged findings as FYI — gate can promote if needed
+                for f in unflagged:
+                    detail = f.get("detail", "").strip()
+                    if detail and len(detail) > 30:  # skip trivial "no issue" findings
+                        check_lines.append(f"    FYI (not flagged): {detail[:200]}")
             critique_checks_block = (
-                "Critique checks completed:\n        "
-                + "\n        ".join(check_summary)
+                "Critique checks (flagged findings are flags; FYI findings are the critique's "
+                "unflagged observations — review them and promote to a flag if any look risky):\n        "
+                + "\n        ".join(check_lines)
             )
     return textwrap.dedent(
         f"""
