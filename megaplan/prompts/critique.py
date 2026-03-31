@@ -215,7 +215,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
     if active_checks:
         critique_review_block = textwrap.dedent(
             f"""
-            Fill in ALL {len(active_checks)} checks below. For each, add at least one finding with "detail" (what you found) and "flagged" (true if it's a problem or could affect whether tests pass). When in doubt, flag it — the gate can accept tradeoffs, but it can't act on findings it never sees. {{"detail": "No issue found", "flagged": false}} is valid. You can add multiple findings per check.
+            Fill in ALL {len(active_checks)} checks below. For each, add at least one finding with "detail" (what you found) and "flagged" (true if it's a concern). When in doubt, flag it — the gate can accept tradeoffs, but it can't act on findings it never sees. {{"detail": "No issue found", "flagged": false}} is valid. You can add multiple findings per check.
 
             {_render_critique_checks(active_checks)}
 
