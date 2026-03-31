@@ -14,6 +14,7 @@ class CritiqueCheckSpec(TypedDict):
     guidance: str
     category: str
     default_severity: str
+    tier: str
 
 
 CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
@@ -26,6 +27,7 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         ),
         "category": "completeness",
         "default_severity": "likely-significant",
+        "tier": "core",
     },
     {
         "id": "correctness",
@@ -37,17 +39,20 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         ),
         "category": "correctness",
         "default_severity": "likely-significant",
+        "tier": "core",
     },
     {
         "id": "scope",
-        "question": "Is the scope and scale of the change appropriate?",
+        "question": "Search for related code that handles the same concept. Is the reported issue a symptom of something broader?",
         "guidance": (
-            "Flag missing required work, out-of-scope edits, or changes that expand behavior without "
-            "clear justification. Also ask: is a minimal patch the right scale, or does this issue "
-            "need new code, new methods, or restructuring?"
+            "Look at how the changed function is used across the codebase. Does the fix only address "
+            "one caller's scenario while others remain broken? Flag missing required work or out-of-scope "
+            "edits. A minimal patch is often right, but check whether the underlying problem is bigger "
+            "than what the issue describes."
         ),
         "category": "completeness",
         "default_severity": "likely-significant",
+        "tier": "core",
     },
     {
         "id": "all_locations",
@@ -59,17 +64,19 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         ),
         "category": "completeness",
         "default_severity": "likely-significant",
+        "tier": "extended",
     },
     {
         "id": "callers",
-        "question": "Is the change in the right place, and would it break any callers?",
+        "question": "Find the callers of the changed function. What arguments do they actually pass? Does the fix handle all of them?",
         "guidance": (
-            "First ask: should this change be HERE, or in a caller, callee, or new method? "
-            "Then check function signatures, return types, and any code that calls or depends on "
-            "the changed function."
+            "Grep for call sites. For each caller, check what values it passes — especially edge cases "
+            "like None, zero, empty, or composite inputs. Then ask: should this change be here, or in "
+            "a caller, callee, or new method?"
         ),
         "category": "correctness",
         "default_severity": "likely-significant",
+        "tier": "extended",
     },
     {
         "id": "conventions",
@@ -81,6 +88,7 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         ),
         "category": "maintainability",
         "default_severity": "likely-minor",
+        "tier": "extended",
     },
     {
         "id": "verification",
@@ -93,6 +101,7 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         ),
         "category": "completeness",
         "default_severity": "uncertain",
+        "tier": "core",
     },
     {
         "id": "criteria_quality",
@@ -105,10 +114,14 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
         ),
         "category": "completeness",
         "default_severity": "likely-significant",
+        "tier": "extended",
     },
 )
 
 _CHECK_BY_ID: Final[dict[str, CritiqueCheckSpec]] = {check["id"]: check for check in CRITIQUE_CHECKS}
+_CORE_CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = tuple(
+    check for check in CRITIQUE_CHECKS if check["tier"] == "core"
+)
 
 
 def get_check_ids() -> list[str]:
@@ -123,14 +136,23 @@ def build_check_category_map() -> dict[str, str]:
     return {check["id"]: check["category"] for check in CRITIQUE_CHECKS}
 
 
-def build_empty_template() -> list[dict[str, Any]]:
+def checks_for_robustness(robustness: str) -> tuple[CritiqueCheckSpec, ...]:
+    if robustness == "heavy":
+        return CRITIQUE_CHECKS
+    if robustness == "light":
+        return ()
+    return _CORE_CRITIQUE_CHECKS
+
+
+def build_empty_template(checks: tuple[CritiqueCheckSpec, ...] | None = None) -> list[dict[str, Any]]:
+    active_checks = CRITIQUE_CHECKS if checks is None else checks
     return [
         {
             "id": check["id"],
             "question": check["question"],
             "findings": [],
         }
-        for check in CRITIQUE_CHECKS
+        for check in active_checks
     ]
 
 
@@ -149,13 +171,17 @@ def _valid_findings(findings: Any) -> bool:
     return True
 
 
-def validate_critique_checks(payload: Any) -> list[str]:
+def validate_critique_checks(
+    payload: Any,
+    *,
+    expected_ids: tuple[str, ...] | list[str] | None = None,
+) -> list[str]:
     raw_checks = payload.get("checks") if isinstance(payload, dict) else payload
+    expected = get_check_ids() if expected_ids is None else list(expected_ids)
     if not isinstance(raw_checks, list):
-        return get_check_ids()
+        return expected
 
-    expected_ids = get_check_ids()
-    expected_set = set(expected_ids)
+    expected_set = set(expected)
     valid_ids: set[str] = set()
     invalid_expected_ids: set[str] = set()
     invalid_unknown_ids: set[str] = set()
@@ -188,7 +214,7 @@ def validate_critique_checks(payload: Any) -> list[str]:
 
     return [
         check_id
-        for check_id in expected_ids
+        for check_id in expected
         if check_id not in valid_ids or check_id in invalid_expected_ids
     ] + sorted(invalid_unknown_ids)
 
@@ -198,6 +224,7 @@ __all__ = [
     "VALID_SEVERITY_HINTS",
     "build_check_category_map",
     "build_empty_template",
+    "checks_for_robustness",
     "get_check_by_id",
     "get_check_ids",
     "validate_critique_checks",
