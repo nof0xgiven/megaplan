@@ -18,18 +18,6 @@ class CritiqueCheckSpec(TypedDict):
 
 CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     {
-        "id": "approach",
-        "question": "Is this the right approach to the problem?",
-        "guidance": (
-            "Before checking details, ask three things: "
-            "(1) Right layer — should the change be in this function, a caller, a callee, or a new function? "
-            "(2) Right scale — is a minimal patch enough, or does the issue need new code/methods/restructuring? "
-            "(3) Right pattern — does the approach match how similar problems are solved in this codebase?"
-        ),
-        "category": "correctness",
-        "default_severity": "likely-significant",
-    },
-    {
         "id": "issue_hints",
         "question": "Did the work fully address the issue hints, user notes, and approved plan requirements?",
         "guidance": (
@@ -51,10 +39,11 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     },
     {
         "id": "scope",
-        "question": "Is the work scoped appropriately to the approved task?",
+        "question": "Is the scope and scale of the change appropriate?",
         "guidance": (
             "Flag missing required work, out-of-scope edits, or changes that expand behavior without "
-            "clear justification from the approved plan."
+            "clear justification. Also ask: is a minimal patch the right scale, or does this issue "
+            "need new code, new methods, or restructuring?"
         ),
         "category": "completeness",
         "default_severity": "likely-significant",
@@ -71,20 +60,22 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
     },
     {
         "id": "callers",
-        "question": "Would this change break any callers or downstream consumers?",
+        "question": "Is the change in the right place, and would it break any callers?",
         "guidance": (
-            "Check function signatures, data contracts, artifact formats, schema compatibility, and "
-            "other entry points that rely on the old behavior."
+            "First ask: should this change be HERE, or in a caller, callee, or new method? "
+            "Then check function signatures, data contracts, and other entry points that rely on "
+            "the current behavior."
         ),
         "category": "correctness",
         "default_severity": "likely-significant",
     },
     {
         "id": "conventions",
-        "question": "Does the change follow repository conventions and existing patterns?",
+        "question": "Does the approach match how the codebase solves similar problems?",
         "guidance": (
-            "Review naming, structure, typing, and how similar logic is implemented elsewhere in the "
-            "codebase. Do not spend findings on trivial stylistic preferences."
+            "Check not just naming/style but how similar PROBLEMS are solved in this codebase. "
+            "If the codebase adds new methods for similar cases, the plan should too. "
+            "Do not spend findings on trivial stylistic preferences."
         ),
         "category": "maintainability",
         "default_severity": "likely-minor",
