@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import textwrap
+from functools import partial
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
-from megaplan.checks import CRITIQUE_CHECKS, build_empty_template, get_check_by_id
+from megaplan.checks import CRITIQUE_CHECKS, build_empty_template
 from megaplan.types import (
     CliError,
     PlanState,
@@ -94,6 +95,79 @@ PLAN_TEMPLATE = textwrap.dedent(
     - Complex plans: use multiple `## Phase N:` sections, each containing `### Step N:` steps. Step numbers are global (not per-phase).
     - The flat `## Step N:` format (without phases) also works for backwards compatibility.
     - Key invariants: one H1 title, one `## Overview`, numbered step sections (`### Step N:` or `## Step N:`), and at least one ordering section.
+    """
+).strip()
+
+_EXECUTE_OUTPUT_SHAPE_EXAMPLE = textwrap.dedent(
+    """
+    ```json
+    {
+      "output": "Implemented the approved plan and captured execution evidence.",
+      "files_changed": ["megaplan/handlers.py", "megaplan/evaluation.py"],
+      "commands_run": ["pytest tests/test_megaplan.py -k evidence"],
+      "deviations": [],
+      "task_updates": [
+        {
+          "task_id": "T6",
+          "status": "done",
+          "executor_notes": "Caught the empty-strings edge case while checking execution evidence: blank `commands_run` entries still leave the task uncovered, so the missing-evidence guard behaves correctly.",
+          "files_changed": ["megaplan/handlers.py"],
+          "commands_run": ["pytest tests/test_megaplan.py -k execute"]
+        },
+        {
+          "task_id": "T7",
+          "status": "done",
+          "executor_notes": "Confirmed the happy path still records task evidence after the prompt updates by rerunning focused tests and checking the tracked task summary stayed intact.",
+          "files_changed": ["megaplan/prompts.py"],
+          "commands_run": ["pytest tests/test_prompts.py -k review"]
+        },
+        {
+          "task_id": "T8",
+          "status": "done",
+          "executor_notes": "Kept the rubber-stamp thresholds centralized in evaluation so sense checks and reviewer verdicts share one policy entry point while still using different strictness levels.",
+          "files_changed": ["megaplan/evaluation.py"],
+          "commands_run": ["pytest tests/test_evaluation.py -k rubber_stamp"]
+        },
+        {
+          "task_id": "T11",
+          "status": "skipped",
+          "executor_notes": "Skipped because upstream work is not ready yet; no repo changes were made for this task.",
+          "files_changed": [],
+          "commands_run": []
+        }
+      ],
+      "sense_check_acknowledgments": [
+        {
+          "sense_check_id": "SC6",
+          "executor_note": "Confirmed execute only blocks when both files_changed and commands_run are empty for a done task."
+        }
+      ]
+    }
+    ```
+    """
+).strip()
+
+_EXECUTE_REQUIREMENTS_TEMPLATE = textwrap.dedent(
+    """
+    Requirements:
+    - Implement the intent, not just the text.
+    - Adapt if repository reality contradicts the plan.
+    - Report deviations explicitly.
+    - Do not over-engineer beyond what the plan prescribes — no str() wraps, .get() fallbacks, or try/except guards unless the plan called for them or you found a concrete reason.
+    - Do NOT fix unrelated issues you encounter (e.g., dependency compatibility, Python version workarounds). Only change files directly needed for the task. If tests need updating, only update tests that are directly related to your fix.
+    - If you cannot verify your changes (tests missing or unrunnable), treat this as high risk — re-examine your implementation with extra scrutiny instead of accepting it on faith.
+    - If tests fail, read the traceback carefully. Diagnose WHY — don't just retry. Common causes: wrong function/method used, missing import, incorrect type, edge case not handled. Fix the root cause, then re-run.
+    - Output concrete files changed and commands run. `files_changed` means files you WROTE or MODIFIED — not files you read or verified. Only list files where you made actual edits.
+    - Use the tasks in `finalize.json` as the execution boundary.
+    - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, then after each completed task read the full file, update that task's `status`, `executor_notes`, `files_changed`, and `commands_run`, and write the full file back. Do NOT write to `finalize.json` directly — the harness owns that file.
+    - Best-effort sense-check checkpointing: if `{checkpoint_path}` is writable, then after each sense check acknowledgment read the full file again, update that sense check's `executor_note`, and write the full file back.
+    - Always use full read-modify-write updates for `{checkpoint_path}` instead of partial edits. If the sandbox blocks writes, continue execution and rely on the structured output below.
+    - Structured output remains the authoritative final summary for this step. Disk writes are progress checkpoints for timeout recovery only.
+    - Return `task_updates` with one object per completed or skipped task.
+    - Return `sense_check_acknowledgments` with one object per sense check.
+    - Keep `executor_notes` verification-focused: explain why your changes are correct. The diff already shows what changed; notes should cover edge cases caught, expected behaviors confirmed, or design choices made.
+    - Follow this JSON shape exactly:
+    {output_shape}
     """
 ).strip()
 
@@ -201,6 +275,7 @@ def _finalize_debt_block(plan_dir: Path, root: Path | None) -> str:
 def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     prep_block, prep_instruction = _render_prep_block(plan_dir)
+    research_block, research_instruction = _render_research_block(plan_dir)
     clarification = state.get("clarification", {})
     if clarification:
         clarification_block = textwrap.dedent(
@@ -226,11 +301,16 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
 
         {clarification_block}
 
+        {research_block}
+
         Requirements:
-        - If the engineering brief above already identifies the exact file, line, and fix, trust it. Verify with at most 1-2 file reads, then produce the plan. Do NOT re-explore the codebase for information the brief already provides.
+        - If the engineering brief suggests an approach, use it as your starting hypothesis — but before committing, consider if there's a simpler or more fundamental fix. The brief is well-researched input, not a final answer.
         - If the brief is absent, incomplete, or says "skip", inspect the repository yourself before planning.
         - Produce a concrete implementation plan in markdown.
-        - Define observable success criteria.
+        - Define observable success criteria as objects with `criterion` (string) and `priority` (`must`, `should`, or `info`):
+          - `must` — hard gate. The reviewer will block on failure. Use for correctness, functional requirements, and verifiable outcomes (e.g., "all existing tests pass", "API returns 200 for valid input"). Every `must` criterion must have a clear yes/no answer.
+          - `should` — quality target. The reviewer flags but does not block. Use for subjective goals, numeric guidelines, and best-effort improvements (e.g., "file under ~300 lines", "no deeply nested conditionals", "each function has a single responsibility").
+          - `info` — documented for humans, reviewer skips. Use for criteria that cannot be verified in this pipeline (e.g., "13 manual smoke tests pass", "stakeholder sign-off obtained").
         - Use the `questions` field for ambiguities that would materially change implementation.
         - Use the `assumptions` field for defaults you are making so planning can proceed now.
         - Prefer cheap validation steps early.
@@ -239,6 +319,7 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
         - Fix the problem fully. Do not limit scope just to avoid breaking existing tests — update the tests too if needed.
         - Prefer the simplest, most direct fix. No fallbacks, type conversions, or defensive wrappers without concrete evidence they are needed.
         - If the task or issue hints suggest a specific approach, follow it. Only deviate with concrete counter-evidence.
+        {research_instruction}
 
         {PLAN_TEMPLATE}
         """
@@ -348,7 +429,7 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
         - Update the plan to address the significant issues.
         - Keep the plan readable and executable.
         - Return flags_addressed with the exact flag IDs you addressed.
-        - Preserve or improve success criteria quality.
+        - Preserve or improve success criteria quality. Each criterion must have a `priority` of `must`, `should`, or `info`. Promote or demote priorities if critique feedback reveals a criterion was over- or under-weighted.
         - Verify that the plan remains aligned with the user's original intent, not just internal plan quality.
         - Remove unjustified scope growth. If critique raised scope creep, narrow the plan back to the original idea unless the broader work is strictly required.
         - Maintain the structural template: H1 title, ## Overview, phase sections with numbered step sections, ## Execution Order or ## Validation Order.
@@ -587,7 +668,7 @@ def _render_prep_block(plan_dir: Path) -> tuple[str, str]:
         {suggested_approach}
         """
     ).strip()
-    prep_instruction = "The engineering brief above was produced by analyzing the codebase. Use it as primary context."
+    prep_instruction = "The engineering brief above was produced by analyzing the codebase. Use it as a strong starting point, but the suggested approach is a hypothesis — verify it's the best fix, not just a valid one."
     return prep_block, prep_instruction
 
 
@@ -620,7 +701,12 @@ def _render_critique_template(plan_dir: Path, state: PlanState) -> str:
                 enriched = []
                 for check in prior_checks:
                     cid = check.get("id", "")
-                    flagged_findings = [f for f in check.get("findings", []) if f.get("flagged")]
+                    flagged_indices: dict[int, int] = {}
+                    flagged_counter = 0
+                    for finding_index, finding in enumerate(check.get("findings", [])):
+                        if finding.get("flagged"):
+                            flagged_counter += 1
+                            flagged_indices[finding_index] = flagged_counter
                     prior_findings_list = []
                     for fi, f in enumerate(check.get("findings", [])):
                         pf = {
@@ -629,11 +715,10 @@ def _render_critique_template(plan_dir: Path, state: PlanState) -> str:
                         }
                         if f.get("flagged"):
                             # Match flag ID: check_id for single, check_id-N for multiple
-                            if len(flagged_findings) == 1:
+                            if flagged_counter == 1:
                                 fid = cid
                             else:
-                                flagged_idx = [j for j, ff in enumerate(check.get("findings", [])) if ff.get("flagged")].index(fi) if fi < len(check.get("findings", [])) else 0
-                                fid = f"{cid}-{flagged_idx + 1}"
+                                fid = f"{cid}-{flagged_indices[fi]}"
                             pf["status"] = flag_status.get(fid, flag_status.get(cid, "open"))
                         else:
                             pf["status"] = "n/a"
@@ -723,8 +808,11 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
 
         Additional guidelines:
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
+        - Over-engineering: prefer the simplest approach that fully solves the problem.
         - Reuse existing flag IDs when the same concern is still open.
         - `verified_flag_ids` should list previously addressed flags that now appear resolved.
+        - Verify that the plan follows the expected structure when validator warnings or the outline suggest drift.
+        - Additional flags may use these categories: correctness, security, completeness, performance, maintainability, other.
         - Focus on concrete issues, not structural formatting.
         {research_instruction}
         """
@@ -922,6 +1010,23 @@ def _finalize_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
           - `question`: reviewer verification question
           - `verdict`: always `""` at finalize time
         - `meta_commentary` must be a single string with execution guidance, gotchas, or judgment calls that help the executor succeed.
+        - `validation` must be an object that self-checks plan coverage:
+          - `plan_steps_covered`: enumerate EVERY step from the approved plan. For each step, provide a short `plan_step_summary` (the step's intent in one phrase) and `finalize_task_ids` (array of task IDs that implement it — a single plan step may map to multiple tasks).
+          - `orphan_tasks`: task IDs that do not correspond to any plan step. Normally empty. If non-empty, explain in `completeness_notes`.
+          - `completeness_notes`: free-text explanation of any gaps, deviations, or deliberate omissions.
+          - `coverage_complete`: set to `true` only if every plan step has at least one finalize task AND you have verified the mapping by reviewing each entry. Set to `false` if any plan step is missing coverage.
+          - Example:
+          ```json
+          "validation": {{
+            "plan_steps_covered": [
+              {{"plan_step_summary": "Add retry logic to API client", "finalize_task_ids": ["T1", "T2"]}},
+              {{"plan_step_summary": "Update configuration schema", "finalize_task_ids": ["T3"]}}
+            ],
+            "orphan_tasks": [],
+            "completeness_notes": "All plan steps mapped to tasks.",
+            "coverage_complete": true
+          }}
+          ```
         - Preserve information that strong existing artifacts already capture well: execution ordering, watch-outs, reviewer checkpoints, and practical context.
         - The structured output should be self-contained: an executor reading only `finalize.json` should have everything needed to work.
         - Keep the task count proportional to the work. A simple 1-2 file fix should be 2 tasks: (1) apply the fix, (2) run tests. Do NOT create separate "inspect" or "read" tasks for simple changes — the executor can read and fix in one step. Only create more tasks when the work has genuinely independent stages.
@@ -929,28 +1034,19 @@ def _finalize_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         """
     ).strip()
 
-
-def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    prep_block, prep_instruction = _render_prep_block(plan_dir)
-    # Codex execute often cannot write back into plan_dir during --full-auto, so
-    # checkpoint instructions must stay best-effort rather than mandatory.
-    finalize_path = str(plan_dir / "finalize.json")
-    checkpoint_path = str(plan_dir / "execution_checkpoint.json")
-    finalize_data = read_json(plan_dir / "finalize.json")
-    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    robustness = configured_robustness(state)
-    gate = read_json(plan_dir / "gate.json")
+def _execute_review_block(plan_dir: Path) -> str:
     review_path = plan_dir / "review.json"
-    if review_path.exists():
-        prior_review_block = textwrap.dedent(
-            f"""
-            Previous review findings to address on this execution pass (`review.json`):
-            {json_dump(read_json(review_path)).strip()}
-            """
-        ).strip()
-    else:
-        prior_review_block = "No prior `review.json` exists. Treat this as the first execution pass."
+    if not review_path.exists():
+        return "No prior `review.json` exists. Treat this as the first execution pass."
+    return textwrap.dedent(
+        f"""
+        Previous review findings to address on this execution pass (`review.json`):
+        {json_dump(read_json(review_path)).strip()}
+        """
+    ).strip()
+
+
+def _execute_nudges(finalize_data: dict[str, Any], plan_dir: Path, root: Path | None) -> str:
     nudge_lines: list[str] = []
     sense_checks = finalize_data.get("sense_checks", [])
     if sense_checks:
@@ -967,41 +1063,84 @@ def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) 
         nudge_lines.append("Debt watch items (do not make these worse):")
         for item in debt_watch_items:
             nudge_lines.append(f"- {item}")
-    execution_nudges = "\n".join(nudge_lines)
+    return "\n".join(nudge_lines)
+
+
+def _execute_rerun_guidance(plan_dir: Path, finalize_data: dict[str, Any]) -> str:
     tasks = finalize_data.get("tasks", [])
-    done_tasks = [t for t in tasks if t.get("status") in ("done", "skipped")]
-    pending_tasks = [t for t in tasks if t.get("status") == "pending"]
+    done_tasks = [task for task in tasks if task.get("status") in ("done", "skipped")]
+    pending_tasks = [task for task in tasks if task.get("status") == "pending"]
     if done_tasks and pending_tasks:
-        done_ids = ", ".join(t["id"] for t in done_tasks)
-        pending_ids = ", ".join(t["id"] for t in pending_tasks)
-        rerun_guidance = (
+        done_ids = ", ".join(task["id"] for task in done_tasks)
+        pending_ids = ", ".join(task["id"] for task in pending_tasks)
+        return (
             f"Re-execution: {len(done_tasks)} tasks already tracked ({done_ids}). "
             f"Focus on the {len(pending_tasks)} remaining tasks ({pending_ids}). "
             "You must still return task_updates for ALL tasks (including already-tracked ones) — "
             "for previously done tasks, preserve their existing status and notes."
         )
-    elif done_tasks and not pending_tasks:
+    if done_tasks and not pending_tasks:
         review_data = read_json(plan_dir / "review.json") if (plan_dir / "review.json").exists() else {}
-        review_issues = review_data.get("issues", [])
-        issue_list = "\n".join(f"  - {issue}" for issue in review_issues) if review_issues else "  (see review.json above for details)"
-        rerun_guidance = (
+        rework_items = review_data.get("rework_items", [])
+        if rework_items:
+            rework_lines = []
+            for item in rework_items:
+                if not isinstance(item, dict):
+                    continue
+                task_id = item.get("task_id", "?")
+                issue = item.get("issue", "")
+                expected = item.get("expected", "")
+                actual = item.get("actual", "")
+                evidence = item.get("evidence_file", "")
+                entry = f"  - [{task_id}] {issue}"
+                if expected:
+                    entry += f"\n    expected: {expected}"
+                if actual:
+                    entry += f"\n    actual: {actual}"
+                if evidence:
+                    entry += f"\n    evidence: {evidence}"
+                rework_lines.append(entry)
+            issue_list = "\n".join(rework_lines)
+        else:
+            review_issues = review_data.get("issues", [])
+            issue_list = "\n".join(f"  - {issue}" for issue in review_issues) if review_issues else "  (see review.json above for details)"
+        return (
             "REWORK REQUIRED: all tasks are already tracked but the reviewer kicked this back.\n"
             f"Review issues to fix:\n{issue_list}\n\n"
             "You MUST make code changes to address each issue — do not return success without modifying files. "
             "For each issue, either fix it and list the file in files_changed, or explain in deviations why no change is needed with line-level evidence. "
             "Return task_updates for all tasks with updated evidence."
         )
-    else:
-        rerun_guidance = ""
+    return ""
+
+
+def _execute_approval_note(state: PlanState) -> str:
     if state["config"].get("auto_approve"):
-        approval_note = (
+        return (
             "Note: User chose auto-approve mode. This execution was not manually "
             "reviewed at the gate. Exercise extra caution on destructive operations."
         )
-    elif state["meta"].get("user_approved_gate"):
-        approval_note = "Note: User explicitly approved this plan at the gate checkpoint."
-    else:
-        approval_note = "Note: Review mode is enabled. Execute should only be running after explicit gate approval."
+    if state["meta"].get("user_approved_gate"):
+        return "Note: User explicitly approved this plan at the gate checkpoint."
+    return "Note: Review mode is enabled. Execute should only be running after explicit gate approval."
+
+
+def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
+    project_dir = Path(state["config"]["project_dir"])
+    prep_block, prep_instruction = _render_prep_block(plan_dir)
+    finalize_data = read_json(plan_dir / "finalize.json")
+    checkpoint_path = str(plan_dir / "execution_checkpoint.json")
+    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
+    gate = read_json(plan_dir / "gate.json")
+    robustness = configured_robustness(state)
+    prior_review_block = _execute_review_block(plan_dir)
+    rerun_guidance = _execute_rerun_guidance(plan_dir, finalize_data)
+    approval_note = _execute_approval_note(state)
+    execution_nudges = _execute_nudges(finalize_data, plan_dir, root)
+    requirements_block = _EXECUTE_REQUIREMENTS_TEMPLATE.format(
+        checkpoint_path=checkpoint_path,
+        output_shape=_EXECUTE_OUTPUT_SHAPE_EXAMPLE,
+    )
     return textwrap.dedent(
         f"""
         Execute the approved plan in the repository.
@@ -1034,68 +1173,7 @@ def _execute_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) 
         {approval_note}
         Robustness level: {robustness}.
 
-        Requirements:
-        - Implement the intent, not just the text.
-        - Adapt if repository reality contradicts the plan.
-        - Report deviations explicitly.
-        - Do not over-engineer beyond what the plan prescribes — no str() wraps, .get() fallbacks, or try/except guards unless the plan called for them or you found a concrete reason.
-        - Do NOT fix unrelated issues you encounter (e.g., dependency compatibility, Python version workarounds). Only change files directly needed for the task. If tests need updating, only update tests that are directly related to your fix.
-        - If you cannot verify your changes (tests missing or unrunnable), treat this as high risk — re-examine your implementation with extra scrutiny instead of accepting it on faith.
-        - If tests fail, read the traceback carefully. Diagnose WHY — don't just retry. Common causes: wrong function/method used, missing import, incorrect type, edge case not handled. Fix the root cause, then re-run.
-        - Output concrete files changed and commands run. `files_changed` means files you WROTE or MODIFIED — not files you read or verified. Only list files where you made actual edits.
-        - Use the tasks in `finalize.json` as the execution boundary.
-        - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, then after each completed task read the full file, update that task's `status`, `executor_notes`, `files_changed`, and `commands_run`, and write the full file back. Do NOT write to `finalize.json` directly — the harness owns that file.
-        - Best-effort sense-check checkpointing: if `{checkpoint_path}` is writable, then after each sense check acknowledgment read the full file again, update that sense check's `executor_note`, and write the full file back.
-        - Always use full read-modify-write updates for `{checkpoint_path}` instead of partial edits. If the sandbox blocks writes, continue execution and rely on the structured output below.
-        - Structured output remains the authoritative final summary for this step. Disk writes are progress checkpoints for timeout recovery only.
-        - Return `task_updates` with one object per completed or skipped task.
-        - Return `sense_check_acknowledgments` with one object per sense check.
-        - Keep `executor_notes` verification-focused: explain why your changes are correct. The diff already shows what changed; notes should cover edge cases caught, expected behaviors confirmed, or design choices made.
-        - Follow this JSON shape exactly:
-        ```json
-        {{
-          "output": "Implemented the approved plan and captured execution evidence.",
-          "files_changed": ["megaplan/handlers.py", "megaplan/evaluation.py"],
-          "commands_run": ["pytest tests/test_megaplan.py -k evidence"],
-          "deviations": [],
-          "task_updates": [
-            {{
-              "task_id": "T6",
-              "status": "done",
-              "executor_notes": "Caught the empty-strings edge case while checking execution evidence: blank `commands_run` entries still leave the task uncovered, so the missing-evidence guard behaves correctly.",
-              "files_changed": ["megaplan/handlers.py"],
-              "commands_run": ["pytest tests/test_megaplan.py -k execute"]
-            }},
-            {{
-              "task_id": "T7",
-              "status": "done",
-              "executor_notes": "Confirmed the happy path still records task evidence after the prompt updates by rerunning focused tests and checking the tracked task summary stayed intact.",
-              "files_changed": ["megaplan/prompts.py"],
-              "commands_run": ["pytest tests/test_prompts.py -k review"]
-            }},
-            {{
-              "task_id": "T8",
-              "status": "done",
-              "executor_notes": "Kept the rubber-stamp thresholds centralized in evaluation so sense checks and reviewer verdicts share one policy entry point while still using different strictness levels.",
-              "files_changed": ["megaplan/evaluation.py"],
-              "commands_run": ["pytest tests/test_evaluation.py -k rubber_stamp"]
-            }},
-            {{
-              "task_id": "T11",
-              "status": "skipped",
-              "executor_notes": "Skipped because upstream work is not ready yet; no repo changes were made for this task.",
-              "files_changed": [],
-              "commands_run": []
-            }}
-          ],
-          "sense_check_acknowledgments": [
-            {{
-              "sense_check_id": "SC6",
-              "executor_note": "Confirmed execute only blocks when both files_changed and commands_run are empty for a done task."
-            }}
-          ]
-        }}
-        ```
+        {requirements_block}
 
         {execution_nudges}
         """
@@ -1239,24 +1317,24 @@ def _settled_decisions_instruction(gate: dict[str, object]) -> str:
     return "- The decisions listed above were settled at the gate stage. Verify that the executor implemented each settled decision correctly. Flag deviations from these decisions, but do not question the decisions themselves."
 
 
-def _review_robustness_instruction(robustness: str) -> list[str]:
-    return [
-        "Trust executor evidence by default. Dig deeper only where the git diff, `execution_audit.json`, or vague notes make the claim ambiguous.",
-    ]
-
-
-def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
+def _review_prompt(
+    state: PlanState,
+    plan_dir: Path,
+    *,
+    review_intro: str,
+    criteria_guidance: str,
+    task_guidance: str,
+    sense_check_guidance: str,
+) -> str:
     project_dir = Path(state["config"]["project_dir"])
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     execution = read_json(plan_dir / "execution.json")
     gate = read_json(plan_dir / "gate.json")
     finalize_data = read_json(plan_dir / "finalize.json")
-    robustness = configured_robustness(state)
     settled_decisions_block = _settled_decisions_block(gate)
     settled_decisions_instruction = _settled_decisions_instruction(gate)
     review_research_block, review_research_instruction = _render_research_block(plan_dir)
-    robustness_lines = "\n".join(f"- {line}" for line in _review_robustness_instruction(robustness))
     diff_summary = collect_git_diff_summary(project_dir)
     audit_path = plan_dir / "execution_audit.json"
     if audit_path.exists():
@@ -1270,7 +1348,7 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
         audit_block = "Execution audit (`execution_audit.json`): not present. Skip that artifact gracefully and rely on `finalize.json`, `execution.json`, and the git diff."
     return textwrap.dedent(
         f"""
-        Review the execution critically against user intent and observable success criteria.
+        {review_intro}
 
         Project directory:
         {project_dir}
@@ -1302,27 +1380,45 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
         {diff_summary}
 
         Requirements:
-        - Judge against the success criteria, not plan elegance.
-        - Be critical and call out real misses.
-        {robustness_lines}
+        - {criteria_guidance}
+        - Trust executor evidence by default. Dig deeper only where the git diff, `execution_audit.json`, or vague notes make the claim ambiguous.
+        - Each criterion has a `priority` (`must`, `should`, or `info`). Apply these rules:
+          - `must` criteria are hard gates. A `must` criterion that fails means `needs_rework`.
+          - `should` criteria are quality targets. If the spirit is met but the letter is not, mark `pass` with evidence explaining the gap. Only mark `fail` if the intent was clearly missed. A `should` failure alone does NOT require `needs_rework`.
+          - `info` criteria are for human reference. Mark them `waived` with a note — do not evaluate them.
+          - If a criterion (any priority) cannot be verified in this context (e.g., requires manual testing or runtime observation), mark it `waived` with an explanation.
+        - Set `review_verdict` to `needs_rework` only when at least one `must` criterion fails or actual implementation work is incomplete. Use `approved` when all `must` criteria pass, even if some `should` criteria are flagged.
         {settled_decisions_instruction}
         {review_research_instruction}
-        - If actual implementation work is incomplete, set top-level `review_verdict` to `needs_rework` so the plan routes back to execute. Use `approved` only when the work itself is acceptable.
-        - Review each task by cross-referencing the executor's per-task `files_changed` and `commands_run` against the git diff and any audit findings.
-        - Review every sense check explicitly. Confirm concise executor acknowledgments when they are specific; dig deeper only when they are perfunctory or contradicted by the code.
+        - {task_guidance}
+        - {sense_check_guidance}
         - Follow this JSON shape exactly:
         ```json
         {{
           "review_verdict": "approved",
           "criteria": [
             {{
-              "name": "Execution evidence is auditable.",
-              "pass": true,
-              "evidence": "Per-task evidence in finalize.json matches the git diff and execution_audit.json reported no phantom claims."
+              "name": "All existing tests pass",
+              "priority": "must",
+              "pass": "pass",
+              "evidence": "Test suite ran green — 42 passed, 0 failed."
+            }},
+            {{
+              "name": "File under ~300 lines",
+              "priority": "should",
+              "pass": "pass",
+              "evidence": "File is 375 lines — above the target but reasonable given the component's responsibilities. Spirit met."
+            }},
+            {{
+              "name": "Manual smoke tests pass",
+              "priority": "info",
+              "pass": "waived",
+              "evidence": "Cannot be verified in automated review. Noted for manual QA."
             }}
           ],
           "issues": [],
-          "summary": "Approved. Executor evidence lines up with the diff; only routine advisory findings remain.",
+          "rework_items": [],
+          "summary": "Approved. All must criteria pass. The should criterion on line count is close enough given the component scope.",
           "task_verdicts": [
             {{
               "task_id": "T6",
@@ -1338,105 +1434,14 @@ def _review_claude_prompt(state: PlanState, plan_dir: Path) -> str:
           ]
         }}
         ```
-        - When the work needs another execute pass, keep the same shape and change only `review_verdict` to `needs_rework`; make `issues`, `summary`, and task verdicts specific enough for the executor to act on directly.
-        """
-    ).strip()
-
-
-def _review_codex_prompt(state: PlanState, plan_dir: Path) -> str:
-    project_dir = Path(state["config"]["project_dir"])
-    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    execution = read_json(plan_dir / "execution.json")
-    gate = read_json(plan_dir / "gate.json")
-    finalize_data = read_json(plan_dir / "finalize.json")
-    robustness = configured_robustness(state)
-    settled_decisions_block = _settled_decisions_block(gate)
-    settled_decisions_instruction = _settled_decisions_instruction(gate)
-    review_research_block, review_research_instruction = _render_research_block(plan_dir)
-    robustness_lines = "\n".join(f"- {line}" for line in _review_robustness_instruction(robustness))
-    diff_summary = collect_git_diff_summary(project_dir)
-    audit_path = plan_dir / "execution_audit.json"
-    if audit_path.exists():
-        audit_block = textwrap.dedent(
-            f"""
-            Execution audit (`execution_audit.json`):
-            {json_dump(read_json(audit_path)).strip()}
-            """
-        ).strip()
-    else:
-        audit_block = "Execution audit (`execution_audit.json`): not present. Skip that artifact gracefully and rely on `finalize.json`, `execution.json`, and the git diff."
-    return textwrap.dedent(
-        f"""
-        Review the implementation against the success criteria.
-
-        Project directory:
-        {project_dir}
-
-        {intent_and_notes_block(state)}
-
-        Approved plan:
-        {latest_plan}
-
-        Execution tracking state (`finalize.json`):
-        {json_dump(finalize_data).strip()}
-
-        Plan metadata:
-        {json_dump(latest_meta).strip()}
-
-        Gate summary:
-        {json_dump(gate).strip()}
-
-        {settled_decisions_block}
-
-        {review_research_block}
-
-        Execution summary:
-        {json_dump(execution).strip()}
-
-        {audit_block}
-
-        Git diff summary:
-        {diff_summary}
-
-        Requirements:
-        - Be critical.
-        - Verify each success criterion explicitly.
-        {robustness_lines}
-        {settled_decisions_instruction}
-        {review_research_instruction}
-        - If actual implementation work is incomplete, set top-level `review_verdict` to `needs_rework` so the plan routes back to execute. Use `approved` only when the work itself checks out.
-        - Cross-reference each task's `files_changed` and `commands_run` against the git diff and any audit findings.
-        - Review every `sense_check` explicitly and treat perfunctory acknowledgments as a reason to dig deeper.
-        - Follow this JSON shape exactly:
-        ```json
-        {{
-          "review_verdict": "approved",
-          "criteria": [
-            {{
-              "name": "Review cross-check completed",
-              "pass": true,
-              "evidence": "Executor evidence in finalize.json matches the diff and the audit file."
-            }}
-          ],
-          "issues": [],
-          "summary": "Approved. The executor evidence is consistent and the remaining findings are advisory only.",
-          "task_verdicts": [
-            {{
-              "task_id": "T3",
-              "reviewer_verdict": "Pass. Review prompt changes match the diff and reference the audit fallback correctly.",
-              "evidence_files": ["megaplan/prompts.py"]
-            }}
-          ],
-          "sense_check_verdicts": [
-            {{
-              "sense_check_id": "SC3",
-              "verdict": "Confirmed. Both review prompts load execution_audit.json with a graceful fallback."
-            }}
-          ]
-        }}
-        ```
-        - When the work needs another execute pass, keep the same shape and change only `review_verdict` to `needs_rework`; put the actionable gaps in `issues`, `summary`, and per-task verdicts.
+        - `rework_items` must be an array of structured rework directives. When `review_verdict` is `needs_rework`, populate one entry per issue with:
+          - `task_id`: which finalize task this issue relates to
+          - `issue`: what is wrong
+          - `expected`: what correct behavior looks like
+          - `actual`: what was observed
+          - `evidence_file` (optional): file path supporting the finding
+        - `issues` must still be populated as a flat one-line-per-item summary derived from `rework_items` (for backward compatibility). When approved, both `issues` and `rework_items` should be empty arrays.
+        - When the work needs another execute pass, keep the same shape and change only `review_verdict` to `needs_rework`; make `issues`, `rework_items`, `summary`, and task verdicts specific enough for the executor to act on directly.
         """
     ).strip()
 
@@ -1452,7 +1457,13 @@ _CLAUDE_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "gate": _gate_prompt,
     "finalize": _finalize_prompt,
     "execute": _execute_prompt,
-    "review": _review_claude_prompt,
+    "review": partial(
+        _review_prompt,
+        review_intro="Review the execution critically against user intent and observable success criteria.",
+        criteria_guidance="Judge against the success criteria, not plan elegance.",
+        task_guidance="Review each task by cross-referencing the executor's per-task `files_changed` and `commands_run` against the git diff and any audit findings.",
+        sense_check_guidance="Review every sense check explicitly. Confirm concise executor acknowledgments when they are specific; dig deeper only when they are perfunctory or contradicted by the code.",
+    ),
 }
 
 _CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
@@ -1464,7 +1475,13 @@ _CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "gate": _gate_prompt,
     "finalize": _finalize_prompt,
     "execute": _execute_prompt,
-    "review": _review_codex_prompt,
+    "review": partial(
+        _review_prompt,
+        review_intro="Review the implementation against the success criteria.",
+        criteria_guidance="Verify each success criterion explicitly.",
+        task_guidance="Cross-reference each task's `files_changed` and `commands_run` against the git diff and any audit findings.",
+        sense_check_guidance="Review every `sense_check` explicitly and treat perfunctory acknowledgments as a reason to dig deeper.",
+    ),
 }
 
 
@@ -1477,7 +1494,13 @@ _HERMES_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "gate": _gate_prompt,
     "finalize": _finalize_prompt,
     "execute": _execute_prompt,
-    "review": _review_claude_prompt,  # Hermes routes through Claude models on OpenRouter
+    "review": partial(  # Hermes routes through Claude models on OpenRouter
+        _review_prompt,
+        review_intro="Review the execution critically against user intent and observable success criteria.",
+        criteria_guidance="Judge against the success criteria, not plan elegance.",
+        task_guidance="Review each task by cross-referencing the executor's per-task `files_changed` and `commands_run` against the git diff and any audit findings.",
+        sense_check_guidance="Review every sense check explicitly. Confirm concise executor acknowledgments when they are specific; dig deeper only when they are perfunctory or contradicted by the code.",
+    ),
 }
 
 
