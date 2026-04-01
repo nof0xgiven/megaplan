@@ -271,7 +271,7 @@ def _critique_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         - Robustness level: {robustness}. {robustness_critique_instruction(robustness)}
         - Over-engineering: prefer the simplest approach that fully solves the problem.
         - Reuse existing flag IDs when the same concern is still open.
-        - `verified_flag_ids` should list previously addressed flags that now appear resolved.
+        - `verified_flag_ids`: list flag IDs from prior iterations that the revised plan actually resolves (e.g., if the plan was revised to fix FLAG-001, and you confirm the fix is correct, include "FLAG-001"). Only include flags you've verified — don't guess.
         - Verify that the plan follows the expected structure when validator warnings or the outline suggest drift.
         - Additional flags may use these categories: correctness, security, completeness, performance, maintainability, other.
         - Focus on concrete issues, not structural formatting.

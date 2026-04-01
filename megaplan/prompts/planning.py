@@ -186,7 +186,6 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         - test_expectations: Tests that verify the affected behavior.
         - constraints: What must not break.
         - suggested_approach: A concrete approach grounded in what you found.
-        - estimated_scope: How big is this change? (e.g., "1-line fix in one file", "changes needed in 3 files", "new function/class required", "refactor of existing subsystem"). Be honest — if this needs significant new code, say so.
 
         """
     ).strip()
@@ -238,29 +237,11 @@ def _research_prompt(state: PlanState, plan_dir: Path, root: Path | None = None)
         Your job is to find things the plan might be getting wrong OR missing based on current documentation.
         You are NOT validating the plan — you are a devil's advocate looking for problems, gaps, and outdated approaches.
 
-        You MUST do FOUR searches minimum:
-
-        Search 1 — CHECK WHAT THE TASK ASKS FOR:
-        Read the Original Task carefully. Extract every technical term, API name, directive, file convention,
-        and feature name that is NOT a standard well-known API. For each extracted term, search:
-        "[framework] [version] [term]"
-        e.g. "next.js 16 use cache directive", "next.js 16 proxy.ts", "next.js 16 unstable_instant"
-        If the task names something the plan doesn't mention, that's likely a CRITICAL gap.
-
-        Search 2 — CHECK WHAT THE PLAN DOES:
-        For each framework-specific API/pattern in the plan, search for "[framework] [version] [API]"
-        e.g. "next.js 16 unstable_cache", "next.js 16 force-dynamic"
-        If the docs say this API is deprecated or replaced, that's a CRITICAL consideration.
-
-        Search 3 — CHECK WHAT THE PLAN IS MISSING:
-        Search for "[framework] [version] [task type] best practices" or "checklist" or "migration guide"
-        e.g. "next.js 16 app router migration checklist", "next.js 16 caching best practices"
-        Compare the checklist against the plan. Every recommended step the plan omits is a consideration.
-
-        Search 4 — CHECK FOR BREAKING CHANGES:
-        Search for "[framework] [version] breaking changes" or "new features"
-        e.g. "next.js 16 breaking changes", "next.js 16 new APIs"
-        If the plan uses patterns that changed in this version, that's a CRITICAL consideration.
+        Use your judgment on how many searches to do — adapt to the task. Consider checking:
+        - What the task asks for (unfamiliar APIs, directives, conventions)
+        - What the plan proposes (are the APIs current or deprecated?)
+        - What the plan might be missing (best practices, migration guides)
+        - Breaking changes in the relevant framework version
 
         After all searches, re-read the plan one final time and compare it against the Original Task:
         - Does the task name a specific API or pattern that the plan does NOT use? Flag as CRITICAL.
