@@ -6,8 +6,8 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
 
+from megaplan.checks import build_empty_template, checks_for_robustness
 from megaplan.types import CliError, MOCK_ENV_VAR, PlanState
 from megaplan.workers import (
     STEP_SCHEMA_FILENAMES,
@@ -16,7 +16,7 @@ from megaplan.workers import (
     session_key_for,
     validate_payload,
 )
-from megaplan._core import read_json, schemas_root
+from megaplan._core import configured_robustness, read_json, schemas_root
 from megaplan.prompts import create_hermes_prompt
 
 
@@ -63,6 +63,38 @@ def _toolsets_for_phase(phase: str) -> list[str] | None:
     return ["file"]
 
 
+_TEMPLATE_FILE_PHASES = {"critique", "finalize", "review", "prep"}
+
+
+def _build_output_template(step: str, schema: dict, state: PlanState) -> str:
+    if step != "critique":
+        return _schema_template(schema)
+
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    critique_checks = build_empty_template(
+        checks_for_robustness(configured_robustness(state))
+    )
+    template: dict[str, object] = {}
+    for key in required:
+        if key == "checks":
+            template[key] = critique_checks
+            continue
+        prop = properties.get(key, {})
+        ptype = prop.get("type", "string") if isinstance(prop, dict) else "string"
+        if ptype == "array":
+            template[key] = []
+        elif ptype == "object":
+            template[key] = {}
+        elif ptype == "boolean":
+            template[key] = False
+        elif ptype in ("number", "integer"):
+            template[key] = 0
+        else:
+            template[key] = ""
+    return json.dumps(template, indent=2)
+
+
 def run_hermes_step(
     step: str,
     state: PlanState,
@@ -87,6 +119,7 @@ def run_hermes_step(
     project_dir = Path(state["config"]["project_dir"])
     schema_name = STEP_SCHEMA_FILENAMES[step]
     schema = read_json(schemas_root(root) / schema_name)
+    output_path: Path | None = None
 
     # Session management
     session_key = session_key_for(step, "hermes", model=model)
@@ -132,13 +165,22 @@ def run_hermes_step(
             "They are used for scoring after execution and must remain unchanged."
         )
 
-    # Append a JSON template so the model knows exactly what structure to output
-    template = _schema_template(schema)
-    prompt += (
-        "\n\nIMPORTANT: Your final response MUST be a single valid JSON object. "
-        "Do NOT use markdown. Do NOT wrap in code fences. Output ONLY raw JSON "
-        "matching this template:\n\n" + template
-    )
+    if step in _TEMPLATE_FILE_PHASES:
+        output_path = plan_dir / f"{step}_output.json"
+        output_path.write_text(_build_output_template(step, schema, state), encoding="utf-8")
+        prompt += (
+            f"\n\nIMPORTANT: A template file has been written to {output_path}. "
+            "Fill in this file with your findings using the file write tool as you work. "
+            "Update the file after each major finding. When done, ensure the file contains "
+            "your complete output."
+        )
+    else:
+        template = _schema_template(schema)
+        prompt += (
+            "\n\nIMPORTANT: Your final response MUST be a single valid JSON object. "
+            "Do NOT use markdown. Do NOT wrap in code fences. Output ONLY raw JSON "
+            "matching this template:\n\n" + template
+        )
 
     # Redirect stdout to stderr before creating the agent.  Hermes's
     # KawaiiSpinner captures sys.stdout at __init__ time and writes
@@ -290,7 +332,7 @@ def run_hermes_step(
 
     try:
         validate_payload(step, payload)
-    except CliError as error:
+    except CliError:
         # For execute, try reconstructed payload if validation fails
         if step == "execute":
             reconstructed = _reconstruct_execute_payload(messages, project_dir, plan_dir)
@@ -597,7 +639,6 @@ def _repair_json(text: str) -> str:
     Models sometimes mix escaped and literal newlines, or produce
     backslash-n outside of strings where real whitespace is needed.
     """
-    import re
     # Replace literal \n that appear outside of JSON strings with actual newlines.
     # This handles the case where the model outputs [\n    "item"] instead of
     # [\n    "item"] — the \n is structural whitespace, not string content.

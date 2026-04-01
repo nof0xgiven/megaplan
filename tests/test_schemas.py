@@ -180,7 +180,7 @@ def test_review_schema_requires_task_and_sense_check_verdicts() -> None:
     assert "expected" in rework_item["properties"]
     assert "actual" in rework_item["properties"]
     assert "evidence_file" in rework_item["properties"]
-    assert set(rework_item["required"]) == {"task_id", "issue", "expected", "actual"}
+    assert set(rework_item["required"]) == {"task_id", "issue", "expected", "actual", "evidence_file"}
 
 
 # ---------------------------------------------------------------------------

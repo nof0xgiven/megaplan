@@ -386,7 +386,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                         "actual": {"type": "string"},
                         "evidence_file": {"type": "string"},
                     },
-                    "required": ["task_id", "issue", "expected", "actual"],
+                    "required": ["task_id", "issue", "expected", "actual", "evidence_file"],
                 },
             },
             "summary": {"type": "string"},

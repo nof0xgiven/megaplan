@@ -20,7 +20,6 @@ from megaplan._core import (
     atomic_write_text,
     compute_global_batches,
     config_dir,
-    debt_by_subsystem,
     detect_available_agents,
     escalated_subsystems,
     ensure_runtime_layout,
@@ -47,7 +46,6 @@ from megaplan.handlers import (
     handle_research,
     handle_review,
     handle_revise,
-    handle_step,
 )
 from megaplan.loop.handlers import (
     handle_loop_init,
@@ -55,6 +53,7 @@ from megaplan.loop.handlers import (
     handle_loop_run,
     handle_loop_status,
 )
+from megaplan.step_edit import handle_step
 
 
 

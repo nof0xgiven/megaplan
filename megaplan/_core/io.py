@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import shutil as _shutil
 import tempfile
 from pathlib import Path
 from typing import Any

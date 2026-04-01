@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from megaplan.checks import build_empty_template
+from megaplan.checks import build_empty_template, checks_for_robustness
 from megaplan.schemas import SCHEMAS
 from megaplan.types import (
     CliError,
@@ -28,6 +28,7 @@ from megaplan.types import (
     parse_agent_spec,
 )
 from megaplan._core import (
+    configured_robustness,
     detect_available_agents,
     json_dump,
     latest_plan_meta_path,
@@ -346,7 +347,9 @@ def _default_mock_loop_execute_payload(
 
 def _default_mock_critique_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     iteration = state["iteration"] or 1
-    checks = build_empty_template()
+    del plan_dir
+    active_checks = checks_for_robustness(configured_robustness(state))
+    checks = build_empty_template(active_checks)
     if iteration == 1:
         return {
             "checks": [

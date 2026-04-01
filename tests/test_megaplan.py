@@ -690,7 +690,11 @@ def test_handle_critique_rejects_invalid_check_payload(plan_fixture: PlanFixture
         "run_step_with_worker",
         lambda *args, **kwargs: (worker, "claude", "persistent", False),
     )
-    monkeypatch.setattr(megaplan.handlers, "validate_critique_checks", lambda payload: ["correctness"])
+    monkeypatch.setattr(
+        megaplan.handlers,
+        "validate_critique_checks",
+        lambda payload, **kwargs: ["correctness"],
+    )
 
     with pytest.raises(megaplan.CliError, match="Critique output failed check validation"):
         megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
@@ -701,7 +705,11 @@ def test_handle_critique_rejects_invalid_check_payload(plan_fixture: PlanFixture
 
 
 def test_handle_critique_accepts_validated_checks(plan_fixture: PlanFixture, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(megaplan.handlers, "validate_critique_checks", lambda payload: [])
+    monkeypatch.setattr(
+        megaplan.handlers,
+        "validate_critique_checks",
+        lambda payload, **kwargs: [],
+    )
 
     megaplan.handle_plan(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))
     response = megaplan.handle_critique(plan_fixture.root, plan_fixture.make_args(plan=plan_fixture.plan_name))

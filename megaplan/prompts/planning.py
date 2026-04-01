@@ -138,8 +138,8 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
 
 def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
     del plan_dir
+    del root
     project_dir = Path(state["config"]["project_dir"])
-    project_root = root if root is not None else project_dir
     return textwrap.dedent(
         f"""
         Prepare a concise engineering brief for the task below. This brief will be the primary context for all subsequent planning and execution.
@@ -188,7 +188,6 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         - suggested_approach: A concrete approach grounded in what you found.
         - estimated_scope: How big is this change? (e.g., "1-line fix in one file", "changes needed in 3 files", "new function/class required", "refactor of existing subsystem"). Be honest — if this needs significant new code, say so.
 
-        IMPORTANT: After you finish searching and reading files, you MUST output the prep.json as your final message. Do not end with a tool call — end with the JSON object as plain text.
         """
     ).strip()
 

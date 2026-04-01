@@ -28,19 +28,12 @@ from megaplan.evaluation import validate_execution_evidence
 from megaplan.execution_quality import (
     _capture_git_status_snapshot,
     _check_done_task_evidence,
-    _collect_execute_claimed_paths,
     _collect_quality_deviations,
-    _normalize_execute_claimed_path,
     _observe_git_changes,
-    _observed_batch_paths,
-    _repo_path_hash,
 )
 from megaplan.execution_timeout import (
-    _merge_timeout_checkpoint,
     _recover_execute_timeout,
-    _reset_timeout_invalid_tasks,
     _resolve_execute_approval_mode,
-    _timeout_checkpoint_path,
 )
 from megaplan.merge import _validate_and_merge_batch
 from megaplan.prompts import _execute_batch_prompt
