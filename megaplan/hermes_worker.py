@@ -169,10 +169,14 @@ def run_hermes_step(
         output_path = plan_dir / f"{step}_output.json"
         output_path.write_text(_build_output_template(step, schema, state), encoding="utf-8")
         prompt += (
-            f"\n\nIMPORTANT: A template file has been written to {output_path}. "
-            "Fill in this file with your findings using the file write tool as you work. "
-            "Update the file after each major finding. When done, ensure the file contains "
-            "your complete output."
+            f"\n\nIMPORTANT: Your output MUST be written to this file: {output_path}\n"
+            "This file contains a JSON template. After each check/task you complete:\n"
+            "1. Read the file\n"
+            "2. Add your findings to the relevant section\n"
+            "3. Write the complete updated JSON back to the file\n"
+            "Do NOT output your findings as text. Write them to the file.\n"
+            "Example: to add a finding to the 'correctness' check, read the file, "
+            "update the findings array for that check, and write the whole file back."
         )
     else:
         template = _schema_template(schema)
