@@ -80,6 +80,8 @@ _EXECUTE_REQUIREMENTS_TEMPLATE = textwrap.dedent(
     - If you cannot verify your changes (tests missing or unrunnable), treat this as high risk — re-examine your implementation with extra scrutiny instead of accepting it on faith.
     - If tests fail, read the traceback carefully. Diagnose WHY — don't just retry. Common causes: wrong function/method used, missing import, incorrect type, edge case not handled. Fix the root cause, then re-run.
     - When verifying changes, run the entire test file or module (e.g., `pytest tests/test_foo.py`), not individual test functions. Individual tests miss regressions in the same module.
+    - If a test fails and you determine the failure is pre-existing (fails without your changes too), you MUST still re-run the FULL test suite with your changes applied. Pre-existing failures do not excuse you from verifying all other tests still pass. Never narrow to individual test functions and stop.
+    - Before declaring the work complete, write a short script (not a full test) that reproduces the exact bug or incorrect behavior described in the task. Run it to confirm the fix resolves the issue. Then delete the script so it does not appear in the final diff. If the task description is too vague to write a concrete reproduction, note this explicitly in executor_notes.
     - Output concrete files changed and commands run. `files_changed` means files you WROTE or MODIFIED — not files you read or verified. Only list files where you made actual edits.
     - Use the tasks in `finalize.json` as the execution boundary.
     - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, then after each completed task read the full file, update that task's `status`, `executor_notes`, `files_changed`, and `commands_run`, and write the full file back. Do NOT write to `finalize.json` directly — the harness owns that file.
@@ -375,5 +377,8 @@ def _execute_batch_prompt(
         - Do not include updates for tasks or sense checks outside this batch.
         - Keep `executor_notes` verification-focused.
         - Best-effort progress checkpointing: if `{checkpoint_path}` is writable, checkpoint task and sense-check updates there (not `finalize.json`). The harness owns `finalize.json`.
+        - When verifying changes, run the entire test file or module, not individual test functions. Individual tests miss regressions.
+        - If a test fails and you determine the failure is pre-existing (fails without your changes too), you MUST still re-run the FULL test suite with your changes applied. Pre-existing failures do not excuse you from verifying all other tests still pass. Never narrow to individual test functions and stop.
+        - If this batch includes the final verification task, write a short script that reproduces the exact bug described in the task, run it to confirm the fix resolves it, then delete the script.
         """
     ).strip()

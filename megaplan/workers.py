@@ -355,7 +355,12 @@ def _default_mock_critique_payload(state: PlanState, plan_dir: Path) -> dict[str
             "checks": [
                 {
                     **check,
-                    "findings": [{"detail": "Mock critique found a concrete issue.", "flagged": True}],
+                    "findings": [
+                        {
+                            "detail": "Mock critique found a concrete repository issue that should be addressed before proceeding.",
+                            "flagged": True,
+                        }
+                    ],
                 }
                 for check in checks
             ],
@@ -382,12 +387,17 @@ def _default_mock_critique_payload(state: PlanState, plan_dir: Path) -> dict[str
         "checks": [
             {
                 **check,
-                "findings": [{"detail": "Mock critique verified the revised plan.", "flagged": False}],
+                "findings": [
+                    {
+                        "detail": "Mock critique verified the revised plan against the repository context and found no remaining issue.",
+                        "flagged": False,
+                    }
+                ],
             }
             for check in checks
         ],
         "flags": [],
-        "verified_flag_ids": ["FLAG-001", "FLAG-002"],
+        "verified_flag_ids": [*(check["id"] for check in checks), "FLAG-001", "FLAG-002"],
         "disputed_flag_ids": [],
     }
 
@@ -894,8 +904,22 @@ def run_codex_step(
         raise CliError(error_code, error_message, extra={"raw_output": raw})
     try:
         payload = parse_json_file(output_path)
-    except CliError as error:
-        raise CliError(error.code, error.message, extra={"raw_output": raw}) from error
+    except CliError:
+        # Fallback: when resuming a persistent session, --output-schema is not
+        # supported so Codex may write to the plan-dir output file instead of
+        # the temp file.  Try the known output path before giving up.
+        fallback_names = {
+            "critique": "critique_output.json",
+        }
+        fallback_name = fallback_names.get(step, f"{step}_output.json")
+        fallback_path = plan_dir / fallback_name
+        if fallback_path != output_path and fallback_path.exists():
+            try:
+                payload = parse_json_file(fallback_path)
+            except CliError as inner_error:
+                raise CliError(inner_error.code, inner_error.message, extra={"raw_output": raw}) from inner_error
+        else:
+            raise CliError("parse_error", f"Output file {output_path.name} was not valid JSON and no fallback found", extra={"raw_output": raw})
     try:
         validate_payload(step, payload)
     except CliError as error:

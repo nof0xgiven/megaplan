@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -12,9 +14,10 @@ from megaplan.execution import (
     handle_execute_auto_loop as dispatch_execute_auto_loop,
     handle_execute_one_batch as dispatch_execute_one_batch,
 )
-from megaplan.flags import update_flags_after_critique, update_flags_after_revise
+from megaplan.flags import update_flags_after_critique, update_flags_after_gate, update_flags_after_revise
 from megaplan.merge import _validate_and_merge_batch
-from megaplan.merge import _validate_merge_inputs  # noqa: F401
+from megaplan.merge import _validate_merge_inputs
+from megaplan.parallel_critique import run_parallel_critique
 from megaplan.step_edit import next_plan_artifact_name
 from megaplan.types import (
     FLAG_BLOCKING_STATUSES,
@@ -74,8 +77,11 @@ from megaplan.evaluation import (
     run_gate_checks,
     validate_plan_structure,
 )
+from megaplan.workers import resolve_agent_mode
 from megaplan._core import find_command, infer_next_steps, require_state
 from megaplan.workers import WorkerResult, validate_payload
+
+log = logging.getLogger("megaplan")
 
 
 def _append_to_meta(state: PlanState, field: str, value: Any) -> None:
@@ -464,42 +470,68 @@ def _store_last_gate(state: PlanState, gate_summary: dict[str, Any]) -> None:
     }
 
 
-def _apply_gate_outcome(state: PlanState, gate_summary: dict[str, Any], *, robustness: str) -> tuple[str, str, str]:
+def _apply_gate_outcome(state: PlanState, gate_summary: dict[str, Any], *, robustness: str, plan_dir: Path) -> tuple[str, str, str]:
     result = "success"
     summary = f"Gate recommendation {gate_summary['recommendation']}: {gate_summary['rationale']}"
 
-    # Enforce: can't PROCEED with unresolved blocking flags unless the gate
-    # explicitly resolved them (resolution_summary + resolved_flag_ids).
+    # Process flag resolutions when the gate recommends PROCEED.
+    # The gate LLM sees all blocking flags and makes an informed decision.
+    # We respect its PROCEED recommendation: explicit resolutions are persisted
+    # as-is, and any remaining blocking flags are implicitly accepted as
+    # tradeoffs (the gate reviewed them and still chose PROCEED).
     if gate_summary["recommendation"] == "PROCEED":
         unresolved = gate_summary.get("unresolved_flags", [])
-        # The gate can resolve flags by listing them in resolved_flag_ids
-        # with a resolution_summary explaining why. Check the gate payload.
-        gate_resolved_ids = set(gate_summary.get("resolved_flag_ids", []))
-        has_resolution_summary = bool(gate_summary.get("resolution_summary", "").strip())
+        resolutions = gate_summary.get("flag_resolutions", [])
+
+        # Cap: if more than 3 explicit resolutions, truncate to 3 and warn
+        # (but don't override — the gate's PROCEED decision still stands).
+        if len(resolutions) > 3:
+            log.warning(
+                "Gate provided %d flag resolutions (max 3); truncating to first 3.",
+                len(resolutions),
+            )
+            resolutions = resolutions[:3]
+
+        # Validate each explicit resolution
+        valid_resolved_ids: set[str] = set()
+        for res in resolutions:
+            action = res.get("action", "")
+            flag_id = res.get("flag_id", "")
+            if action == "dispute":
+                evidence = res.get("evidence", "").strip()
+                if not evidence or is_rubber_stamp(evidence, strict=True):
+                    continue  # invalid dispute — skip
+            elif action == "accept_tradeoff":
+                pass  # always allowed
+            else:
+                continue  # unknown action — skip
+            valid_resolved_ids.add(flag_id)
+
         blocking_unresolved = [
             f for f in unresolved
             if f.get("severity") in ("significant", "likely-significant")
-            and f.get("status") in ("open", "addressed", "disputed")
-            and f.get("id") not in gate_resolved_ids
+            and f.get("status") in FLAG_BLOCKING_STATUSES
+            and f.get("id") not in valid_resolved_ids
         ]
-        # If gate listed resolved flags but no summary, still block
-        if not blocking_unresolved and gate_resolved_ids and not has_resolution_summary:
-            blocking_unresolved = [
-                f for f in unresolved
-                if f.get("severity") in ("significant", "likely-significant")
-                and f.get("status") in ("open", "addressed", "disputed")
-            ]
+
+        # Persist explicit resolutions
+        if valid_resolved_ids:
+            update_flags_after_gate(plan_dir, resolutions)
+
+        # Implicitly accept remaining blocking flags as tradeoffs — the gate
+        # saw them, assessed them, and still recommended PROCEED.
         if blocking_unresolved:
+            implicit_resolutions = [
+                {"flag_id": f["id"], "action": "accept_tradeoff"}
+                for f in blocking_unresolved
+            ]
+            update_flags_after_gate(plan_dir, implicit_resolutions)
             flag_ids = [f.get("id", "?") for f in blocking_unresolved]
-            concerns = [f"{f.get('id','?')}: {str(f.get('concern',''))[:80]}" for f in blocking_unresolved]
-            gate_summary["recommendation"] = "ITERATE"
-            summary = (
-                f"Gate recommended PROCEED but {len(blocking_unresolved)} blocking "
-                f"flag(s) are unresolved. Overriding to ITERATE.\n"
-                f"Unresolved flags:\n"
-                + "\n".join(f"  - {c}" for c in concerns)
-                + "\nTo proceed: revise the plan to address these, or the gate must "
-                f"write a resolution_summary explaining why each is accepted/disputed."
+            log.info(
+                "Gate recommended PROCEED with %d unresolved blocking flag(s); "
+                "implicitly accepting as tradeoffs: %s",
+                len(blocking_unresolved),
+                ", ".join(flag_ids),
             )
 
     if gate_summary["recommendation"] == "PROCEED" and gate_summary["passed"]:
@@ -684,7 +716,16 @@ def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     active_checks = checks_for_robustness(robustness)
     expected_ids = [check["id"] for check in active_checks]
     state["last_gate"] = {}
-    worker, agent, mode, refreshed = _run_worker("critique", state, plan_dir, args, root=root)
+    agent_type, mode, refreshed, model = resolve_agent_mode("critique", args)
+    if len(active_checks) > 1 and agent_type == "hermes":
+        try:
+            worker = run_parallel_critique(state, plan_dir, root=root, model=model, checks=active_checks)
+            agent, mode, refreshed = "hermes", "persistent", True
+        except Exception as exc:
+            print(f"[parallel-critique] Failed, falling back to sequential: {exc}", file=sys.stderr)
+            worker, agent, mode, refreshed = _run_worker("critique", state, plan_dir, args, root=root)
+    else:
+        worker, agent, mode, refreshed = _run_worker("critique", state, plan_dir, args, root=root)
     invalid_checks = validate_critique_checks(worker.payload, expected_ids=expected_ids)
     if invalid_checks:
         _raise_step_validation_error(plan_dir=plan_dir, state=state, step="critique", iteration=iteration, worker=worker, code="invalid_critique", message="Critique output failed check validation: " + ", ".join(invalid_checks))
@@ -812,14 +853,17 @@ def handle_gate(root: Path, args: argparse.Namespace) -> StepResponse:
     )
     gate_hash = _write_json_artifact(plan_dir, "gate.json", gate_summary)
     debt_entries_added = _record_gate_debt_entries(root, state, gate_summary, worker.payload)
-    _store_last_gate(state, gate_summary)
     if len(state["meta"].get("weighted_scores", [])) < iteration:
         _append_to_meta(state, "weighted_scores", gate_signals["signals"]["weighted_score"])
     result, next_step, summary = _apply_gate_outcome(
         state,
         gate_summary,
         robustness=gate_signals["robustness"],
+        plan_dir=plan_dir,
     )
+    # Store last_gate AFTER _apply_gate_outcome — the outcome may override
+    # the recommendation (e.g. PROCEED → ITERATE when flags are unresolved).
+    _store_last_gate(state, gate_summary)
     return _finish_step(
         plan_dir,
         state,

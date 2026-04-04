@@ -246,7 +246,11 @@ class DebtRegistry(TypedDict):
 # Constants
 # ---------------------------------------------------------------------------
 
-FLAG_BLOCKING_STATUSES = {"open", "disputed"}
+FLAG_BLOCKING_STATUSES = {"open", "disputed", "addressed"}
+FLAG_VALID_STATUSES = {
+    "open", "addressed", "disputed", "verified",
+    "accepted_tradeoff", "gate_disputed",
+}
 DEBT_ESCALATION_THRESHOLD = 3
 MOCK_ENV_VAR = "MEGAPLAN_MOCK_WORKERS"
 

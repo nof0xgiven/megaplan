@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
-from megaplan.checks import build_empty_template, checks_for_robustness
 from megaplan.types import CliError, MOCK_ENV_VAR, PlanState
 from megaplan.workers import (
     STEP_SCHEMA_FILENAMES,
@@ -16,7 +16,7 @@ from megaplan.workers import (
     session_key_for,
     validate_payload,
 )
-from megaplan._core import configured_robustness, read_json, schemas_root
+from megaplan._core import read_json, schemas_root
 from megaplan.prompts import create_hermes_prompt
 
 
@@ -63,36 +63,192 @@ def _toolsets_for_phase(phase: str) -> list[str] | None:
     return ["file"]
 
 
-_TEMPLATE_FILE_PHASES = {"critique", "finalize", "review", "prep"}
+_TEMPLATE_FILE_PHASES = {"finalize", "review", "prep"}
 
 
-def _build_output_template(step: str, schema: dict, state: PlanState) -> str:
-    if step != "critique":
-        return _schema_template(schema)
-
-    properties = schema.get("properties", {})
-    required = schema.get("required", [])
-    critique_checks = build_empty_template(
-        checks_for_robustness(configured_robustness(state))
+def _template_has_content(payload: dict, step: str) -> bool:
+    """Check if a template-file payload has real content (not just the empty template)."""
+    if step == "critique":
+        # For critique: check if any check has non-empty findings
+        checks = payload.get("checks", [])
+        if isinstance(checks, list):
+            for check in checks:
+                if isinstance(check, dict):
+                    findings = check.get("findings", [])
+                    if isinstance(findings, list) and findings:
+                        return True
+        # Also check flags array
+        flags = payload.get("flags", [])
+        if isinstance(flags, list) and flags:
+            return True
+        return False
+    # For other phases: any non-empty array or non-empty string
+    return any(
+        (isinstance(v, list) and v) or (isinstance(v, str) and v.strip())
+        for k, v in payload.items()
     )
-    template: dict[str, object] = {}
-    for key in required:
-        if key == "checks":
-            template[key] = critique_checks
-            continue
-        prop = properties.get(key, {})
-        ptype = prop.get("type", "string") if isinstance(prop, dict) else "string"
-        if ptype == "array":
-            template[key] = []
-        elif ptype == "object":
-            template[key] = {}
-        elif ptype == "boolean":
-            template[key] = False
-        elif ptype in ("number", "integer"):
-            template[key] = 0
-        else:
-            template[key] = ""
-    return json.dumps(template, indent=2)
+
+
+def _build_output_template(step: str, schema: dict) -> str:
+    """Build a JSON template from a schema for non-critique template-file phases."""
+    return _schema_template(schema)
+
+
+def parse_agent_output(
+    agent,
+    result: dict,
+    *,
+    output_path: Path | None,
+    schema: dict,
+    step: str,
+    project_dir: Path,
+    plan_dir: Path,
+) -> tuple[dict, str]:
+    """Parse a Hermes agent result into a structured payload."""
+    raw_output = result.get("final_response", "") or ""
+    messages = result.get("messages", [])
+
+    # If final_response is empty and the model used tools, the agent loop exited
+    # after tool calls without giving the model a chance to output JSON.
+    # Make one more API call with the template to force structured output.
+    if not raw_output.strip() and messages and any(m.get("tool_calls") for m in messages if m.get("role") == "assistant"):
+        try:
+            template = _schema_template(schema)
+            summary_prompt = (
+                "You have finished investigating. Now fill in this JSON template with your findings "
+                "and output it as your response. Output ONLY the raw JSON, nothing else.\n\n"
+                + template
+            )
+            summary_result = agent.run_conversation(
+                user_message=summary_prompt,
+                conversation_history=messages,
+            )
+            raw_output = summary_result.get("final_response", "") or ""
+            messages = summary_result.get("messages", messages)
+            if raw_output.strip():
+                print(f"[hermes-worker] Got JSON from template prompt ({len(raw_output)} chars)", file=sys.stderr)
+        except Exception as exc:
+            print(f"[hermes-worker] Template prompt failed: {exc}", file=sys.stderr)
+
+    # For template-file phases, check the template file FIRST — we told the
+    # model to write there, so it's the primary output path.
+    payload = None
+    if output_path and output_path.exists():
+        try:
+            candidate_payload = json.loads(output_path.read_text(encoding="utf-8"))
+            if isinstance(candidate_payload, dict):
+                # Check if the model actually filled in findings (not just the empty template)
+                has_content = _template_has_content(candidate_payload, step)
+                if has_content:
+                    payload = candidate_payload
+                    print(f"[hermes-worker] Read JSON from template file: {output_path}", file=sys.stderr)
+                else:
+                    print(f"[hermes-worker] Template file exists but has no real content", file=sys.stderr)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Try parsing the final text response
+    if payload is None:
+        payload = _parse_json_response(raw_output)
+
+    # Fallback: some models (GLM-5) put JSON in reasoning/think tags
+    # instead of content. Just grab it from there.
+    if payload is None and messages:
+        payload = _extract_json_from_reasoning(messages)
+        if payload is not None:
+            print(f"[hermes-worker] Extracted JSON from reasoning tags", file=sys.stderr)
+
+    # Fallback: check all assistant message content fields (not just final_response)
+    # The model may have output JSON in an earlier message before making more tool calls
+    if payload is None and messages:
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.strip():
+                payload = _parse_json_response(content)
+                if payload is not None:
+                    print(f"[hermes-worker] Extracted JSON from assistant message content", file=sys.stderr)
+                    break
+
+    # Fallback: for execute phase, reconstruct from tool calls + git diff
+    if payload is None and step == "execute":
+        payload = _reconstruct_execute_payload(messages, project_dir, plan_dir)
+        if payload is not None:
+            print(f"[hermes-worker] Reconstructed execute payload from tool calls", file=sys.stderr)
+
+    # Fallback: the model may have written the JSON to a different file location
+    if payload is None:
+        schema_filename = STEP_SCHEMA_FILENAMES.get(step, f"{step}.json")
+        for candidate in [
+            plan_dir / f"{step}_output.json",  # template file path
+            project_dir / schema_filename,
+            plan_dir / schema_filename,
+            project_dir / f"{step}.json",
+        ]:
+            if candidate.exists() and candidate != output_path:  # skip if already checked
+                try:
+                    payload = json.loads(candidate.read_text(encoding="utf-8"))
+                    print(f"[hermes-worker] Read JSON from file written by model: {candidate}", file=sys.stderr)
+                    break
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+    # Last resort for template-file phases: the model investigated and produced
+    # text findings but didn't write valid JSON anywhere. Ask it to restructure
+    # its analysis into JSON. This catches MiniMax's pattern of outputting markdown.
+    if payload is None and output_path and messages:
+        try:
+            template = _schema_template(schema)
+            summary_prompt = (
+                "You have completed your investigation but your findings were not written as JSON. "
+                "Take everything you found and fill in this JSON template. "
+                "Output ONLY the raw JSON, nothing else — no markdown, no explanation.\n\n"
+                + template
+            )
+            print(f"[hermes-worker] Attempting summary prompt to extract JSON from investigation", file=sys.stderr)
+            summary_result = agent.run_conversation(
+                user_message=summary_prompt,
+                conversation_history=messages,
+            )
+            summary_output = summary_result.get("final_response", "") or ""
+            if summary_output.strip():
+                payload = _parse_json_response(summary_output)
+                if payload is not None:
+                    print(f"[hermes-worker] Got JSON from summary prompt ({len(summary_output)} chars)", file=sys.stderr)
+        except Exception as exc:
+            print(f"[hermes-worker] Summary prompt failed: {exc}", file=sys.stderr)
+
+    if payload is None:
+        raise CliError(
+            "worker_parse_error",
+            f"Hermes worker returned invalid JSON for step '{step}': "
+            f"could not extract JSON from response ({len(raw_output)} chars)",
+            extra={"raw_output": raw_output},
+        )
+
+    result["final_response"] = raw_output
+    result["messages"] = messages
+    return payload, raw_output
+
+
+def clean_parsed_payload(payload: dict, schema: dict, step: str) -> None:
+    """Normalize a parsed Hermes payload before validation."""
+    # Strip guide-only fields from critique checks (guidance/prior_findings
+    # are in the template file to help the model, but not part of the schema)
+    if step == "critique" and isinstance(payload.get("checks"), list):
+        for check in payload["checks"]:
+            if isinstance(check, dict):
+                check.pop("guidance", None)
+                check.pop("prior_findings", None)
+
+    # Fill in missing required fields with safe defaults before validation.
+    # Models often omit empty arrays/strings that megaplan requires.
+    _fill_schema_defaults(payload, schema)
+
+    # Normalize field aliases in nested arrays (e.g. critique flags use
+    # "summary" instead of "concern", "detail" instead of "evidence").
+    _normalize_nested_aliases(payload, schema)
 
 
 def run_hermes_step(
@@ -165,18 +321,24 @@ def run_hermes_step(
             "They are used for scoring after execution and must remain unchanged."
         )
 
-    if step in _TEMPLATE_FILE_PHASES:
+    # Critique: the prompt layer already wrote the template file and references it.
+    # Other template-file phases: hermes_worker writes the template and appends instructions.
+    if step == "critique":
+        output_path = plan_dir / "critique_output.json"
+    elif step in _TEMPLATE_FILE_PHASES:
         output_path = plan_dir / f"{step}_output.json"
-        output_path.write_text(_build_output_template(step, schema, state), encoding="utf-8")
+        output_path.write_text(
+            _build_output_template(step, schema),
+            encoding="utf-8",
+        )
         prompt += (
-            f"\n\nIMPORTANT: Your output MUST be written to this file: {output_path}\n"
-            "This file contains a JSON template. After each check/task you complete:\n"
-            "1. Read the file\n"
-            "2. Add your findings to the relevant section\n"
-            "3. Write the complete updated JSON back to the file\n"
-            "Do NOT output your findings as text. Write them to the file.\n"
-            "Example: to add a finding to the 'correctness' check, read the file, "
-            "update the findings array for that check, and write the whole file back."
+            f"\n\nOUTPUT FILE: {output_path}\n"
+            "This file is your ONLY output. It contains a JSON template with the structure to fill in.\n"
+            "Workflow:\n"
+            "1. Start by reading the file to see the structure\n"
+            "2. Do your work\n"
+            "3. Read the file, add your results, write it back\n\n"
+            "Do NOT put your results in a text response. The file is the only output that matters."
         )
     else:
         template = _schema_template(schema)
@@ -191,189 +353,180 @@ def run_hermes_step(
     # directly to it (bypassing _print_fn).  By swapping stdout to
     # stderr here, all spinner/progress output flows to stderr while
     # megaplan keeps stdout clean for structured JSON results.
-    import sys
     real_stdout = sys.stdout
     sys.stdout = sys.stderr
 
     # Resolve model provider — support direct API providers via prefix
     # e.g. "zhipu:glm-5.1" → base_url=Zhipu API, model="glm-5.1"
-    agent_kwargs: dict = {}
-    resolved_model = model or "anthropic/claude-opus-4.6"
-    if resolved_model.startswith("zhipu:"):
-        resolved_model = resolved_model[len("zhipu:"):]
-        agent_kwargs["base_url"] = os.environ.get("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
-        agent_kwargs["api_key"] = os.environ.get("ZHIPU_API_KEY", "")
-    elif resolved_model.startswith("minimax:"):
-        resolved_model = resolved_model[len("minimax:"):]
-        agent_kwargs["base_url"] = os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
-        agent_kwargs["api_key"] = os.environ.get("MINIMAX_API_KEY", "")
+    # Uses the key pool for key rotation and cooldown on 429s.
+    from megaplan.key_pool import resolve_model as _resolve_model, acquire_key, report_429
+    resolved_model, agent_kwargs = _resolve_model(model)
 
-    # Instantiate AIAgent
-    agent = AIAgent(
-        model=resolved_model,
-        quiet_mode=True,
-        skip_context_files=True,
-        skip_memory=True,
-        enabled_toolsets=_toolsets_for_phase(step),
-        session_id=session_id,
-        session_db=SessionDB(),
-        # Cap output tokens to prevent repetition loops (Qwen generates 330K+
-        # of repeated text without a limit). 8192 is plenty for any megaplan
-        # phase response. Execute gets more since it may include verbose output.
-        max_tokens=16384 if step == "execute" else 8192,
-        **agent_kwargs,
+    toolsets = _toolsets_for_phase(step)
+
+    # Disable reasoning/thinking for models that default to reasoning mode.
+    # When reasoning is enabled, some models (Qwen3.5, DeepSeek-R1) put all
+    # output in the reasoning field and return content: null.  Megaplan needs
+    # structured JSON in the content field, so force reasoning off for any
+    # model family known to use reasoning by default on OpenRouter.
+    _model_lower = (resolved_model or "").lower()
+    _reasoning_families = ("qwen/qwen3", "deepseek/deepseek-r1")
+    _reasoning_off = (
+        {"enabled": False}
+        if any(_model_lower.startswith(prefix) for prefix in _reasoning_families)
+        else None
     )
-    agent._print_fn = lambda *a, **kw: print(*a, **kw, file=sys.stderr)
+
+    def _make_agent(agent_model: str, extra_kwargs: dict) -> "AIAgent":
+        current_agent = AIAgent(
+            model=agent_model,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=toolsets,
+            session_id=session_id,
+            session_db=SessionDB(),
+            # Cap output tokens to prevent repetition loops (Qwen generates 330K+
+            # of repeated text without a limit). 8192 is plenty for any megaplan
+            # phase response. Execute gets more since it may include verbose output.
+            max_tokens=16384 if step == "execute" else 8192,
+            reasoning_config=_reasoning_off,
+            **extra_kwargs,
+        )
+        current_agent._print_fn = lambda *a, **kw: print(*a, **kw, file=sys.stderr)
+        if not toolsets:
+            current_agent.set_response_format(schema, name=f"megaplan_{step}")
+        return current_agent
+
+    def _rewrite_output_template(current_output_path: Path | None) -> Path | None:
+        if current_output_path is None:
+            return None
+        if step == "critique":
+            from megaplan._core import configured_robustness
+            from megaplan.checks import checks_for_robustness
+            from megaplan.prompts import _write_critique_template
+
+            return _write_critique_template(
+                plan_dir,
+                state,
+                checks_for_robustness(configured_robustness(state)),
+            )
+        current_output_path.write_text(
+            _build_output_template(step, schema),
+            encoding="utf-8",
+        )
+        return current_output_path
+
+    def _failure_reason(exc: Exception) -> str:
+        if isinstance(exc, CliError):
+            return exc.message
+        return str(exc) or exc.__class__.__name__
+
+    def _run_attempt(current_agent, current_output_path: Path | None) -> tuple[dict, dict, str]:
+        current_result = current_agent.run_conversation(
+            user_message=prompt,
+            conversation_history=conversation_history,
+        )
+        current_payload, current_raw_output = parse_agent_output(
+            current_agent,
+            current_result,
+            output_path=current_output_path,
+            schema=schema,
+            step=step,
+            project_dir=project_dir,
+            plan_dir=plan_dir,
+        )
+        clean_parsed_payload(current_payload, schema, step)
+        messages = current_result.get("messages", [])
+
+        try:
+            validate_payload(step, current_payload)
+        except CliError as error:
+            # For execute, try reconstructed payload if validation fails
+            if step == "execute":
+                reconstructed = _reconstruct_execute_payload(messages, project_dir, plan_dir)
+                if reconstructed is not None:
+                    try:
+                        validate_payload(step, reconstructed)
+                        current_payload = reconstructed
+                        print(
+                            "[hermes-worker] Using reconstructed payload (original failed validation)",
+                            file=sys.stderr,
+                        )
+                        error = None
+                    except CliError:
+                        pass
+            if error is not None:
+                raise CliError(error.code, error.message, extra={"raw_output": current_raw_output}) from error
+
+        return current_result, current_payload, current_raw_output
+
+    agent = _make_agent(resolved_model, agent_kwargs)
     # Don't set response_format when tools are enabled — many models
     # (Qwen, GLM-5) hang or produce garbage when both are active.
     # The JSON template in the prompt is sufficient; _parse_json_response
     # handles code fences and markdown wrapping.
-    toolsets = _toolsets_for_phase(step)
-    if not toolsets:
-        agent.set_response_format(schema, name=f"megaplan_{step}")
 
-    # Run
+    # Run — with fallback to OpenRouter for MiniMax if primary API fails
     started = time.monotonic()
     try:
-        result = agent.run_conversation(
-            user_message=prompt,
-            conversation_history=conversation_history,
-        )
-    except Exception as exc:
-        raise CliError(
-            "worker_error",
-            f"Hermes worker failed for step '{step}': {exc}",
-            extra={"session_id": session_id},
-        ) from exc
+        try:
+            result, payload, raw_output = _run_attempt(agent, output_path)
+        except Exception as exc:
+            # Report 429 to key pool so it cools down this key
+            if "429" in str(exc) and model and model.startswith("minimax:"):
+                report_429("minimax", agent_kwargs.get("api_key", ""), cooldown_secs=60)
+            if model and model.startswith("minimax:"):
+                or_key = acquire_key("openrouter")
+                if or_key:
+                    if isinstance(exc, CliError):
+                        print(
+                            f"[hermes-worker] MiniMax returned bad content ({_failure_reason(exc)}), falling back to OpenRouter",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(f"[hermes-worker] MiniMax failed ({exc}), falling back to OpenRouter", file=sys.stderr)
+                    from megaplan.key_pool import minimax_openrouter_model
+                    fallback_model = minimax_openrouter_model(model[len("minimax:"):])
+                    output_path = _rewrite_output_template(output_path)
+                    agent = _make_agent(
+                        fallback_model,
+                        {
+                            "base_url": "https://openrouter.ai/api/v1",
+                            "api_key": or_key,
+                        },
+                    )
+                    try:
+                        result, payload, raw_output = _run_attempt(agent, output_path)
+                    except Exception as fallback_exc:
+                        raise CliError(
+                            "worker_error",
+                            (
+                                f"Hermes worker failed for step '{step}' "
+                                f"(both MiniMax and OpenRouter): primary={_failure_reason(exc)}; "
+                                f"fallback={_failure_reason(fallback_exc)}"
+                            ),
+                            extra={"session_id": session_id},
+                        ) from fallback_exc
+                elif isinstance(exc, CliError):
+                    raise
+                else:
+                    raise CliError(
+                        "worker_error",
+                        f"Hermes worker failed for step '{step}': {exc}",
+                        extra={"session_id": session_id},
+                    ) from exc
+            elif isinstance(exc, CliError):
+                raise
+            else:
+                raise CliError(
+                    "worker_error",
+                    f"Hermes worker failed for step '{step}': {exc}",
+                    extra={"session_id": session_id},
+                ) from exc
     finally:
         sys.stdout = real_stdout
     elapsed_ms = int((time.monotonic() - started) * 1000)
-
-    # Parse structured output from the response.
-    # Try: final_response → reasoning field → assistant content → summary call.
-    raw_output = result.get("final_response", "") or ""
-    messages = result.get("messages", [])
-
-    # If final_response is empty and the model used tools, the agent loop exited
-    # after tool calls without giving the model a chance to output JSON.
-    # Make one more API call with the template to force structured output.
-    if not raw_output.strip() and messages and any(m.get("tool_calls") for m in messages if m.get("role") == "assistant"):
-        try:
-            template = _schema_template(schema)
-            summary_prompt = (
-                "You have finished investigating. Now fill in this JSON template with your findings "
-                "and output it as your response. Output ONLY the raw JSON, nothing else.\n\n"
-                + template
-            )
-            summary_result = agent.run_conversation(
-                user_message=summary_prompt,
-                conversation_history=messages,
-            )
-            raw_output = summary_result.get("final_response", "") or ""
-            messages = summary_result.get("messages", messages)
-            if raw_output.strip():
-                print(f"[hermes-worker] Got JSON from template prompt ({len(raw_output)} chars)", file=sys.stderr)
-        except Exception as exc:
-            print(f"[hermes-worker] Template prompt failed: {exc}", file=sys.stderr)
-
-    # For template-file phases, check the template file FIRST — we told the
-    # model to write there, so it's the primary output path.
-    payload = None
-    if output_path and output_path.exists():
-        try:
-            candidate_payload = json.loads(output_path.read_text(encoding="utf-8"))
-            # Only use if the model actually filled something in (not just the empty template)
-            if isinstance(candidate_payload, dict):
-                has_content = any(
-                    v for k, v in candidate_payload.items()
-                    if isinstance(v, list) and v  # non-empty arrays
-                    or isinstance(v, str) and v.strip()  # non-empty strings
-                )
-                if has_content:
-                    payload = candidate_payload
-                    print(f"[hermes-worker] Read JSON from template file: {output_path}", file=sys.stderr)
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # Try parsing the final text response
-    if payload is None:
-        payload = _parse_json_response(raw_output)
-
-    # Fallback: some models (GLM-5) put JSON in reasoning/think tags
-    # instead of content. Just grab it from there.
-    if payload is None and messages:
-        payload = _extract_json_from_reasoning(messages)
-        if payload is not None:
-            print(f"[hermes-worker] Extracted JSON from reasoning tags", file=sys.stderr)
-
-    # Fallback: check all assistant message content fields (not just final_response)
-    # The model may have output JSON in an earlier message before making more tool calls
-    if payload is None and messages:
-        for msg in reversed(messages):
-            if msg.get("role") != "assistant":
-                continue
-            content = msg.get("content", "")
-            if isinstance(content, str) and content.strip():
-                payload = _parse_json_response(content)
-                if payload is not None:
-                    print(f"[hermes-worker] Extracted JSON from assistant message content", file=sys.stderr)
-                    break
-
-    # Fallback: for execute phase, reconstruct from tool calls + git diff
-    if payload is None and step == "execute":
-        payload = _reconstruct_execute_payload(messages, project_dir, plan_dir)
-        if payload is not None:
-            print(f"[hermes-worker] Reconstructed execute payload from tool calls", file=sys.stderr)
-
-    # Fallback: the model may have written the JSON to a different file location
-    if payload is None:
-        schema_filename = STEP_SCHEMA_FILENAMES.get(step, f"{step}.json")
-        for candidate in [
-            plan_dir / f"{step}_output.json",  # template file path
-            project_dir / schema_filename,
-            plan_dir / schema_filename,
-            project_dir / f"{step}.json",
-        ]:
-            if candidate.exists() and candidate != output_path:  # skip if already checked
-                try:
-                    payload = json.loads(candidate.read_text(encoding="utf-8"))
-                    print(f"[hermes-worker] Read JSON from file written by model: {candidate}", file=sys.stderr)
-                    break
-                except (json.JSONDecodeError, OSError):
-                    pass
-
-    if payload is None:
-        raise CliError(
-            "worker_parse_error",
-            f"Hermes worker returned invalid JSON for step '{step}': "
-            f"could not extract JSON from response ({len(raw_output)} chars)",
-            extra={"raw_output": raw_output},
-        )
-
-    # Fill in missing required fields with safe defaults before validation.
-    # Models often omit empty arrays/strings that megaplan requires.
-    _fill_schema_defaults(payload, schema)
-
-    # Normalize field aliases in nested arrays (e.g. critique flags use
-    # "summary" instead of "concern", "detail" instead of "evidence").
-    _normalize_nested_aliases(payload, schema)
-
-    try:
-        validate_payload(step, payload)
-    except CliError:
-        # For execute, try reconstructed payload if validation fails
-        if step == "execute":
-            reconstructed = _reconstruct_execute_payload(messages, project_dir, plan_dir)
-            if reconstructed is not None:
-                try:
-                    validate_payload(step, reconstructed)
-                    payload = reconstructed
-                    print(f"[hermes-worker] Using reconstructed payload (original failed validation)", file=sys.stderr)
-                    error = None
-                except CliError:
-                    pass
-        if error is not None:
-            raise CliError(error.code, error.message, extra={"raw_output": raw_output}) from error
 
     cost_usd = result.get("estimated_cost_usd", 0.0) or 0.0
 

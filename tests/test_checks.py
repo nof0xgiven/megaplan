@@ -13,7 +13,12 @@ def _payload_for(checks: tuple[dict[str, str], ...]) -> dict[str, object]:
             {
                 "id": check["id"],
                 "question": check["question"],
-                "findings": [{"detail": "No issue found", "flagged": False}],
+                "findings": [
+                    {
+                        "detail": "Checked this critique dimension against the repository and found no concrete issue to flag.",
+                        "flagged": False,
+                    }
+                ],
             }
             for check in checks
         ]

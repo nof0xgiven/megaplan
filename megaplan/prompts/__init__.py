@@ -21,9 +21,8 @@ from ._shared import (
 )
 from .critique import (
     _critique_prompt,
-    _render_critique_checks,
-    _render_critique_template,
     _revise_prompt,
+    _write_critique_template,
 )
 from .execute import (
     _execute_approval_note,
@@ -156,8 +155,7 @@ __all__ = [
     "_plan_prompt",
     "_planning_debt_block",
     "_prep_prompt",
-    "_render_critique_checks",
-    "_render_critique_template",
+    "_write_critique_template",
     "_render_prep_block",
     "_render_research_block",
     "_research_prompt",

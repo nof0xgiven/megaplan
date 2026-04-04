@@ -1445,14 +1445,18 @@ def test_unresolved_significant_flags_filtering() -> None:
         {"id": "FLAG-003", "severity": "significant", "status": "verified"},
         {"id": "FLAG-004", "severity": "significant", "status": "disputed"},
         {"id": "FLAG-005", "severity": "significant", "status": "addressed"},
+        {"id": "FLAG-006", "severity": "significant", "status": "accepted_tradeoff"},
+        {"id": "FLAG-007", "severity": "significant", "status": "gate_disputed"},
     ]}
     unresolved = megaplan.unresolved_significant_flags(registry)
     ids = [f["id"] for f in unresolved]
     assert "FLAG-001" in ids
     assert "FLAG-004" in ids
+    assert "FLAG-005" in ids  # "addressed" is now a blocking status
     assert "FLAG-002" not in ids
     assert "FLAG-003" not in ids
-    assert "FLAG-005" not in ids
+    assert "FLAG-006" not in ids  # accepted_tradeoff is a resolved state
+    assert "FLAG-007" not in ids  # gate_disputed is a resolved state
 
 
 # ---------------------------------------------------------------------------

@@ -100,7 +100,7 @@ CRITIQUE_CHECKS: Final[tuple[CritiqueCheckSpec, ...]] = (
             "If you manually verify an edge case because existing tests don't cover it, also test the cases next to it."
         ),
         "category": "completeness",
-        "default_severity": "uncertain",
+        "default_severity": "likely-minor",
         "tier": "core",
     },
     {

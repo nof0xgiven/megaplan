@@ -137,9 +137,9 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
 
 
 def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
-    del plan_dir
     del root
     project_dir = Path(state["config"]["project_dir"])
+    output_path = plan_dir / "prep.json"
     return textwrap.dedent(
         f"""
         Prepare a concise engineering brief for the task below. This brief will be the primary context for all subsequent planning and execution.
@@ -148,6 +148,7 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         {state["idea"]}
 
         Project: {project_dir}
+        Output file: {output_path}
 
         First, assess: does this task need codebase investigation?
 

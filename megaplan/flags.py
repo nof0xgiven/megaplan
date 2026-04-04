@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ def resolve_severity(hint: str) -> str:
         return "minor"
     if hint == "uncertain":
         return "significant"
+    logging.getLogger("megaplan").warning(f"Unexpected severity_hint: {hint!r}, defaulting to significant")
     return "significant"
 
 
@@ -125,5 +127,25 @@ def update_flags_after_revise(
             flag["status"] = "addressed"
             flag["addressed_in"] = plan_file
             flag["evidence"] = summary
+    save_flag_registry(plan_dir, registry)
+    return registry
+
+
+def update_flags_after_gate(
+    plan_dir: Path,
+    resolutions: list[dict[str, Any]],
+) -> FlagRegistry:
+    """Persist flag status changes from validated gate resolutions."""
+    registry = load_flag_registry(plan_dir)
+    by_id: dict[str, FlagRecord] = {flag["id"]: flag for flag in registry["flags"]}
+    for res in resolutions:
+        flag_id = res.get("flag_id", "")
+        action = res.get("action", "")
+        if flag_id not in by_id:
+            continue
+        if action == "dispute":
+            by_id[flag_id]["status"] = "gate_disputed"
+        elif action == "accept_tradeoff":
+            by_id[flag_id]["status"] = "accepted_tradeoff"
     save_flag_registry(plan_dir, registry)
     return registry

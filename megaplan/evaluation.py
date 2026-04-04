@@ -610,6 +610,8 @@ def build_gate_artifact(
         "robustness": signals.get("robustness"),
         "signals": signals["signals"],
         # Gate's flag resolution — used by handler to allow PROCEED past blocking flags
+        "flag_resolutions": list(gate_payload.get("flag_resolutions", [])),
+        # Backward compatibility: carry through old-format fields if present
         "resolved_flag_ids": list(gate_payload.get("resolved_flag_ids", [])),
         "resolution_summary": gate_payload.get("resolution_summary", ""),
     }

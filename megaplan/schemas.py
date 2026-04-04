@@ -124,6 +124,19 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                     "required": ["id", "decision"],
                 },
             },
+            "flag_resolutions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "flag_id": {"type": "string"},
+                        "action": {"type": "string", "enum": ["dispute", "accept_tradeoff"]},
+                        "evidence": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["flag_id", "action"],
+                },
+            },
             "accepted_tradeoffs": {
                 "type": "array",
                 "items": {

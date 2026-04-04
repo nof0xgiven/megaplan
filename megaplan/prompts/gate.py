@@ -102,9 +102,13 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         - **Blocking** (severity = significant/likely-significant): You cannot PROCEED unless you address ALL of them. The handler enforces this — it will override PROCEED to ITERATE if blocking flags remain open.
         - **Noted** (everything else): Acknowledge in your rationale but they don't block PROCEED.
 
-        If there are blocking flags and you want to PROCEED, write a `resolution_summary` — one paragraph explaining how you accounted for each blocking flag (accepted with reason, or disputed with evidence). List the flag IDs you're resolving in `resolved_flag_ids`.
+        If there are blocking flags and you want to PROCEED, you must provide `flag_resolutions` — one entry per flag you are resolving. Two actions are allowed:
+        - **dispute**: The critique was factually wrong. You MUST cite specific evidence (file path, line, API doc, etc.) proving the concern is invalid.
+        - **accept_tradeoff**: The concern is real but intentionally accepted as a known limitation. Always allowed; the flag is recorded as tech debt.
 
-        If there are no blocking flags, `resolution_summary` and `resolved_flag_ids` can be omitted.
+        You may resolve at most 3 flags per gate call. If more need resolving, recommend ITERATE so the plan can address them first.
+
+        If there are no blocking flags, `flag_resolutions` can be omitted.
 
         Populate `settled_decisions` with design choices that should carry into review without re-litigation. Return `[]` when there are none.
 
@@ -115,8 +119,10 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
           "rationale": "Core fix is correct. Convention concern accepted.",
           "signals_assessment": "Score stable at 2.5, preflight passed, no recurring critiques.",
           "warnings": ["Verify edge case with composite moduli during execution."],
-          "resolution_summary": "The correctness flag about allow_migrate vs allow_migrate_model is accepted — both APIs produce identical behavior for this use case (verified at django/db/utils.py:286). The convention flag is noted but non-blocking.",
-          "resolved_flag_ids": ["correctness-1", "conventions-1"],
+          "flag_resolutions": [
+            {{"flag_id": "correctness-1", "action": "dispute", "evidence": "allow_migrate and allow_migrate_model produce identical behavior for this use case (verified at django/db/utils.py:286)."}},
+            {{"flag_id": "conventions-1", "action": "accept_tradeoff", "rationale": "Minor naming inconsistency; tracked as debt for later cleanup."}}
+          ],
           "settled_decisions": []
         }}
         ```
