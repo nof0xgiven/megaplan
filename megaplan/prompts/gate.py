@@ -99,14 +99,15 @@ def _gate_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
         - `signals_assessment`: one paragraph summarizing score trajectory, flag status, and preflight posture.
 
         Flags come in two tiers:
-        - **Blocking** (severity = significant/likely-significant): You cannot PROCEED unless you address ALL of them. The handler enforces this — it will override PROCEED to ITERATE if blocking flags remain open.
+        - **Blocking** (severity = significant/likely-significant): These are serious concerns. If you PROCEED, any blocking flags you don't explicitly resolve will be implicitly accepted as tradeoffs.
         - **Noted** (everything else): Acknowledge in your rationale but they don't block PROCEED.
 
-        If there are blocking flags and you want to PROCEED, you must provide `flag_resolutions` — one entry per flag you are resolving. Two actions are allowed:
+        If there are blocking flags and you want to PROCEED, you may provide `flag_resolutions` — one entry per flag you are explicitly resolving. Two actions are allowed:
         - **dispute**: The critique was factually wrong. You MUST cite specific evidence (file path, line, API doc, etc.) proving the concern is invalid.
         - **accept_tradeoff**: The concern is real but intentionally accepted as a known limitation. Always allowed; the flag is recorded as tech debt.
 
-        You may resolve at most 3 flags per gate call. If more need resolving, recommend ITERATE so the plan can address them first.
+        You may resolve at most 3 flags explicitly per gate call. Any remaining blocking flags are implicitly accepted as tradeoffs if you recommend PROCEED.
+        If a flag is structurally unresolvable (e.g., references infrastructure outside the repo), you should still PROCEED — do not loop indefinitely on flags that cannot be addressed.
 
         If there are no blocking flags, `flag_resolutions` can be omitted.
 
