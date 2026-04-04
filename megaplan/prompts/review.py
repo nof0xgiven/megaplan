@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import textwrap
 from pathlib import Path
 
@@ -42,6 +43,62 @@ def _settled_decisions_instruction(gate: dict[str, object]) -> str:
     if not isinstance(settled_decisions, list) or not settled_decisions:
         return ""
     return "- The decisions listed above were settled at the gate stage. Verify that the executor implemented each settled decision correctly. Flag deviations from these decisions, but do not question the decisions themselves."
+
+
+def _write_review_template(plan_dir: Path, state: PlanState) -> Path:
+    """Write a pre-populated review output template and return its path.
+
+    Pre-fills ``task_verdicts`` and ``sense_check_verdicts`` with the actual
+    task IDs and sense-check IDs from ``finalize.json`` so the model only has
+    to fill in verdict text instead of inventing IDs from scratch.  This is
+    the same pattern used for critique templates and fixes MiniMax-M2.7's
+    tendency to return empty verdict arrays.
+    """
+    finalize_data = read_json(plan_dir / "finalize.json")
+
+    task_verdicts = []
+    for task in finalize_data.get("tasks", []):
+        task_id = task.get("id", "")
+        if task_id:
+            task_verdicts.append({
+                "task_id": task_id,
+                "reviewer_verdict": "",
+                "evidence_files": [],
+            })
+
+    sense_check_verdicts = []
+    for sc in finalize_data.get("sense_checks", []):
+        sc_id = sc.get("id", "")
+        if sc_id:
+            sense_check_verdicts.append({
+                "sense_check_id": sc_id,
+                "verdict": "",
+            })
+
+    # Pre-populate criteria from finalize success_criteria if available
+    criteria = []
+    for crit in finalize_data.get("success_criteria", []):
+        if isinstance(crit, dict) and crit.get("name"):
+            criteria.append({
+                "name": crit["name"],
+                "priority": crit.get("priority", "must"),
+                "pass": "",
+                "evidence": "",
+            })
+
+    template = {
+        "review_verdict": "",
+        "criteria": criteria,
+        "issues": [],
+        "rework_items": [],
+        "summary": "",
+        "task_verdicts": task_verdicts,
+        "sense_check_verdicts": sense_check_verdicts,
+    }
+
+    output_path = plan_dir / "review_output.json"
+    output_path.write_text(json.dumps(template, indent=2), encoding="utf-8")
+    return output_path
 
 
 def _review_prompt(

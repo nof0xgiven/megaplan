@@ -64,6 +64,7 @@ def _toolsets_for_phase(phase: str) -> list[str] | None:
 
 
 _TEMPLATE_FILE_PHASES = {"finalize", "review", "prep"}
+_CUSTOM_TEMPLATE_PHASES = {"critique", "review"}
 
 
 def _template_has_content(payload: dict, step: str) -> bool:
@@ -81,6 +82,23 @@ def _template_has_content(payload: dict, step: str) -> bool:
         flags = payload.get("flags", [])
         if isinstance(flags, list) and flags:
             return True
+        return False
+    if step == "review":
+        # For review: the template is pre-populated with task IDs and sense-check
+        # IDs (empty verdicts). Check that at least one verdict was filled in, or
+        # that summary/review_verdict has content.
+        review_verdict = payload.get("review_verdict", "")
+        if isinstance(review_verdict, str) and review_verdict.strip():
+            return True
+        summary = payload.get("summary", "")
+        if isinstance(summary, str) and summary.strip():
+            return True
+        for tv in payload.get("task_verdicts", []):
+            if isinstance(tv, dict) and tv.get("reviewer_verdict", "").strip():
+                return True
+        for sc in payload.get("sense_check_verdicts", []):
+            if isinstance(sc, dict) and sc.get("verdict", "").strip():
+                return True
         return False
     # For other phases: any non-empty array or non-empty string
     return any(
@@ -321,10 +339,26 @@ def run_hermes_step(
             "They are used for scoring after execution and must remain unchanged."
         )
 
-    # Critique: the prompt layer already wrote the template file and references it.
-    # Other template-file phases: hermes_worker writes the template and appends instructions.
+    # Critique and review: use custom template writers that pre-populate IDs.
+    # Other template-file phases: hermes_worker writes a generic template.
     if step == "critique":
         output_path = plan_dir / "critique_output.json"
+    elif step == "review":
+        from megaplan.prompts.review import _write_review_template
+        output_path = _write_review_template(plan_dir, state)
+        prompt += (
+            f"\n\nOUTPUT FILE: {output_path}\n"
+            "This file is your ONLY output. It contains a JSON template PRE-POPULATED with "
+            "the task IDs and sense-check IDs you must review.\n"
+            "Workflow:\n"
+            "1. Read the file to see all the task IDs and sense-check IDs\n"
+            "2. Investigate each task — cross-reference executor claims against the git diff\n"
+            "3. Fill in every reviewer_verdict, evidence_files, verdict, criteria, and summary\n"
+            "4. Write the completed JSON back to the file\n\n"
+            "CRITICAL: You MUST fill in ALL task_verdicts and sense_check_verdicts entries. "
+            "Do NOT leave reviewer_verdict or verdict fields empty. "
+            "Do NOT put your results in a text response. The file is the only output that matters."
+        )
     elif step in _TEMPLATE_FILE_PHASES:
         output_path = plan_dir / f"{step}_output.json"
         output_path.write_text(
@@ -411,6 +445,9 @@ def run_hermes_step(
                 state,
                 checks_for_robustness(configured_robustness(state)),
             )
+        if step == "review":
+            from megaplan.prompts.review import _write_review_template
+            return _write_review_template(plan_dir, state)
         current_output_path.write_text(
             _build_output_template(step, schema),
             encoding="utf-8",

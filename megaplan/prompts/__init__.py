@@ -39,6 +39,7 @@ from .review import (
     _review_prompt,
     _settled_decisions_block,
     _settled_decisions_instruction,
+    _write_review_template,
 )
 
 _PromptBuilder = Callable[..., str]
@@ -164,6 +165,7 @@ __all__ = [
     "_revise_prompt",
     "_settled_decisions_block",
     "_settled_decisions_instruction",
+    "_write_review_template",
     "create_claude_prompt",
     "create_codex_prompt",
     "create_hermes_prompt",
