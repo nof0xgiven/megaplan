@@ -121,8 +121,13 @@ def _run_check(
         _result, check_payload, verified_ids, disputed_ids, cost_usd, pt, ct, tt = _run_attempt(agent, output_path)
     except Exception as exc:
         # Report 429 to key pool so it cools down this key
-        if "429" in str(exc) and model and model.startswith("minimax:"):
-            report_429("minimax", agent_kwargs.get("api_key", ""), cooldown_secs=60)
+        exc_str = str(exc)
+        if "429" in exc_str:
+            if model and model.startswith("minimax:"):
+                report_429("minimax", agent_kwargs.get("api_key", ""), cooldown_secs=60)
+            elif model and model.startswith("zhipu:"):
+                cooldown = 3600 if "Limit Exhausted" in exc_str else 120
+                report_429("zhipu", agent_kwargs.get("api_key", ""), cooldown_secs=cooldown)
         # Fallback to OpenRouter if primary MiniMax API fails (429, timeout, etc.)
         if model and model.startswith("minimax:"):
             or_key = acquire_key("openrouter")
