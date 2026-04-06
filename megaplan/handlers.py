@@ -33,7 +33,6 @@ from megaplan.types import (
     STATE_INITIALIZED,
     STATE_PREPPED,
     STATE_PLANNED,
-    STATE_RESEARCHED,
     StepResponse,
 )
 from megaplan._core import (
@@ -627,8 +626,8 @@ def handle_init(root: Path, args: argparse.Namespace) -> StepResponse:
 
 def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "plan", {STATE_INITIALIZED, STATE_PREPPED, STATE_PLANNED, STATE_RESEARCHED})
-    rerun = state["current_state"] in {STATE_PLANNED, STATE_RESEARCHED}
+    require_state(state, "plan", {STATE_INITIALIZED, STATE_PREPPED, STATE_PLANNED})
+    rerun = state["current_state"] == STATE_PLANNED
     version = state["iteration"] if rerun else state["iteration"] + 1
     worker, agent, mode, refreshed = _run_worker("plan", state, plan_dir, args, root=root, iteration=version)
     payload = worker.payload
@@ -670,25 +669,6 @@ def handle_plan(root: Path, args: argparse.Namespace) -> StepResponse:
     )
 
 
-def handle_research(root: Path, args: argparse.Namespace) -> StepResponse:
-    plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "research", {STATE_PLANNED})
-    worker, agent, mode, refreshed = _run_worker("research", state, plan_dir, args, root=root)
-    research_filename = "research.json"
-    artifact_hash = _write_json_artifact(plan_dir, research_filename, worker.payload)
-    considerations = worker.payload.get("considerations", [])
-    state["current_state"] = STATE_RESEARCHED
-    return _finish_step(
-        plan_dir, state, args,
-        step="research",
-        worker=worker, agent=agent, mode=mode, refreshed=refreshed,
-        summary=f"Research complete: logged {len(considerations)} documentation consideration(s).",
-        artifacts=[research_filename],
-        output_file=research_filename,
-        artifact_hash=artifact_hash,
-        response_fields={"iteration": state["iteration"]},
-    )
-
 
 def handle_prep(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
@@ -713,7 +693,7 @@ def handle_prep(root: Path, args: argparse.Namespace) -> StepResponse:
 
 def handle_critique(root: Path, args: argparse.Namespace) -> StepResponse:
     plan_dir, state = load_plan(root, args.plan)
-    require_state(state, "critique", {STATE_PLANNED, STATE_RESEARCHED})
+    require_state(state, "critique", {STATE_PLANNED})
     iteration = state["iteration"]
     robustness = configured_robustness(state)
     active_checks = checks_for_robustness(robustness)

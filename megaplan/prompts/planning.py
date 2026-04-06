@@ -14,7 +14,7 @@ from megaplan._core import (
 )
 from megaplan.types import PlanState
 
-from ._shared import _render_prep_block, _render_research_block
+from ._shared import _render_prep_block
 
 PLAN_TEMPLATE = textwrap.dedent(
     """
@@ -85,7 +85,6 @@ PLAN_TEMPLATE = textwrap.dedent(
 def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
     project_dir = Path(state["config"]["project_dir"])
     prep_block, prep_instruction = _render_prep_block(plan_dir)
-    research_block, research_instruction = _render_research_block(plan_dir)
     clarification = state.get("clarification", {})
     if clarification:
         clarification_block = textwrap.dedent(
@@ -111,8 +110,6 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
 
         {clarification_block}
 
-        {research_block}
-
         Requirements:
         - If the engineering brief suggests an approach, use it as your starting hypothesis — but before committing, consider if there's a simpler or more fundamental fix. The brief is well-researched input, not a final answer.
         - If the brief is absent, incomplete, or says "skip", inspect the repository yourself before planning.
@@ -129,7 +126,6 @@ def _plan_prompt(state: PlanState, plan_dir: Path) -> str:
         - Fix the problem fully. Do not limit scope just to avoid breaking existing tests — update the tests too if needed.
         - Prefer the simplest, most direct fix. No fallbacks, type conversions, or defensive wrappers without concrete evidence they are needed.
         - If the task or issue hints suggest a specific approach, follow it. Only deviate with concrete counter-evidence.
-        {research_instruction}
 
         {PLAN_TEMPLATE}
         """
@@ -192,72 +188,3 @@ def _prep_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> 
     ).strip()
 
 
-def _research_prompt(state: PlanState, plan_dir: Path, root: Path | None = None) -> str:
-    del root
-    project_dir = Path(state["config"]["project_dir"])
-    latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
-    latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
-    package_json_path = project_dir / "package.json"
-    try:
-        package_json = read_json(package_json_path)
-        dependency_versions = {
-            **package_json.get("dependencies", {}),
-            **package_json.get("devDependencies", {}),
-            **package_json.get("peerDependencies", {}),
-            **package_json.get("optionalDependencies", {}),
-        }
-        package_json_block = textwrap.dedent(
-            f"""
-            package.json detected at:
-            {package_json_path}
-
-            Dependency and framework version hints:
-            {json_dump(dependency_versions).strip()}
-            """
-        ).strip()
-    except FileNotFoundError:
-        package_json_block = "no package.json detected"
-
-    return textwrap.dedent(
-        f"""
-        You are doing targeted documentation research for the plan that was just created.
-
-        Project directory:
-        {project_dir}
-
-        {intent_and_notes_block(state)}
-
-        Plan:
-        {latest_plan}
-
-        Plan metadata:
-        {json_dump(latest_meta).strip()}
-
-        {package_json_block}
-
-        Your job is to find things the plan might be getting wrong OR missing based on current documentation.
-        You are NOT validating the plan — you are a devil's advocate looking for problems, gaps, and outdated approaches.
-
-        Use your judgment on how many searches to do — adapt to the task. Consider checking:
-        - What the task asks for (unfamiliar APIs, directives, conventions)
-        - What the plan proposes (are the APIs current or deprecated?)
-        - What the plan might be missing (best practices, migration guides)
-        - Breaking changes in the relevant framework version
-
-        After all searches, re-read the plan one final time and compare it against the Original Task:
-        - Does the task name a specific API or pattern that the plan does NOT use? Flag as CRITICAL.
-        - Is there ANY API the plan uses that the docs say should be done differently?
-        - Is there ANY required config flag or file that the plan doesn't mention?
-        - Is there ANY naming convention (file names, exports) that the plan gets wrong?
-
-        Severity rules:
-        - CRITICAL: docs recommend a DIFFERENT API/approach than the plan uses, OR a required config/file is missing
-        - IMPORTANT: docs show a best practice the plan doesn't follow
-        - MINOR: style or preference difference
-
-        Output:
-        - Each consideration must have a clear point, detail, and severity
-        - The summary must list key findings — NEVER say "everything looks correct" unless you truly found zero issues
-        - If you found issues, the summary should start with "Found N issues:" followed by a brief list
-        """
-    ).strip()

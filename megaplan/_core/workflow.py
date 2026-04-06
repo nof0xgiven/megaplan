@@ -18,7 +18,6 @@ from megaplan.types import (
     STATE_INITIALIZED,
     STATE_PLANNED,
     STATE_PREPPED,
-    STATE_RESEARCHED,
 )
 
 
@@ -37,10 +36,6 @@ WORKFLOW: dict[str, list[Transition]] = {
         Transition("plan", STATE_PLANNED),
     ],
     STATE_PLANNED: [
-        Transition("critique", STATE_CRITIQUED),
-        Transition("plan", STATE_PLANNED),
-    ],
-    STATE_RESEARCHED: [
         Transition("critique", STATE_CRITIQUED),
         Transition("plan", STATE_PLANNED),
     ],
@@ -76,12 +71,7 @@ WORKFLOW: dict[str, list[Transition]] = {
 # declared once: heavy has none, standard keeps the planned->critique
 # routing documented explicitly, and light adds gate/review skips.
 _ROBUSTNESS_OVERRIDES: dict[str, dict[str, list[Transition]]] = {
-    "heavy": {
-        STATE_PLANNED: [
-            Transition("research", STATE_RESEARCHED),
-            Transition("plan", STATE_PLANNED),
-        ],
-    },
+    "heavy": {},
     "standard": {
         STATE_INITIALIZED: [
             Transition("plan", STATE_PLANNED),
@@ -103,7 +93,6 @@ _ROBUSTNESS_WORKFLOW_LEVELS: dict[str, tuple[str, ...]] = {
 
 _STEP_CONTEXT_STATES = {
     STATE_PLANNED,
-    STATE_RESEARCHED,
     STATE_CRITIQUED,
     STATE_GATED,
     STATE_FINALIZED,

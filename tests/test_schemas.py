@@ -6,7 +6,7 @@ from megaplan.schemas import SCHEMAS, strict_schema
 
 
 def test_schema_registry_matches_5_step_workflow() -> None:
-    required = {"plan.json", "prep.json", "research.json", "revise.json", "gate.json", "critique.json", "finalize.json", "execution.json", "review.json"}
+    required = {"plan.json", "prep.json", "revise.json", "gate.json", "critique.json", "finalize.json", "execution.json", "review.json"}
     assert required.issubset(set(SCHEMAS))
 
 
@@ -88,7 +88,7 @@ def test_strict_schema_non_object_untouched() -> None:
 
 
 def test_schema_registry_has_all_expected_steps() -> None:
-    required_schemas = {"plan.json", "prep.json", "research.json", "revise.json", "gate.json", "critique.json", "finalize.json", "execution.json", "review.json"}
+    required_schemas = {"plan.json", "prep.json", "revise.json", "gate.json", "critique.json", "finalize.json", "execution.json", "review.json"}
     assert required_schemas.issubset(set(SCHEMAS.keys()))
 
 

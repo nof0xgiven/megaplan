@@ -210,27 +210,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": ["checks", "flags", "verified_flag_ids", "disputed_flag_ids"],
     },
-    "research.json": {
-        "type": "object",
-        "properties": {
-            "considerations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "point": {"type": "string"},
-                        "severity": {"type": "string", "enum": ["critical", "important", "minor"]},
-                        "detail": {"type": "string"},
-                        "source": {"type": "string"},
-                    },
-                    "required": ["severity"],
-                },
-            },
-            "summary": {"type": "string"},
-        },
-        "required": ["considerations", "summary"],
-    },
-    "finalize.json": {
+"finalize.json": {
         "type": "object",
         "properties": {
             "tasks": {

@@ -12,7 +12,6 @@ from typing import Any, NotRequired, TypedDict
 STATE_INITIALIZED = "initialized"
 STATE_PREPPED = "prepped"
 STATE_PLANNED = "planned"
-STATE_RESEARCHED = "researched"
 STATE_CRITIQUED = "critiqued"
 STATE_GATED = "gated"
 STATE_FINALIZED = "finalized"
@@ -257,7 +256,6 @@ MOCK_ENV_VAR = "MEGAPLAN_MOCK_WORKERS"
 DEFAULT_AGENT_ROUTING: dict[str, str] = {
     "plan": "claude",
     "prep": "claude",
-    "research": "claude",
     "critique": "codex",
     "revise": "claude",
     "gate": "claude",

@@ -333,29 +333,6 @@ def test_plan_prompt_uses_existing_clarification_context(tmp_path: Path) -> None
     assert "Keep it simple" in prompt
 
 
-def test_plan_prompt_includes_research_context_when_present(tmp_path: Path) -> None:
-    plan_dir, state = _scaffold(tmp_path)
-    atomic_write_json(
-        plan_dir / "research.json",
-        {
-            "considerations": [
-                {
-                    "point": "Use the documented path",
-                    "severity": "important",
-                    "detail": "The current docs require the new workflow branch to load research.json.",
-                    "source": "docs",
-                }
-            ],
-            "summary": "Found one documentation concern.",
-        },
-    )
-
-    prompt = create_claude_prompt("plan", state, plan_dir)
-
-    assert "A researcher recommended you consider these points" in prompt
-    assert "Use the documented path" in prompt
-    assert "current documentation searches" in prompt
-
 
 def test_revise_prompt_reads_gate_summary(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
@@ -485,7 +462,7 @@ def test_revise_prompt_contains_intent(tmp_path: Path) -> None:
 
 def test_codex_matches_claude_for_shared_steps(tmp_path: Path) -> None:
     plan_dir, state = _scaffold(tmp_path)
-    for step in ["plan", "prep", "research", "critique", "revise", "gate", "execute"]:
+    for step in ["plan", "prep", "critique", "revise", "gate", "execute"]:
         claude_prompt = create_claude_prompt(step, state, plan_dir)
         codex_prompt = create_codex_prompt(step, state, plan_dir)
         assert claude_prompt == codex_prompt, f"Prompts differ for step '{step}'"

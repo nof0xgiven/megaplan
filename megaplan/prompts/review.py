@@ -16,7 +16,6 @@ from megaplan._core import (
 )
 from megaplan.types import PlanState
 
-from ._shared import _render_research_block
 
 
 def _settled_decisions_block(gate: dict[str, object]) -> str:
@@ -118,9 +117,6 @@ def _review_prompt(
     finalize_data = read_json(plan_dir / "finalize.json")
     settled_decisions_block = _settled_decisions_block(gate)
     settled_decisions_instruction = _settled_decisions_instruction(gate)
-    review_research_block, review_research_instruction = _render_research_block(
-        plan_dir
-    )
     diff_summary = collect_git_diff_summary(project_dir)
     audit_path = plan_dir / "execution_audit.json"
     if audit_path.exists():
@@ -155,8 +151,6 @@ def _review_prompt(
 
         {settled_decisions_block}
 
-        {review_research_block}
-
         Execution summary:
         {json_dump(execution).strip()}
 
@@ -175,7 +169,6 @@ def _review_prompt(
           - If a criterion (any priority) cannot be verified in this context (e.g., requires manual testing or runtime observation), mark it `waived` with an explanation.
         - Set `review_verdict` to `needs_rework` only when at least one `must` criterion fails or actual implementation work is incomplete. Use `approved` when all `must` criteria pass, even if some `should` criteria are flagged.
         {settled_decisions_instruction}
-        {review_research_instruction}
         - {task_guidance}
         - {sense_check_guidance}
         - Follow this JSON shape exactly:

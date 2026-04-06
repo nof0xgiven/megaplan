@@ -65,19 +65,6 @@ def test_parse_claude_envelope_rejects_invalid_json() -> None:
                 "suggested_approach": "Use the brief as primary context.",
             },
         ),
-        (
-            "research",
-            {
-                "considerations": [
-                    {
-                        "point": "useRouter is stable in Next.js 14+",
-                        "severity": "minor",
-                        "detail": "No issues found with the planned usage.",
-                    }
-                ],
-                "summary": "Verified useRouter API is current for Next.js 14.",
-            },
-        ),
         ("revise", {"plan": "x", "changes_summary": "y", "flags_addressed": []}),
         (
             "gate",
@@ -177,7 +164,6 @@ def test_validate_payload_rejects_missing_gate_key() -> None:
 def test_session_key_for_matches_new_roles() -> None:
     assert session_key_for("plan", "claude") == "claude_planner"
     assert session_key_for("revise", "codex") == "codex_planner"
-    assert session_key_for("research", "hermes") == "hermes_research"
     assert session_key_for("critique", "codex") == "codex_critic"
     assert session_key_for("gate", "claude") == "claude_gatekeeper"
     assert session_key_for("execute", "claude") == "claude_executor"
@@ -511,7 +497,7 @@ def test_session_key_for_unknown_step_uses_step_name() -> None:
 
 def test_step_schema_filenames_cover_all_steps() -> None:
     from megaplan.workers import STEP_SCHEMA_FILENAMES
-    required_steps = {"plan", "prep", "research", "revise", "critique", "gate", "finalize", "execute", "review"}
+    required_steps = {"plan", "prep", "revise", "critique", "gate", "finalize", "execute", "review"}
     assert required_steps.issubset(set(STEP_SCHEMA_FILENAMES.keys()))
 
 

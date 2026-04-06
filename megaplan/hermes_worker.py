@@ -54,11 +54,11 @@ def _toolsets_for_phase(phase: str) -> list[str] | None:
 
     Execute phase gets full terminal + file + web access.
     Plan, critique, and revise get file + web (verify APIs against docs).
-    Gate, finalize, review get file only (judgment, not research).
+    Gate, finalize, review get file only (judgment, not investigation).
     """
     if phase == "execute":
         return ["terminal", "file", "web"]
-    if phase in ("plan", "prep", "critique", "revise", "research"):
+    if phase in ("plan", "prep", "critique", "revise"):
         return ["file", "web"]
     return ["file"]
 

@@ -43,7 +43,6 @@ from megaplan.handlers import (
     handle_override,
     handle_plan,
     handle_prep,
-    handle_research,
     handle_review,
     handle_revise,
 )
@@ -438,7 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
 
-    for name in ["plan", "prep", "research", "critique", "revise", "gate", "finalize", "execute", "review"]:
+    for name in ["plan", "prep", "critique", "revise", "gate", "finalize", "execute", "review"]:
         step_parser = subparsers.add_parser(name)
         step_parser.add_argument("--plan")
         step_parser.add_argument("--agent", choices=["claude", "codex", "hermes"])
@@ -552,7 +551,6 @@ COMMAND_HANDLERS: dict[str, Callable[..., StepResponse]] = {
     "init": handle_init,
     "plan": handle_plan,
     "prep": handle_prep,
-    "research": handle_research,
     "critique": handle_critique,
     "revise": handle_revise,
     "gate": handle_gate,

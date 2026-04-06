@@ -48,7 +48,6 @@ _EXECUTE_STEPS = {"execute", "loop_execute"}
 STEP_SCHEMA_FILENAMES: dict[str, str] = {
     "plan": "plan.json",
     "prep": "prep.json",
-    "research": "research.json",
     "revise": "revise.json",
     "critique": "critique.json",
     "gate": "gate.json",
@@ -405,19 +404,6 @@ def _default_mock_critique_payload(state: PlanState, plan_dir: Path) -> dict[str
     }
 
 
-def _default_mock_research_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
-    return {
-        "considerations": [
-            {
-                "point": "Re-check the framework-specific behavior named in the task.",
-                "severity": "important",
-                "detail": "Mock research recommends validating the plan against current docs before critique.",
-                "source": "mock-docs",
-            }
-        ],
-        "summary": "Mock research found one documentation consideration worth carrying into critique.",
-    }
-
 
 def _default_mock_revise_payload(state: PlanState, plan_dir: Path) -> dict[str, Any]:
     return {
@@ -650,7 +636,6 @@ _MockPayloadBuilder = Callable[[dict[str, Any], Path], dict[str, Any]]
 _MOCK_DEFAULTS: dict[str, _MockPayloadBuilder] = {
     "plan": _default_mock_plan_payload,
     "prep": _default_mock_prep_payload,
-    "research": _default_mock_research_payload,
     "loop_plan": _default_mock_loop_plan_payload,
     "critique": _default_mock_critique_payload,
     "revise": _default_mock_revise_payload,
@@ -685,9 +670,6 @@ def _mock_prep(state: PlanState, plan_dir: Path) -> WorkerResult:
 def _mock_loop_plan(state: PlanState, plan_dir: Path) -> WorkerResult:
     return _mock_result(_build_mock_payload("loop_plan", state, plan_dir))
 
-
-def _mock_research(state: PlanState, plan_dir: Path) -> WorkerResult:
-    return _mock_result(_build_mock_payload("research", state, plan_dir))
 
 
 def _mock_critique(state: PlanState, plan_dir: Path) -> WorkerResult:
@@ -731,7 +713,6 @@ _MockHandler = Callable[..., WorkerResult]
 _MOCK_DISPATCH: dict[str, _MockHandler] = {
     "plan": _mock_plan,
     "prep": _mock_prep,
-    "research": _mock_research,
     "loop_plan": _mock_loop_plan,
     "critique": _mock_critique,
     "revise": _mock_revise,

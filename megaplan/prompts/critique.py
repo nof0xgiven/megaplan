@@ -20,7 +20,7 @@ from megaplan._core import (
 )
 from megaplan.types import PlanState
 
-from ._shared import _planning_debt_block, _render_prep_block, _render_research_block
+from ._shared import _planning_debt_block, _render_prep_block
 from .planning import PLAN_TEMPLATE
 
 
@@ -83,7 +83,6 @@ def _revise_prompt(state: PlanState, plan_dir: Path) -> str:
 def _critique_context(state: PlanState, plan_dir: Path, root: Path | None = None) -> dict[str, Any]:
     project_dir = Path(state["config"]["project_dir"])
     prep_block, prep_instruction = _render_prep_block(plan_dir)
-    research_block, research_instruction = _render_research_block(plan_dir)
     latest_plan = latest_plan_path(plan_dir, state).read_text(encoding="utf-8")
     latest_meta = read_json(latest_plan_meta_path(plan_dir, state))
     structure_warnings = latest_meta.get("structure_warnings", [])
@@ -102,8 +101,6 @@ def _critique_context(state: PlanState, plan_dir: Path, root: Path | None = None
         "project_dir": project_dir,
         "prep_block": prep_block,
         "prep_instruction": prep_instruction,
-        "research_block": research_block,
-        "research_instruction": research_instruction,
         "latest_plan": latest_plan,
         "latest_meta": latest_meta,
         "structure_warnings": structure_warnings,
@@ -193,8 +190,6 @@ def _build_critique_prompt(
         Existing flags:
         {json_dump(context["unresolved"]).strip()}
 
-        {context["research_block"]}
-
         {context["debt_block"]}
 
         {critique_review_block}
@@ -207,7 +202,6 @@ def _build_critique_prompt(
         - Verify that the plan follows the expected structure when validator warnings or the outline suggest drift.
         - Additional flags may use these categories: correctness, security, completeness, performance, maintainability, other.
         - Focus on concrete issues, not structural formatting.
-        {context["research_instruction"]}
         """
     ).strip()
 

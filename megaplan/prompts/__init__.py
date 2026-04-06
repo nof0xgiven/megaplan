@@ -16,7 +16,6 @@ from ._shared import (
     _grouped_debt_for_prompt,
     _planning_debt_block,
     _render_prep_block,
-    _render_research_block,
     _resolve_prompt_root,
 )
 from .critique import (
@@ -34,7 +33,7 @@ from .execute import (
 )
 from .finalize import _finalize_prompt
 from .gate import _collect_critique_summaries, _flag_summary, _gate_prompt
-from .planning import PLAN_TEMPLATE, _plan_prompt, _prep_prompt, _research_prompt
+from .planning import PLAN_TEMPLATE, _plan_prompt, _prep_prompt
 from .review import (
     _review_prompt,
     _settled_decisions_block,
@@ -47,7 +46,6 @@ _PromptBuilder = Callable[..., str]
 _CLAUDE_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "plan": _plan_prompt,
     "prep": _prep_prompt,
-    "research": _research_prompt,
     "critique": _critique_prompt,
     "revise": _revise_prompt,
     "gate": _gate_prompt,
@@ -65,7 +63,6 @@ _CLAUDE_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
 _CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "plan": _plan_prompt,
     "prep": _prep_prompt,
-    "research": _research_prompt,
     "critique": _critique_prompt,
     "revise": _revise_prompt,
     "gate": _gate_prompt,
@@ -83,7 +80,6 @@ _CODEX_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
 _HERMES_PROMPT_BUILDERS: dict[str, _PromptBuilder] = {
     "plan": _plan_prompt,
     "prep": _prep_prompt,
-    "research": _research_prompt,
     "critique": _critique_prompt,
     "revise": _revise_prompt,
     "gate": _gate_prompt,
@@ -105,7 +101,7 @@ def create_claude_prompt(
     builder = _CLAUDE_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Claude step '{step}'")
-    if step in {"prep", "research", "critique", "gate", "finalize", "execute"}:
+    if step in {"prep", "critique", "gate", "finalize", "execute"}:
         return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)
 
@@ -116,7 +112,7 @@ def create_codex_prompt(
     builder = _CODEX_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Codex step '{step}'")
-    if step in {"prep", "research", "critique", "gate", "finalize", "execute"}:
+    if step in {"prep", "critique", "gate", "finalize", "execute"}:
         return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)
 
@@ -127,7 +123,7 @@ def create_hermes_prompt(
     builder = _HERMES_PROMPT_BUILDERS.get(step)
     if builder is None:
         raise CliError("unsupported_step", f"Unsupported Hermes step '{step}'")
-    if step in {"prep", "research", "critique", "gate", "finalize", "execute"}:
+    if step in {"prep", "critique", "gate", "finalize", "execute"}:
         return builder(state, plan_dir, root=root)
     return builder(state, plan_dir)
 
@@ -158,8 +154,6 @@ __all__ = [
     "_prep_prompt",
     "_write_critique_template",
     "_render_prep_block",
-    "_render_research_block",
-    "_research_prompt",
     "_resolve_prompt_root",
     "_review_prompt",
     "_revise_prompt",

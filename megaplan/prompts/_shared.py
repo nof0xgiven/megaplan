@@ -120,48 +120,6 @@ def _finalize_debt_block(plan_dir: Path, root: Path | None) -> str:
     ).strip()
 
 
-def _render_research_block(plan_dir: Path) -> tuple[str, str]:
-    """Render research findings for injection into critique/review prompts.
-    Returns (research_block, research_instruction)."""
-    research_path = plan_dir / "research.json"
-    if not research_path.exists():
-        return "", ""
-    research = read_json(research_path)
-    considerations = research.get("considerations", [])
-    severity_order = {"critical": 0, "important": 1, "minor": 2}
-    considerations.sort(key=lambda c: severity_order.get(c.get("severity", "minor"), 2))
-    if considerations:
-        consideration_lines = []
-        for c in considerations:
-            severity = c.get("severity", "minor")
-            point = c.get("point") or c.get("topic") or c.get("name") or ""
-            detail = c.get("detail") or c.get("issue") or c.get("description") or ""
-            recommendation = c.get("recommendation") or ""
-            source = c.get("source") or ""
-            line = f"- [{severity.upper()}] {point}"
-            if detail:
-                line += f"\n  {detail}"
-            if recommendation:
-                line += f"\n  Recommendation: {recommendation}"
-            if source:
-                line += f"\n  Source: {source}"
-            consideration_lines.append(line)
-        considerations_block = "\n".join(consideration_lines)
-    else:
-        considerations_block = "- No noteworthy considerations found."
-    research_block = textwrap.dedent(
-        f"""
-        A researcher recommended you consider these points in executing the task:
-
-        {considerations_block}
-        """
-    ).strip()
-    research_instruction = (
-        "- The research considerations above are based on current documentation searches. "
-        "Any item marked CRITICAL or IMPORTANT should be flagged if the plan doesn't address it."
-    )
-    return research_block, research_instruction
-
 
 def _render_prep_block(plan_dir: Path) -> tuple[str, str]:
     prep_path = plan_dir / "prep.json"

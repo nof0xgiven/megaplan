@@ -1,6 +1,6 @@
 # Megaplan
 
-A planning and execution harness that helps LLMs solve complex tasks through structured phases — prep, plan, critique, gate, execute, and review. Instead of one-shot attempts, Megaplan gives any model a rigorous process with independent critique and gating.
+A planning and execution harness that helps LLMs solve complex tasks through structured phases — plan, critique, gate, revise, finalize, execute, and review. Instead of one-shot attempts, Megaplan gives any model a rigorous process with independent critique and gating.
 
 ## Quick Start — Claude Code / Codex
 
@@ -39,10 +39,10 @@ Get an OpenRouter key at [openrouter.ai/keys](https://openrouter.ai/keys). Any m
 ## How it works
 
 ```
-prep → plan → critique → gate → [revise → critique → gate]* → finalize → execute → review
+plan → critique → gate → [revise → critique → gate]* → finalize → execute → review
 ```
 
-Each phase can use a different model. The critique phase uses an independent model to review the plan and raise flags. The gate decides whether to proceed or iterate. This prevents models from rubber-stamping their own work.
+Each phase can use a different model. The critique phase uses an independent model to review the plan and raise flags. The gate decides whether to proceed or iterate. This prevents models from rubber-stamping their own work. Heavy robustness adds a prep phase before planning to gather codebase context.
 
 ## Running manually
 
@@ -83,7 +83,7 @@ GEMINI_API_KEY=...         # for google: prefix
 
 - **light** — no structured critique, fast
 - **standard** — 4 critique checks (default)
-- **heavy** — 8 critique checks + prep research phase
+- **heavy** — 8 critique checks + prep phase
 
 ## SWE-bench Experiment
 
