@@ -208,6 +208,36 @@ def parse_claude_envelope(raw: str) -> tuple[dict[str, Any], dict[str, Any]]:
     return envelope, payload
 
 
+def _extract_json_from_raw(raw: str) -> dict[str, Any] | None:
+    """Try to extract a JSON object from raw agent output.
+
+    Handles the common case where a sandbox blocks file writes and the agent
+    dumps the JSON into stdout/stderr wrapped in error text or markdown fences.
+    """
+    # Strategy 1: look for ```json ... ``` fenced blocks
+    fenced = re.findall(r"```json\s*\n(.*?)```", raw, re.DOTALL)
+    for block in fenced:
+        try:
+            obj = json.loads(block.strip())
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    # Strategy 2: find the largest { ... } substring that parses as JSON
+    # (greedy match from first { to last })
+    brace_start = raw.find("{")
+    brace_end = raw.rfind("}")
+    if brace_start >= 0 and brace_end > brace_start:
+        candidate = raw[brace_start : brace_end + 1]
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def parse_json_file(path: Path) -> dict[str, Any]:
     try:
         payload = read_json(path)
@@ -886,12 +916,15 @@ def run_codex_step(
     if result.returncode != 0 and (not output_path.exists() or not output_path.read_text(encoding="utf-8").strip()):
         error_code, error_message = _diagnose_codex_failure(raw, result.returncode)
         raise CliError(error_code, error_message, extra={"raw_output": raw})
+    payload = None
     try:
         payload = parse_json_file(output_path)
     except CliError:
-        # Fallback: when resuming a persistent session, --output-schema is not
-        # supported so Codex may write to the plan-dir output file instead of
-        # the temp file.  Try the known output path before giving up.
+        pass
+    # Fallback 1: when resuming a persistent session, --output-schema is not
+    # supported so Codex may write to the plan-dir output file instead of
+    # the temp file.  Try the known output path before giving up.
+    if payload is None:
         fallback_names = {
             "critique": "critique_output.json",
         }
@@ -900,10 +933,29 @@ def run_codex_step(
         if fallback_path != output_path and fallback_path.exists():
             try:
                 payload = parse_json_file(fallback_path)
-            except CliError as inner_error:
-                raise CliError(inner_error.code, inner_error.message, extra={"raw_output": raw}) from inner_error
-        else:
-            raise CliError("parse_error", f"Output file {output_path.name} was not valid JSON and no fallback found", extra={"raw_output": raw})
+            except CliError:
+                pass
+    # Fallback 2: sandbox may block file writes.  The agent dumps JSON
+    # into stdout/stderr wrapped in error text (e.g. "Read-only sandbox
+    # prevented writing ... ```json\n{...}\n```").  Extract it.
+    if payload is None:
+        payload = _extract_json_from_raw(raw)
+    if payload is None:
+        raise CliError("parse_error", f"Output file {output_path.name} was not valid JSON and no fallback found", extra={"raw_output": raw})
+    # Fallback 3: the output file may have been written successfully but contain
+    # a wrapper/error payload instead of the actual structured output.  If the
+    # raw output contains a better payload (e.g. with populated findings),
+    # prefer it.
+    raw_payload = _extract_json_from_raw(raw)
+    if raw_payload is not None and step == "critique":
+        # Check if the raw version has more content (e.g. populated findings
+        # vs empty template that the file-based parse returned).
+        raw_checks = raw_payload.get("checks", [])
+        file_checks = payload.get("checks", [])
+        raw_findings = sum(len(c.get("findings", [])) for c in raw_checks if isinstance(c, dict))
+        file_findings = sum(len(c.get("findings", [])) for c in file_checks if isinstance(c, dict))
+        if raw_findings > file_findings:
+            payload = raw_payload
     try:
         validate_payload(step, payload)
     except CliError as error:
