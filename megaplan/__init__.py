@@ -42,7 +42,7 @@ from megaplan.cli import handle_setup, handle_setup_global, handle_config
 from megaplan._core import infer_next_steps, workflow_includes_step, workflow_next
 from megaplan.cli import handle_status, handle_audit, handle_progress, handle_list, main, cli_entry
 
-__version__ = "0.1.0"
+__version__ = "0.8.1"
 
 __all__ = [
     # Types
